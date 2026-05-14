@@ -1,0 +1,30 @@
+[package]
+name = "superkmeans-rs"
+version = "0.1.0"
+edition = "2024"
+description = "A Rust port of SuperKMeans: fast k-means clustering for high-dimensional vector embeddings"
+license = "MIT"
+
+[lib]
+name = "superkmeans"
+path = "src/lib.rs"
+
+[dependencies]
+matrixmultiply = { version = "0.3", features = ["threading"] }
+rayon = "1.10"
+rand = "0.8"
+rand_chacha = "0.3"
+rand_distr = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[[example]]
+name = "simple_clustering"
+path = "examples/simple_clustering.rs"
+
+[[example]]
+name = "hierarchical_clustering"
+path = "examples/hierarchical_clustering.rs"
