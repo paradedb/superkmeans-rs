@@ -9,12 +9,23 @@ license = "MIT"
 name = "superkmeans"
 path = "src/lib.rs"
 
+[features]
+# Route all SGEMM through a vendor BLAS (`cblas_sgemm`) instead of matrixmultiply.
+# `blas` is an internal marker enabled by each concrete backend below.
+blas = []
+accelerate = ["blas"]    # Apple Accelerate (macOS, AMX)
+openblas = ["blas"]      # OpenBLAS (Linux/Windows/macOS); linked via build.rs
+
 [dependencies]
 matrixmultiply = { version = "0.3", features = ["threading"] }
 rayon = "1.10"
 rand = "0.8"
 rand_chacha = "0.3"
 rand_distr = "0.4"
+
+[build-dependencies]
+# Used only to locate a system OpenBLAS when the `openblas` feature is on.
+pkg-config = "0.3"
 
 [profile.release]
 opt-level = 3
