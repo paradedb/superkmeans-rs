@@ -378,9 +378,14 @@ impl SuperKMeans {
             &data_buffer
         };
 
-        // Centroid norms over partial_d.
-        let centroid_partial_norms =
-            compute_partial_norms_row_major(centroids, n_centroids, d, self.partial_d as usize);
+        // Norms from the rotated centroids (the pruning space), not the passed-in
+        // `centroids` (unrotated; used only by the brute-force fallback).
+        let centroid_partial_norms = compute_partial_norms_row_major(
+            &self.horizontal_centroids,
+            n_centroids,
+            d,
+            self.partial_d as usize,
+        );
 
         let mut result_assignments = vec![0_u32; n_vectors];
         let mut result_distances = vec![0.0_f32; n_vectors];
@@ -394,7 +399,7 @@ impl SuperKMeans {
                 .copy_from_slice(&self.assignments[..n_vectors.min(self.assignments.len())]);
             batch::find_nearest_neighbor_with_pruning(
                 data_p,
-                centroids,
+                &self.horizontal_centroids,
                 n_vectors,
                 n_centroids,
                 d,
@@ -444,7 +449,7 @@ impl SuperKMeans {
                 compute_partial_norms_row_major(data_p, n_vectors, d, self.partial_d as usize);
             batch::find_nearest_neighbor_with_pruning(
                 data_p,
-                centroids,
+                &self.horizontal_centroids,
                 n_vectors,
                 n_centroids,
                 d,
@@ -504,7 +509,7 @@ impl SuperKMeans {
             compute_partial_norms_row_major(data_p, n_vectors, d, self.partial_d as usize);
         batch::find_nearest_neighbor_with_pruning(
             data_p,
-            centroids,
+            &self.horizontal_centroids,
             n_vectors,
             n_centroids,
             d,
