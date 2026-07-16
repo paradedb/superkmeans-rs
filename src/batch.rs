@@ -302,8 +302,12 @@ pub fn find_nearest_neighbor_with_pruning(
                     |positions, (r, (((row, knn), dist), npc))| {
                         let i_idx = i_base + r;
                         let norm_x_i = nx[i_idx];
-                        for c in 0..bn_y {
-                            row[c] = -2.0 * row[c] + norm_x_i + ny[j_base + c];
+                        // Convert raw dot products to partial L2 distances. Iterate
+                        // over zipped slices (no bounds checks, no aliasing) so the
+                        // autovectorizer emits a SIMD FMA loop — the Rust equivalent
+                        // of the C++ `SKM_VECTORIZE_LOOP` conversion pass.
+                        for (rv, &ny_c) in row.iter_mut().zip(&ny[j_base..j_base + bn_y]) {
+                            *rv = norm_x_i + ny_c - 2.0 * *rv;
                         }
                         let data_p = &x[i_idx * d..i_idx * d + d];
                         let prev_assignment = *knn;
