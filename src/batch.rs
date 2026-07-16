@@ -20,24 +20,20 @@ fn blas_dot_products(
     debug_assert!(x_batch.len() >= batch_n_x * d);
     debug_assert!(y_batch.len() >= batch_n_y * d);
     debug_assert!(out.len() >= batch_n_x * batch_n_y);
-    unsafe {
-        matrixmultiply::sgemm(
-            batch_n_x,
-            effective_d,
-            batch_n_y,
-            1.0,
-            x_batch.as_ptr(),
-            d as isize,
-            1,
-            y_batch.as_ptr(),
-            1,
-            d as isize,
-            0.0,
-            out.as_mut_ptr(),
-            batch_n_y as isize,
-            1,
-        );
-    }
+    // out = x[:, :effective_d] * y[:, :effective_d]^T ; both rows are d-wide.
+    crate::gemm::sgemm_ld(
+        false,
+        true,
+        batch_n_x,
+        effective_d,
+        batch_n_y,
+        x_batch,
+        d,
+        y_batch,
+        d,
+        out,
+        batch_n_y,
+    );
 }
 
 /// Brute-force top-1 nearest-centroid search via batched SGEMM.

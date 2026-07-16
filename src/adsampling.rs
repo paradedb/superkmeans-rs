@@ -56,24 +56,7 @@ impl ADSamplingPruner {
         let d = self.num_dimensions;
         debug_assert!(vectors.len() >= n * d);
         debug_assert!(out.len() >= n * d);
-        unsafe {
-            matrixmultiply::sgemm(
-                n,
-                d,
-                d,
-                1.0,
-                vectors.as_ptr(),
-                d as isize,
-                1,
-                self.matrix.as_ptr(),
-                1,
-                d as isize,
-                0.0,
-                out.as_mut_ptr(),
-                d as isize,
-                1,
-            );
-        }
+        gemm::sgemm_ld(false, true, n, d, d, vectors, d, &self.matrix, d, out, d);
     }
 
     /// out = rotated * matrix   (inverse of `rotate` for orthonormal matrix).

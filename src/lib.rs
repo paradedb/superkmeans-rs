@@ -4,6 +4,17 @@
 //! The C++ original lives in `SuperKMeans/`; this crate re-implements the
 //! C++ public API (no Python surface) in pure Rust with no FFI dependencies.
 
+// OpenBLAS is linked by `build.rs` (via pkg-config or OPENBLAS_LIB_DIR);
+// Accelerate is linked by the framework attribute in `gemm.rs`.
+#[cfg(all(
+    feature = "blas",
+    not(any(feature = "accelerate", feature = "openblas"))
+))]
+compile_error!(
+    "the `blas` feature is a marker — enable a concrete backend instead: \
+     `accelerate` (macOS) or `openblas` (Linux/Windows/macOS)"
+);
+
 pub mod adsampling;
 pub mod batch;
 pub mod common;
