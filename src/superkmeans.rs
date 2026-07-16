@@ -133,6 +133,10 @@ pub struct SuperKMeans {
     pub recall: f32,
 
     pub iteration_stats: Vec<SuperKMeansIterationStats>,
+
+    /// Reusable SGEMM output scratch, grown once and reused across iterations
+    /// by `batch::find_nearest_neighbor*` to avoid per-iteration allocation.
+    gemm_buf: Vec<f32>,
 }
 
 impl SuperKMeans {
@@ -193,6 +197,7 @@ impl SuperKMeans {
             shift: 0.0,
             recall: 0.0,
             iteration_stats: Vec::new(),
+            gemm_buf: Vec::new(),
         }
     }
 
@@ -326,6 +331,7 @@ impl SuperKMeans {
         let mut result_distances = vec![0.0_f32; n_vectors];
         let vector_norms = compute_norms_row_major(vectors, n_vectors, d, true);
         let centroid_norms = compute_norms_row_major(centroids, n_centroids, d, true);
+        let mut buf = Vec::new();
         batch::find_nearest_neighbor(
             vectors,
             centroids,
@@ -336,6 +342,7 @@ impl SuperKMeans {
             &centroid_norms,
             &mut result_assignments,
             &mut result_distances,
+            &mut buf,
         );
         result_assignments
     }
@@ -412,6 +419,7 @@ impl SuperKMeans {
                 &self.pruner,
                 self.partial_d as usize,
                 &mut not_pruned_counts,
+                &mut self.gemm_buf,
             );
             return result_assignments;
         }
@@ -462,6 +470,7 @@ impl SuperKMeans {
                 &self.pruner,
                 self.partial_d as usize,
                 &mut not_pruned_counts,
+                &mut self.gemm_buf,
             );
             return result_assignments;
         }
@@ -522,6 +531,7 @@ impl SuperKMeans {
             &self.pruner,
             self.partial_d as usize,
             &mut not_pruned_counts,
+            &mut self.gemm_buf,
         );
 
         result_assignments
@@ -558,6 +568,7 @@ impl SuperKMeans {
                 &self.centroid_norms,
                 &mut self.assignments,
                 &mut self.distances,
+                &mut self.gemm_buf,
             );
             self.horizontal_centroids.iter_mut().for_each(|v| *v = 0.0);
             self.cluster_sizes.iter_mut().for_each(|v| *v = 0);
@@ -587,6 +598,7 @@ impl SuperKMeans {
                 &self.pruner,
                 self.partial_d as usize,
                 not_pruned_counts,
+                &mut self.gemm_buf,
             );
             self.horizontal_centroids.iter_mut().for_each(|v| *v = 0.0);
             self.cluster_sizes.iter_mut().for_each(|v| *v = 0);

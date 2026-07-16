@@ -36,6 +36,17 @@ fn blas_dot_products(
     );
 }
 
+/// Grow `buf` so one SGEMM batch (up to `X_BATCH_SIZE × Y_BATCH_SIZE`, clamped
+/// to the problem size) fits. The buffer is caller-owned and reused across
+/// calls, so this avoids re-allocating (and page-faulting) it every iteration.
+/// The GEMM writes the used region with beta=0, so stale contents are fine.
+fn ensure_buf(buf: &mut Vec<f32>, n_x: usize, n_y: usize) {
+    let required = X_BATCH_SIZE.min(n_x) * Y_BATCH_SIZE.min(n_y);
+    if buf.len() < required {
+        buf.resize(required, 0.0);
+    }
+}
+
 /// Brute-force top-1 nearest-centroid search via batched SGEMM.
 pub fn find_nearest_neighbor(
     x: &[f32],
@@ -47,6 +58,7 @@ pub fn find_nearest_neighbor(
     norms_y: &[f32],
     out_knn: &mut [u32],
     out_distances: &mut [f32],
+    buf: &mut Vec<f32>,
 ) {
     for v in out_distances.iter_mut().take(n_x) {
         *v = f32::MAX;
@@ -55,7 +67,7 @@ pub fn find_nearest_neighbor(
         *v = 0;
     }
 
-    let mut buf = vec![0.0_f32; X_BATCH_SIZE * Y_BATCH_SIZE];
+    ensure_buf(buf, n_x, n_y);
 
     let mut i = 0;
     while i < n_x {
@@ -224,8 +236,9 @@ pub fn find_nearest_neighbor_with_pruning(
     pruner: &ADSamplingPruner,
     partial_d: usize,
     out_not_pruned_counts: &mut [usize],
+    buf: &mut Vec<f32>,
 ) {
-    let mut buf = vec![0.0_f32; X_BATCH_SIZE * Y_BATCH_SIZE];
+    ensure_buf(buf, n_x, n_y);
 
     let mut i = 0;
     while i < n_x {
@@ -264,41 +277,45 @@ pub fn find_nearest_neighbor_with_pruning(
                 .zip(dist_window.par_iter_mut())
                 .zip(npc_window.par_iter_mut())
                 .enumerate()
-                .for_each(|(r, (((row, knn), dist), npc))| {
-                    let i_idx = i_base + r;
-                    let norm_x_i = nx[i_idx];
-                    for c in 0..bn_y {
-                        row[c] = -2.0 * row[c] + norm_x_i + ny[j_base + c];
-                    }
-                    let data_p = &x[i_idx * d..i_idx * d + d];
-                    let prev_assignment = *knn;
-                    let dist_to_prev = if j_base == 0 {
-                        let other_start = prev_assignment as usize * d;
-                        l2_squared(&y[other_start..other_start + d], data_p)
-                    } else {
-                        *dist
-                    };
+                // Reuse one `positions` scratch buffer per worker thread instead
+                // of allocating a Vec per row; top1_partial_search clears it.
+                .for_each_init(
+                    || Vec::<u32>::with_capacity(bn_y),
+                    |positions, (r, (((row, knn), dist), npc))| {
+                        let i_idx = i_base + r;
+                        let norm_x_i = nx[i_idx];
+                        for c in 0..bn_y {
+                            row[c] = -2.0 * row[c] + norm_x_i + ny[j_base + c];
+                        }
+                        let data_p = &x[i_idx * d..i_idx * d + d];
+                        let prev_assignment = *knn;
+                        let dist_to_prev = if j_base == 0 {
+                            let other_start = prev_assignment as usize * d;
+                            l2_squared(&y[other_start..other_start + d], data_p)
+                        } else {
+                            *dist
+                        };
 
-                    let mut positions: Vec<u32> = Vec::with_capacity(bn_y);
-                    let (assignment, local_not_pruned) = top1_partial_search(
-                        pruner,
-                        data_p,
-                        batch_y_p,
-                        bn_y,
-                        d,
-                        vertical_d,
-                        horizontal_d,
-                        row,
-                        partial_d,
-                        prev_assignment,
-                        dist_to_prev,
-                        j_base as u32,
-                        &mut positions,
-                    );
-                    *npc += local_not_pruned;
-                    *knn = assignment.index;
-                    *dist = assignment.distance.max(0.0);
-                });
+                        let (assignment, local_not_pruned) = top1_partial_search(
+                            pruner,
+                            data_p,
+                            batch_y_p,
+                            bn_y,
+                            d,
+                            vertical_d,
+                            horizontal_d,
+                            row,
+                            partial_d,
+                            prev_assignment,
+                            dist_to_prev,
+                            j_base as u32,
+                            positions,
+                        );
+                        *npc += local_not_pruned;
+                        *knn = assignment.index;
+                        *dist = assignment.distance.max(0.0);
+                    },
+                );
 
             j += batch_n_y;
         }
