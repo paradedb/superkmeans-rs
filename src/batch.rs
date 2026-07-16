@@ -302,9 +302,8 @@ pub fn find_nearest_neighbor_with_pruning(
                     |positions, (r, (((row, knn), dist), npc))| {
                         let i_idx = i_base + r;
                         let norm_x_i = nx[i_idx];
-                        for c in 0..bn_y {
-                            row[c] = -2.0 * row[c] + norm_x_i + ny[j_base + c];
-                        }
+                        // `row` holds raw GEMM dot products; top1_partial_search
+                        // converts them to partial L2 in place (fused with the scan).
                         let data_p = &x[i_idx * d..i_idx * d + d];
                         let prev_assignment = *knn;
                         let dist_to_prev = if j_base == 0 {
@@ -323,6 +322,8 @@ pub fn find_nearest_neighbor_with_pruning(
                             vertical_d,
                             horizontal_d,
                             row,
+                            norm_x_i,
+                            &ny[j_base..j_base + bn_y],
                             partial_d,
                             prev_assignment,
                             dist_to_prev,
