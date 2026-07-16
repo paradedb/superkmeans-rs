@@ -9,6 +9,67 @@
 use crate::adsampling::ADSamplingPruner;
 use crate::common::{H_DIM_SIZE, KnnCandidate};
 
+use std::mem::MaybeUninit;
+
+/// Fill `positions` with the indices `i` where `distances[i] < threshold`,
+/// returning the count. Mirrors the C++ `InitPositionsArray`.
+fn collect_survivors(distances: &[f32], threshold: f32, positions: &mut Vec<u32>) -> usize {
+    positions.clear();
+    positions.reserve(distances.len());
+    let count = fill_survivors(distances, threshold, positions.spare_capacity_mut());
+    // SAFETY: `fill_survivors` initialized elements [0, count).
+    unsafe { positions.set_len(count) };
+    count
+}
+
+/// Branch-free compress: unconditionally write each index, advance the cursor
+/// only when the candidate survives. Avoids the data-dependent `push` (and its
+/// branch misprediction in the ~99%-pruned case) and lets the compare vectorize.
+#[cfg(not(target_arch = "aarch64"))]
+fn fill_survivors(distances: &[f32], threshold: f32, out: &mut [MaybeUninit<u32>]) -> usize {
+    let mut count = 0usize;
+    for (i, &dist) in distances.iter().enumerate() {
+        // SAFETY: count <= i < distances.len() <= out.len().
+        unsafe { out.get_unchecked_mut(count).write(i as u32) };
+        count += (dist < threshold) as usize;
+    }
+    count
+}
+
+/// NEON variant (matches the C++ NEON `InitPositionsArray`): compare 4 lanes at
+/// a time and skip the branch-free collect entirely for groups where none pass
+/// — the overwhelmingly common case, since pruning keeps well under 1%.
+#[cfg(target_arch = "aarch64")]
+fn fill_survivors(distances: &[f32], threshold: f32, out: &mut [MaybeUninit<u32>]) -> usize {
+    use std::arch::aarch64::*;
+    let n = distances.len();
+    let simd_n = n & !3;
+    let mut count = 0usize;
+    // SAFETY: NEON is baseline on aarch64; all indices below stay < n <= out.len().
+    unsafe {
+        let thr = vdupq_n_f32(threshold);
+        let mut i = 0;
+        while i < simd_n {
+            let cmp = vcltq_f32(vld1q_f32(distances.as_ptr().add(i)), thr);
+            if vmaxvq_u32(cmp) != 0 {
+                let mut mask = [0u32; 4];
+                vst1q_u32(mask.as_mut_ptr(), cmp);
+                for (k, &m) in mask.iter().enumerate() {
+                    out.get_unchecked_mut(count).write((i + k) as u32);
+                    count += (m != 0) as usize;
+                }
+            }
+            i += 4;
+        }
+        while i < n {
+            out.get_unchecked_mut(count).write(i as u32);
+            count += (*distances.get_unchecked(i) < threshold) as usize;
+            i += 1;
+        }
+    }
+    count
+}
+
 /// Top-1 search for a single query against `batch_n_y` centroids stored
 /// row-major in `centroids[(j..j+batch_n_y) * d]` (slice passed at the right
 /// offset). `partial_distances` already holds the GEMM-derived partial L2
@@ -34,14 +95,12 @@ pub fn top1_partial_search(
     let ratios = &pruner.ratios;
     let mut top = KnnCandidate::new(prev_top_1, prev_threshold);
 
-    positions_buf.clear();
     let init_threshold = top.distance * ratios[partial_d];
-    for i in 0..batch_n_y {
-        if partial_distances[i] < init_threshold {
-            positions_buf.push(i as u32);
-        }
-    }
-    let initial_not_pruned = positions_buf.len();
+    let initial_not_pruned = collect_survivors(
+        &partial_distances[..batch_n_y],
+        init_threshold,
+        positions_buf,
+    );
 
     // Early exit: only candidate is the previous best.
     if positions_buf.len() == 1 {
