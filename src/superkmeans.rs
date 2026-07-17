@@ -137,6 +137,12 @@ pub struct SuperKMeans {
     /// Reusable SGEMM output scratch, grown once and reused across iterations
     /// by `batch::find_nearest_neighbor*` to avoid per-iteration allocation.
     gemm_buf: Vec<f32>,
+
+    /// Reusable per-thread scratch for `update_centroids` (M-step): `n_threads`
+    /// private `n_clusters × d` accumulators and `n_clusters` counters, grown
+    /// once and reused across iterations.
+    mstep_acc: Vec<f32>,
+    mstep_cnt: Vec<u32>,
 }
 
 impl SuperKMeans {
@@ -198,6 +204,8 @@ impl SuperKMeans {
             recall: 0.0,
             iteration_stats: Vec::new(),
             gemm_buf: Vec::new(),
+            mstep_acc: Vec::new(),
+            mstep_cnt: Vec::new(),
         }
     }
 
@@ -662,38 +670,78 @@ impl SuperKMeans {
 
     pub(crate) fn update_centroids(&mut self, data: &[f32], n_samples: usize, n_clusters: usize) {
         let d = self.d;
-        // For correctness with rayon, parallelise over centroids: each thread
-        // handles a contiguous slice c0..c1 of clusters and scans all samples,
-        // matching the C++ kernel.
         let nt = self.n_threads.max(1);
-        let hc_ptr = self.horizontal_centroids.as_mut_ptr() as usize;
-        let cs_ptr = self.cluster_sizes.as_mut_ptr() as usize;
+
+        // Partition by SAMPLES: each thread scans its own contiguous slice once
+        // and accumulates into a private `n_clusters × d` buffer, then the
+        // buffers are reduced per cluster. The alternative — partition by
+        // clusters and have every thread scan all samples (the C++ kernel) —
+        // rescans the whole assignment array `nt` times, so it barely speeds up
+        // past a few threads. This version scans each sample exactly once and
+        // scales with the core count.
+        let acc_stride = n_clusters * d;
+        self.mstep_acc.resize(nt * acc_stride, 0.0);
+        self.mstep_acc.fill(0.0);
+        self.mstep_cnt.resize(nt * n_clusters, 0);
+        self.mstep_cnt.fill(0);
+
+        let acc_ptr = self.mstep_acc.as_mut_ptr() as usize;
+        let cnt_ptr = self.mstep_cnt.as_mut_ptr() as usize;
         let assignments = &self.assignments;
         rayon::scope(|s| {
             for rank in 0..nt {
-                let c0 = n_clusters * rank / nt;
-                let c1 = n_clusters * (rank + 1) / nt;
+                let s0 = n_samples * rank / nt;
+                let s1 = n_samples * (rank + 1) / nt;
                 s.spawn(move |_| {
-                    let hc = hc_ptr as *mut f32;
-                    let cs = cs_ptr as *mut u32;
-                    for i in 0..n_samples {
+                    // SAFETY: rank owns the disjoint `[rank*stride, (rank+1)*stride)`
+                    // slice of `mstep_acc` (and the analogous `mstep_cnt` slice).
+                    let acc = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            (acc_ptr as *mut f32).add(rank * acc_stride),
+                            acc_stride,
+                        )
+                    };
+                    let cnt = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            (cnt_ptr as *mut u32).add(rank * n_clusters),
+                            n_clusters,
+                        )
+                    };
+                    for i in s0..s1 {
                         let ci = assignments[i] as usize;
-                        if ci >= c0 && ci < c1 {
-                            unsafe {
-                                *cs.add(ci) = (*cs.add(ci)) + 1;
-                            }
-                            let vector = &data[i * d..(i + 1) * d];
-                            unsafe {
-                                let row = hc.add(ci * d);
-                                for j in 0..d {
-                                    *row.add(j) += vector[j];
-                                }
-                            }
+                        cnt[ci] += 1;
+                        let row = &mut acc[ci * d..ci * d + d];
+                        let vector = &data[i * d..(i + 1) * d];
+                        for j in 0..d {
+                            row[j] += vector[j];
                         }
                     }
                 });
             }
         });
+
+        // Reduce the per-thread partials into the centroid/size arrays, in
+        // parallel over clusters (disjoint output rows, so no contention).
+        let partials = &self.mstep_acc;
+        let counts = &self.mstep_cnt;
+        self.horizontal_centroids
+            .par_chunks_mut(d)
+            .zip(self.cluster_sizes.par_iter_mut())
+            .enumerate()
+            .for_each(|(ci, (row, sz))| {
+                for v in row.iter_mut() {
+                    *v = 0.0;
+                }
+                let mut total = 0u32;
+                for rank in 0..nt {
+                    total += counts[rank * n_clusters + ci];
+                    let src = &partials[rank * acc_stride + ci * d..rank * acc_stride + ci * d + d];
+                    for j in 0..d {
+                        row[j] += src[j];
+                    }
+                }
+                *sz = total;
+            });
     }
 
     pub(crate) fn consolidate_centroids(&mut self, n_samples: usize, n_clusters: usize) {
