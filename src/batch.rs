@@ -3,7 +3,11 @@
 use rayon::prelude::*;
 
 use crate::adsampling::ADSamplingPruner;
-use crate::common::{MINI_BATCH_SIZE, X_BATCH_SIZE, Y_BATCH_SIZE};
+use crate::common::{X_BATCH_SIZE, Y_BATCH_SIZE};
+// MINI_BATCH_SIZE only exists (and is only used) on macOS, where the partial
+// GEMM is mini-batched across threads for the AMX units.
+#[cfg(target_os = "macos")]
+use crate::common::MINI_BATCH_SIZE;
 use crate::distance::l2_squared;
 use crate::pdxearch::top1_partial_search;
 
