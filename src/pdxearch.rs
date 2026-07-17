@@ -8,6 +8,7 @@
 
 use crate::adsampling::ADSamplingPruner;
 use crate::common::{H_DIM_SIZE, KnnCandidate};
+use crate::distance::l2_squared;
 
 use std::mem::MaybeUninit;
 
@@ -215,12 +216,7 @@ pub fn top1_partial_search(
         for &v_idx in positions_buf.iter() {
             let i = v_idx as usize;
             let row = &centroids[i * d + offset..i * d + offset + block_size];
-            let mut acc = 0.0_f32;
-            for k in 0..block_size {
-                let diff = q_slice[k] - row[k];
-                acc += diff * diff;
-            }
-            partial_distances[i] += acc;
+            partial_distances[i] += l2_squared(q_slice, row);
         }
 
         current_horizontal += block_size;
@@ -238,12 +234,7 @@ pub fn top1_partial_search(
         for &v_idx in positions_buf.iter() {
             let i = v_idx as usize;
             let row = &centroids[i * d + offset..i * d + offset + dims_left];
-            let mut acc = 0.0_f32;
-            for k in 0..dims_left {
-                let diff = q_slice[k] - row[k];
-                acc += diff * diff;
-            }
-            partial_distances[i] += acc;
+            partial_distances[i] += l2_squared(q_slice, row);
         }
 
         current_dim = d;
