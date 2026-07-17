@@ -25,8 +25,8 @@ fn collect_survivors(distances: &[f32], threshold: f32, positions: &mut Vec<u32>
 /// Branch-free compress: unconditionally write each index, advance the cursor
 /// only when the candidate survives. Avoids the data-dependent `push` (and its
 /// branch misprediction in the ~99%-pruned case) and lets the compare vectorize.
-#[cfg(not(target_arch = "aarch64"))]
-fn fill_survivors(distances: &[f32], threshold: f32, out: &mut [MaybeUninit<u32>]) -> usize {
+/// Portable fallback, and the tail handler for the SIMD paths below.
+fn fill_survivors_scalar(distances: &[f32], threshold: f32, out: &mut [MaybeUninit<u32>]) -> usize {
     let mut count = 0usize;
     for (i, &dist) in distances.iter().enumerate() {
         // SAFETY: count <= i < distances.len() <= out.len().
@@ -34,6 +34,98 @@ fn fill_survivors(distances: &[f32], threshold: f32, out: &mut [MaybeUninit<u32>
         count += (dist < threshold) as usize;
     }
     count
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+fn fill_survivors(distances: &[f32], threshold: f32, out: &mut [MaybeUninit<u32>]) -> usize {
+    fill_survivors_scalar(distances, threshold, out)
+}
+
+/// x86-64: runtime-dispatch to the widest available SIMD compress, mirroring the
+/// C++ arch selection (AVX512 → AVX2 → scalar).
+///
+/// NOTE: written to match the C++ AVX2/AVX512 `InitPositionsArray` but NOT yet
+/// validated on x86 hardware — needs a Linux-x86 CI run to confirm recall parity
+/// and the speedup before relying on it. The aarch64 NEON path (below) is the
+/// one exercised here. The scalar fallback stays correct on any x86 CPU.
+#[cfg(target_arch = "x86_64")]
+fn fill_survivors(distances: &[f32], threshold: f32, out: &mut [MaybeUninit<u32>]) -> usize {
+    if is_x86_feature_detected!("avx512f") {
+        // SAFETY: guarded by runtime feature detection.
+        unsafe { fill_survivors_avx512(distances, threshold, out) }
+    } else if is_x86_feature_detected!("avx2") {
+        // SAFETY: guarded by runtime feature detection.
+        unsafe { fill_survivors_avx2(distances, threshold, out) }
+    } else {
+        fill_survivors_scalar(distances, threshold, out)
+    }
+}
+
+/// AVX2 (8-wide): movemask the compare, and for groups with any survivor do the
+/// branch-free collect. Matches the C++ AVX2 `InitPositionsArray`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn fill_survivors_avx2(distances: &[f32], threshold: f32, out: &mut [MaybeUninit<u32>]) -> usize {
+    use std::arch::x86_64::*;
+    // SAFETY: caller ensures AVX2; count <= i < n <= out.len() throughout.
+    unsafe {
+        let n = distances.len();
+        let simd_n = n & !7;
+        let mut count = 0usize;
+        let thr = _mm256_set1_ps(threshold);
+        let mut i = 0;
+        while i < simd_n {
+            let cmp = _mm256_cmp_ps::<_CMP_LT_OQ>(_mm256_loadu_ps(distances.as_ptr().add(i)), thr);
+            let mask = _mm256_movemask_ps(cmp);
+            if mask != 0 {
+                for k in 0..8 {
+                    out.get_unchecked_mut(count).write((i + k) as u32);
+                    count += ((mask >> k) & 1) as usize;
+                }
+            }
+            i += 8;
+        }
+        while i < n {
+            out.get_unchecked_mut(count).write(i as u32);
+            count += (*distances.get_unchecked(i) < threshold) as usize;
+            i += 1;
+        }
+        count
+    }
+}
+
+/// AVX512 (16-wide): compare to a mask register and use the hardware
+/// compress-store (`vpcompressd`) to write only the surviving indices. Matches
+/// the C++ AVX512 `InitPositionsArray`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn fill_survivors_avx512(distances: &[f32], threshold: f32, out: &mut [MaybeUninit<u32>]) -> usize {
+    use std::arch::x86_64::*;
+    // SAFETY: caller ensures AVX512F; count + popcount(mask) <= n <= out.len().
+    unsafe {
+        let n = distances.len();
+        let simd_n = n & !15;
+        let mut count = 0usize;
+        let thr = _mm512_set1_ps(threshold);
+        let iota = _mm512_set_epi32(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
+        let mut i = 0;
+        while i < simd_n {
+            let mask =
+                _mm512_cmp_ps_mask::<_CMP_LT_OQ>(_mm512_loadu_ps(distances.as_ptr().add(i)), thr);
+            if mask != 0 {
+                let indices = _mm512_add_epi32(_mm512_set1_epi32(i as i32), iota);
+                _mm512_mask_compressstoreu_epi32(out.as_mut_ptr().add(count).cast(), mask, indices);
+                count += mask.count_ones() as usize;
+            }
+            i += 16;
+        }
+        while i < n {
+            out.get_unchecked_mut(count).write(i as u32);
+            count += (*distances.get_unchecked(i) < threshold) as usize;
+            i += 1;
+        }
+        count
+    }
 }
 
 /// NEON variant (matches the C++ NEON `InitPositionsArray`): compare 4 lanes at
