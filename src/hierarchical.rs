@@ -451,6 +451,13 @@ impl HierarchicalSuperKMeans {
     ) {
         let d = self.base.d;
         let dn = &mut self.base.data_norms;
+        // `data_norms` is reassigned to a shorter vec whenever a mesocluster's
+        // fine clustering recomputes partial norms (length = that mesocluster's
+        // size). A subsequent, larger mesocluster would then overflow it here,
+        // so ensure it can hold this mesocluster's per-point norms.
+        if dn.len() < mesocluster_size {
+            dn.resize(mesocluster_size, 0.0);
+        }
         buffer
             .par_chunks_mut(d)
             .take(mesocluster_size)
