@@ -6,6 +6,27 @@
 //! All three enable the internal `blas` marker feature; exactly one backend
 //! should be selected. OpenBLAS is linked by the `openblas-src` crate (see
 //! `lib.rs`); Accelerate is a system framework linked here.
+//!
+//! # OpenBLAS threading (Linux/x86 performance)
+//!
+//! Training alternates a BLAS-threaded GEMM with a Rayon-parallel pruning pass
+//! many times per iteration. By default OpenBLAS keeps its worker threads
+//! **spin-waiting** after each GEMM; those spinners then contend with Rayon's
+//! threads during the pruning pass, oversubscribing the cores. Profiling a
+//! Cohere run (1M × 1024, k=4000, 16 threads) showed the port spending ~17% of
+//! its time in the kernel/scheduler (vs ~1% for the C++ reference) purely from
+//! this contention — GEMM and the distance kernels themselves were on par.
+//!
+//! Setting `OPENBLAS_THREAD_TIMEOUT=1` in the environment tells the OpenBLAS
+//! workers to stop spinning promptly, which removed almost all of that
+//! overhead: training dropped ~57s → ~47.5s (−18%), matching the C++ reference.
+//! OpenBLAS reads this variable once, before it initializes, so it must be set
+//! in the environment (there is no runtime API and no library hook that runs
+//! early enough). Recommended when using the `openblas` backend on many cores:
+//!
+//! ```sh
+//! OPENBLAS_THREAD_TIMEOUT=1 ./your_binary
+//! ```
 
 #[cfg(feature = "blas")]
 mod blas_backend {
