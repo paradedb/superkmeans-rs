@@ -2,7 +2,6 @@
 
 use rayon::prelude::*;
 
-use crate::adsampling::ADSamplingPruner;
 use crate::common::{
     DIMENSION_THRESHOLD_FOR_PRUNING, HIERARCHICAL_PRUNER_INITIAL_THRESHOLD, MIN_PARTIAL_D,
     N_CLUSTERS_THRESHOLD_FOR_PRUNING,
@@ -76,12 +75,13 @@ impl HierarchicalSuperKMeans {
         let mut base_config = config.base.clone();
         base_config.use_aggressive_split = true;
         let mut base = SuperKMeans::with_config(n_clusters, dimensionality, base_config);
-        // The hierarchical variant uses a less aggressive pruning ratio.
-        base.pruner = ADSamplingPruner::new(
-            dimensionality,
-            HIERARCHICAL_PRUNER_INITIAL_THRESHOLD,
-            base.config.seed,
-        );
+        // The hierarchical variant uses a less aggressive pruning ratio. Only the
+        // per-dimension ratios differ from the base pruner — the random rotation
+        // matrix is a function of (dimensionality, seed), both identical here — so
+        // adjust epsilon0 in place instead of rebuilding it, which would repeat the
+        // O(d³) Householder QR for a bit-identical matrix.
+        base.pruner
+            .set_epsilon0(HIERARCHICAL_PRUNER_INITIAL_THRESHOLD);
 
         if n_clusters <= 128 && !config.base.suppress_warnings {
             eprintln!(
