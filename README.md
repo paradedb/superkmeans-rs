@@ -38,7 +38,7 @@ dimensionality grows.
 superkmeans-rs = "0.1"
 ```
 
-The minimum supported Rust version (MSRV) is **1.85**.
+The minimum supported Rust version (MSRV) is **1.89** (required by the AVX512 intrinsics used in the pruning kernels).
 
 ## Quick Start
 

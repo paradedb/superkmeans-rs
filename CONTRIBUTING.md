@@ -4,7 +4,7 @@ Thanks for your interest in contributing to superkmeans-rs!
 
 ## Prerequisites
 
-- **Rust 1.85+** (the minimum supported Rust version)
+- **Rust 1.89+** (the minimum supported Rust version)
 - Optional, for the BLAS backends:
   - `openblas` — a system OpenBLAS (`libopenblas-dev` on Debian/Ubuntu, `brew install openblas` on macOS)
   - `accelerate` — macOS only; uses the system Accelerate framework (no extra install)
