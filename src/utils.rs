@@ -110,7 +110,7 @@ pub fn generate_random_vectors(
 }
 
 pub fn ceil_to_multiple(x: u32, m: u32) -> u32 {
-    if m == 0 { x } else { ((x + m - 1) / m) * m }
+    if m == 0 { x } else { x.div_ceil(m) * m }
 }
 
 pub fn is_power_of_two(x: u32) -> bool {

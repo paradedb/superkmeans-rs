@@ -1,0 +1,29 @@
+version: 2
+
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-patch"]
+      # MSRV is intentionally pinned to a specific Rust version (1.85).
+      # Ignore updates so Dependabot doesn't try to bump it every month.
+      - dependency-name: "dtolnay/rust-toolchain"
+    groups:
+      github-actions-dependencies:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-patch"]
+    groups:
+      cargo-dependencies:
+        patterns:
+          - "*"

@@ -4,6 +4,7 @@
 //!   1. `OPENBLAS_LIB_DIR` env var — explicit override (Windows / custom installs).
 //!   2. `pkg-config` for `openblas` (Linux, macOS/Homebrew with PKG_CONFIG_PATH set).
 //!   3. Bare `-lopenblas`, trusting the linker's default search path.
+//!
 //! Accelerate needs nothing here — it is linked via a framework attribute.
 
 fn main() {

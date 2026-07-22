@@ -2,8 +2,15 @@
 name = "superkmeans-rs"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+authors = ["ParadeDB <support@paradedb.com>"]
 description = "A Rust port of SuperKMeans: fast k-means clustering for high-dimensional vector embeddings"
 license = "MIT"
+readme = "README.md"
+repository = "https://github.com/paradedb/superkmeans-rs"
+homepage = "https://github.com/paradedb/superkmeans-rs"
+categories = ["algorithms", "science", "mathematics"]
+keywords = ["kmeans", "clustering", "embeddings", "vector", "simd"]
 
 [lib]
 name = "superkmeans"
