@@ -27,7 +27,7 @@ pub fn get_dimension_split(d: usize) -> PdxDimensionSplit {
     }
     let mut horizontal_d = (d as f64 * local_proportion) as usize;
     let mut vertical_d = d - horizontal_d;
-    if horizontal_d % H_DIM_SIZE > 0 {
+    if !horizontal_d.is_multiple_of(H_DIM_SIZE) {
         horizontal_d = ((horizontal_d as f64 / H_DIM_SIZE as f64).round() as usize) * H_DIM_SIZE;
         vertical_d = d - horizontal_d;
     }

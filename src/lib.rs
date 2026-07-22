@@ -4,6 +4,17 @@
 //! The C++ original lives in `SuperKMeans/`; this crate re-implements the
 //! C++ public API (no Python surface) in pure Rust with no FFI dependencies.
 
+// The numeric kernels favor explicit index arithmetic and wide, positional
+// argument lists that mirror the C++ original, so a handful of Clippy style
+// lints are relaxed crate-wide rather than obscuring the ports.
+#![allow(
+    clippy::needless_range_loop,
+    clippy::too_many_arguments,
+    clippy::manual_memcpy,
+    clippy::field_reassign_with_default,
+    clippy::doc_lazy_continuation
+)]
+
 // OpenBLAS is linked by `build.rs` (via pkg-config or OPENBLAS_LIB_DIR);
 // Accelerate is linked by the framework attribute in `gemm.rs`.
 #[cfg(all(

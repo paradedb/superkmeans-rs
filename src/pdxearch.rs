@@ -66,7 +66,11 @@ fn fill_survivors(distances: &[f32], threshold: f32, out: &mut [MaybeUninit<u32>
 /// branch-free collect. Matches the C++ AVX2 `InitPositionsArray`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn fill_survivors_avx2(distances: &[f32], threshold: f32, out: &mut [MaybeUninit<u32>]) -> usize {
+unsafe fn fill_survivors_avx2(
+    distances: &[f32],
+    threshold: f32,
+    out: &mut [MaybeUninit<u32>],
+) -> usize {
     use std::arch::x86_64::*;
     // SAFETY: caller ensures AVX2; count <= i < n <= out.len() throughout.
     unsafe {
@@ -100,7 +104,11 @@ unsafe fn fill_survivors_avx2(distances: &[f32], threshold: f32, out: &mut [Mayb
 /// the C++ AVX512 `InitPositionsArray`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
-unsafe fn fill_survivors_avx512(distances: &[f32], threshold: f32, out: &mut [MaybeUninit<u32>]) -> usize {
+unsafe fn fill_survivors_avx512(
+    distances: &[f32],
+    threshold: f32,
+    out: &mut [MaybeUninit<u32>],
+) -> usize {
     use std::arch::x86_64::*;
     // SAFETY: caller ensures AVX512F; count + popcount(mask) <= n <= out.len().
     unsafe {
