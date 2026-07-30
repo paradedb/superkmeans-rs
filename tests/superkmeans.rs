@@ -373,3 +373,84 @@ fn pre_rotated_data_produces_identical_results() {
         "avg abs error {avg_abs_error} too large"
     );
 }
+
+fn assert_centroids_match(a: &[f32], b: &[f32], tol: f32) {
+    assert_eq!(a.len(), b.len());
+    let mut max_abs_error = 0.0_f32;
+    for i in 0..a.len() {
+        let e = (a[i] - b[i]).abs();
+        if e > max_abs_error {
+            max_abs_error = e;
+        }
+    }
+    assert!(
+        max_abs_error < tol,
+        "max abs error {max_abs_error} exceeds {tol}"
+    );
+}
+
+#[test]
+fn train_owned_matches_train() {
+    let n = 5_000;
+    let d = 64;
+    let k = 50;
+    let data = default_blobs(n, d, k);
+
+    let cfg = SuperKMeansConfig {
+        iters: 10,
+        seed: 42,
+        sampling_fraction: 1.0,
+        ..Default::default()
+    };
+    let mut borrowed = SuperKMeans::with_config(k, d, cfg.clone());
+    let centroids_borrowed = borrowed.train(&data, n);
+
+    let mut owned = SuperKMeans::with_config(k, d, cfg);
+    let centroids_owned = owned.train_owned(data.clone(), n);
+
+    assert_centroids_match(&centroids_borrowed, &centroids_owned, 1e-4);
+}
+
+#[test]
+fn train_owned_matches_train_with_sampling() {
+    let n = 5_000;
+    let d = 64;
+    let k = 50;
+    let data = default_blobs(n, d, k);
+
+    let cfg = SuperKMeansConfig {
+        iters: 10,
+        seed: 42,
+        sampling_fraction: 0.5,
+        ..Default::default()
+    };
+    let mut borrowed = SuperKMeans::with_config(k, d, cfg.clone());
+    let centroids_borrowed = borrowed.train(&data, n);
+
+    let mut owned = SuperKMeans::with_config(k, d, cfg);
+    let centroids_owned = owned.train_owned(data.clone(), n);
+
+    assert_centroids_match(&centroids_borrowed, &centroids_owned, 1e-4);
+}
+
+#[test]
+fn hierarchical_train_owned_matches_train() {
+    use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig};
+
+    let n = 10_000;
+    let d = 64;
+    let k = 200;
+    let data = make_blobs(n, d, k, false, 1.0, 10.0, 42);
+
+    let mut cfg = HierarchicalSuperKMeansConfig::default();
+    cfg.base.seed = 42;
+    cfg.base.suppress_warnings = true;
+
+    let mut borrowed = HierarchicalSuperKMeans::with_config(k, d, cfg.clone());
+    let centroids_borrowed = borrowed.train(&data, n);
+
+    let mut owned = HierarchicalSuperKMeans::with_config(k, d, cfg);
+    let centroids_owned = owned.train_owned(data.clone(), n);
+
+    assert_centroids_match(&centroids_borrowed, &centroids_owned, 1e-4);
+}
