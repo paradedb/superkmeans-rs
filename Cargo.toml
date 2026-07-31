@@ -34,6 +34,9 @@ rand_distr = "0.4"
 # Used only to locate a system OpenBLAS when the `openblas` feature is on.
 pkg-config = "0.3"
 
+[dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
+
 [profile.release]
 opt-level = 3
 lto = "thin"
@@ -46,3 +49,7 @@ path = "examples/simple_clustering.rs"
 [[example]]
 name = "hierarchical_clustering"
 path = "examples/hierarchical_clustering.rs"
+
+[[bench]]
+name = "cohere"
+harness = false
