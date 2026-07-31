@@ -975,7 +975,13 @@ impl SuperKMeans {
         rotate: bool,
     ) -> Vec<f32> {
         let samples = self.gather_samples(data, n);
-        self.rotate_samples(samples, rotate)
+        if rotate {
+            let mut rotated = vec![0.0_f32; self.n_samples * self.d];
+            self.pruner.rotate(&samples, &mut rotated, self.n_samples);
+            rotated
+        } else {
+            samples
+        }
     }
 
     /// Owned variant: when no subsampling is needed, rotates `data` in place
@@ -986,7 +992,7 @@ impl SuperKMeans {
         n: usize,
         rotate: bool,
     ) -> Vec<f32> {
-        let samples = if self.n_samples < n {
+        let mut samples = if self.n_samples < n {
             self.gather_samples(&data, n)
         } else {
             self.sampled_indices = (0..n).collect();
@@ -996,7 +1002,10 @@ impl SuperKMeans {
             data.truncate(self.n_samples * self.d);
             data
         };
-        self.rotate_samples(samples, rotate)
+        if rotate {
+            self.pruner.rotate_in_place(&mut samples, self.n_samples);
+        }
+        samples
     }
 
     fn gather_samples(&mut self, data: &[f32], n: usize) -> Vec<f32> {
@@ -1026,13 +1035,6 @@ impl SuperKMeans {
             }
             data[..n_samples * d].to_vec()
         }
-    }
-
-    fn rotate_samples(&self, mut samples: Vec<f32>, rotate: bool) -> Vec<f32> {
-        if rotate {
-            self.pruner.rotate_in_place(&mut samples, self.n_samples);
-        }
-        samples
     }
 
     /// Copy horizontal_centroids -> prev_centroids, applying rotation if needed.
