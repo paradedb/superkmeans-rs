@@ -1,5 +1,7 @@
 //! Core SuperKMeans algorithm: BLAS+pruning k-means.
 
+use std::borrow::Cow;
+
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, Uniform, WeightedIndex};
@@ -206,9 +208,26 @@ impl SuperKMeans {
         self.train_with_queries(data, n, &[], 0)
     }
 
+    /// Like `train`, but takes ownership of `data`. When no subsampling is
+    /// configured, the buffer is rotated in place, so peak memory is one copy
+    /// of the training set instead of two.
+    pub fn train_owned(&mut self, data: Vec<f32>, n: usize) -> Vec<f32> {
+        self.train_impl(Cow::Owned(data), n, &[], 0)
+    }
+
     pub fn train_with_queries(
         &mut self,
         data: &[f32],
+        n: usize,
+        queries: &[f32],
+        n_queries: usize,
+    ) -> Vec<f32> {
+        self.train_impl(Cow::Borrowed(data), n, queries, n_queries)
+    }
+
+    fn train_impl(
+        &mut self,
+        data: Cow<'_, [f32]>,
         n: usize,
         queries: &[f32],
         n_queries: usize,
@@ -258,12 +277,15 @@ impl SuperKMeans {
 
         // Sample initial centroids (Forgy) and rotate them into prev_centroids/horizontal_centroids.
         let rotate = !self.config.data_already_rotated;
-        self.generate_centroids(data, n, rotate);
+        self.generate_centroids(&data, n, rotate);
 
         if self.config.verbose {
             println!("Sampling data...");
         }
-        let data_to_cluster = self.sample_and_rotate_vectors(data, n, rotate);
+        let data_to_cluster = match data {
+            Cow::Borrowed(borrowed) => self.sample_and_rotate_vectors(borrowed, n, rotate),
+            Cow::Owned(owned) => self.sample_and_rotate_vectors_owned(owned, n, rotate),
+        };
 
         // horizontal_centroids currently holds the unrotated Forgy samples.
         // Rotate (or copy) into prev_centroids.
@@ -952,6 +974,41 @@ impl SuperKMeans {
         n: usize,
         rotate: bool,
     ) -> Vec<f32> {
+        let samples = self.gather_samples(data, n);
+        if rotate {
+            let mut rotated = vec![0.0_f32; self.n_samples * self.d];
+            self.pruner.rotate(&samples, &mut rotated, self.n_samples);
+            rotated
+        } else {
+            samples
+        }
+    }
+
+    /// Owned variant: when no subsampling is needed, rotates `data` in place
+    /// instead of allocating a second full-size buffer.
+    pub(crate) fn sample_and_rotate_vectors_owned(
+        &mut self,
+        mut data: Vec<f32>,
+        n: usize,
+        rotate: bool,
+    ) -> Vec<f32> {
+        let mut samples = if self.n_samples < n {
+            self.gather_samples(&data, n)
+        } else {
+            self.sampled_indices = (0..n).collect();
+            if self.config.verbose {
+                println!("Using {} vectors", self.n_samples);
+            }
+            data.truncate(self.n_samples * self.d);
+            data
+        };
+        if rotate {
+            self.pruner.rotate_in_place(&mut samples, self.n_samples);
+        }
+        samples
+    }
+
+    fn gather_samples(&mut self, data: &[f32], n: usize) -> Vec<f32> {
         let d = self.d;
         let n_samples = self.n_samples;
 
@@ -970,27 +1027,13 @@ impl SuperKMeans {
                 let src = self.sampled_indices[i] * d;
                 dst.copy_from_slice(&data[src..src + d]);
             });
-            if rotate {
-                let mut rotated = vec![0.0_f32; n_samples * d];
-                self.pruner.rotate(&samples, &mut rotated, n_samples);
-                rotated
-            } else {
-                samples
-            }
+            samples
         } else {
-            // No sampling.
             self.sampled_indices = (0..n).collect();
             if self.config.verbose {
                 println!("Using {} vectors", n_samples);
             }
-            if rotate {
-                let mut rotated = vec![0.0_f32; n_samples * d];
-                self.pruner
-                    .rotate(&data[..n_samples * d], &mut rotated, n_samples);
-                rotated
-            } else {
-                data[..n_samples * d].to_vec()
-            }
+            data[..n_samples * d].to_vec()
         }
     }
 

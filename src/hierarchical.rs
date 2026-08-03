@@ -1,5 +1,7 @@
 //! Hierarchical SuperKMeans: 3-phase clustering for very large k.
 
+use std::borrow::Cow;
+
 use rayon::prelude::*;
 
 use crate::adsampling::ADSamplingPruner;
@@ -99,6 +101,17 @@ impl HierarchicalSuperKMeans {
     }
 
     pub fn train(&mut self, data: &[f32], n: usize) -> Vec<f32> {
+        self.train_impl(Cow::Borrowed(data), n)
+    }
+
+    /// Like `train`, but takes ownership of `data`. When no subsampling is
+    /// configured (the hierarchical default), the buffer is rotated in place,
+    /// so peak memory is one copy of the training set instead of two.
+    pub fn train_owned(&mut self, data: Vec<f32>, n: usize) -> Vec<f32> {
+        self.train_impl(Cow::Owned(data), n)
+    }
+
+    fn train_impl(&mut self, data: Cow<'_, [f32]>, n: usize) -> Vec<f32> {
         assert!(n > 0, "n must be positive");
         assert!(!self.base.trained, "already trained");
         assert!(
@@ -153,12 +166,15 @@ impl HierarchicalSuperKMeans {
         let rotate = !self.base.config.data_already_rotated;
         // Generate mesocluster initial centroids.
         self.base.n_clusters = self.n_mesoclusters; // temporarily for generate_centroids
-        self.base.generate_centroids(data, n, rotate);
+        self.base.generate_centroids(&data, n, rotate);
         // Restore for storage sizing semantics; n_clusters drives storage but generate_centroids
         // only writes the first n_mesoclusters rows.
         self.base.n_clusters = n_clusters;
 
-        let data_to_cluster = self.base.sample_and_rotate_vectors(data, n, rotate);
+        let data_to_cluster = match data {
+            Cow::Borrowed(borrowed) => self.base.sample_and_rotate_vectors(borrowed, n, rotate),
+            Cow::Owned(owned) => self.base.sample_and_rotate_vectors_owned(owned, n, rotate),
+        };
 
         // Mirror horizontal_centroids -> prev_centroids for first iteration.
         self.base.prev_centroids[..self.n_mesoclusters * d]

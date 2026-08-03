@@ -59,6 +59,36 @@ impl ADSamplingPruner {
         gemm::sgemm_ld(false, true, n, d, d, vectors, d, &self.matrix, d, out, d);
     }
 
+    /// In-place `rotate`: rewrites `data` block-by-block through a bounded
+    /// scratch buffer instead of a second full-size allocation.
+    pub fn rotate_in_place(&self, data: &mut [f32], n: usize) {
+        self.rotate_in_place_blocked(data, n, 8 << 20);
+    }
+
+    fn rotate_in_place_blocked(&self, data: &mut [f32], n: usize, scratch_bytes: usize) {
+        let d = self.num_dimensions;
+        debug_assert!(data.len() >= n * d);
+        let block_rows = (scratch_bytes / (d * 4)).clamp(1, n.max(1));
+        let mut scratch = vec![0.0_f32; block_rows * d];
+        for chunk in data[..n * d].chunks_mut(block_rows * d) {
+            let rows = chunk.len() / d;
+            gemm::sgemm_ld(
+                false,
+                true,
+                rows,
+                d,
+                d,
+                chunk,
+                d,
+                &self.matrix,
+                d,
+                &mut scratch[..rows * d],
+                d,
+            );
+            chunk.copy_from_slice(&scratch[..rows * d]);
+        }
+    }
+
     /// out = rotated * matrix   (inverse of `rotate` for orthonormal matrix).
     pub fn unrotate(&self, rotated: &[f32], out: &mut [f32], n: usize) {
         let d = self.num_dimensions;
@@ -220,6 +250,29 @@ mod tests {
             assert!(max_err < 1e-3, "max error {max_err} too large for d={d}");
             assert!(avg_err < 1e-5, "avg error {avg_err} too large for d={d}");
         }
+    }
+
+    #[test]
+    fn rotate_in_place_matches_rotate() {
+        let d = 64;
+        let n = 100;
+        let pruner = ADSamplingPruner::new(d, 2.1, 42);
+        let original = generate_random_vectors(n, d, -1.0, 1.0, 7);
+        let mut expected = vec![0.0_f32; n * d];
+        pruner.rotate(&original, &mut expected, n);
+
+        // Small scratch forces multiple blocks (8 rows per block).
+        let mut in_place = original.clone();
+        pruner.rotate_in_place_blocked(&mut in_place, n, 8 * d * 4);
+        for i in 0..n * d {
+            let e = (expected[i] - in_place[i]).abs();
+            assert!(e < 1e-5, "mismatch at {i}: {e}");
+        }
+
+        // Default scratch (single block at this size).
+        let mut single_block = original.clone();
+        pruner.rotate_in_place(&mut single_block, n);
+        assert_eq!(single_block, expected);
     }
 
     #[test]
