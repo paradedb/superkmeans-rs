@@ -16,11 +16,13 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use superkmeans::{HierarchicalSuperKMeans, SuperKMeans};
+use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, SuperKMeans};
 
 const N: usize = 1_000_000;
 const D: usize = 1024;
 const K: usize = 100_000;
+/// Target roughly K leaves for the hierarchical bench (`N / max_leaf_size`).
+const HIER_MAX_LEAF_SIZE: usize = N / K;
 
 fn data_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/data_cohere_1m.bin")
@@ -78,10 +80,17 @@ fn bench_train(c: &mut Criterion) {
     );
 
     group.bench_function(
-        BenchmarkId::new("HierarchicalSuperKMeans", format!("n{N}_k{K}_d{D}")),
+        BenchmarkId::new(
+            "HierarchicalSuperKMeans",
+            format!("n{N}_leaf{HIER_MAX_LEAF_SIZE}_d{D}"),
+        ),
         |b| {
             b.iter(|| {
-                let mut kmeans = HierarchicalSuperKMeans::new(K, D);
+                let cfg = HierarchicalSuperKMeansConfig {
+                    max_leaf_size: HIER_MAX_LEAF_SIZE,
+                    ..Default::default()
+                };
+                let mut kmeans = HierarchicalSuperKMeans::with_config(D, cfg);
                 let centroids = kmeans.train(black_box(data), black_box(N));
                 black_box(centroids);
             });
@@ -100,7 +109,11 @@ fn bench_assign(c: &mut Criterion) {
         kmeans.train(data, N)
     };
     let hier_centroids = {
-        let mut kmeans = HierarchicalSuperKMeans::new(K, D);
+        let cfg = HierarchicalSuperKMeansConfig {
+            max_leaf_size: HIER_MAX_LEAF_SIZE,
+            ..Default::default()
+        };
+        let mut kmeans = HierarchicalSuperKMeans::with_config(D, cfg);
         kmeans.train(data, N)
     };
 
@@ -121,10 +134,13 @@ fn bench_assign(c: &mut Criterion) {
     );
 
     group.bench_function(
-        BenchmarkId::new("HierarchicalSuperKMeans", format!("n{N}_k{K}_d{D}")),
+        BenchmarkId::new(
+            "HierarchicalSuperKMeans",
+            format!("n{N}_leaf{HIER_MAX_LEAF_SIZE}_d{D}"),
+        ),
         |b| {
             b.iter(|| {
-                let kmeans = HierarchicalSuperKMeans::new(K, D);
+                let kmeans = HierarchicalSuperKMeans::new(D);
                 let assignments =
                     kmeans.assign(black_box(data), black_box(&hier_centroids), black_box(N));
                 black_box(assignments);

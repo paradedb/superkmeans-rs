@@ -1,23 +1,34 @@
-//! Rust port of `SuperKMeans/examples/hierarchical_clustering.cpp`.
+//! Hierarchical SuperKMeans (HBC) example.
+//!
+//! By default the root uses a √K meso split and deeper nodes finish toward
+//! `max_leaf_size`. Pass an optional branching factor to force fixed fan-out.
 
 use std::env;
 use std::process::ExitCode;
 
-use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, TicToc, make_blobs};
+use superkmeans::{
+    HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, SuperKMeans, TicToc, make_blobs,
+};
 
 fn print_usage(program: &str) {
     println!(
-        "Usage: {} [n] [d] [k]\n  n: Number of vectors (default: 1000000)\n  d: Dimensionality (default: 768)\n  k: Number of clusters (default: 10000)\n\nExample:\n  {} 500000 512 100",
-        program, program
+        "Usage: {} [n] [d] [max_leaf_size] [branching_factor]\n  \
+         n: Number of vectors (default: 100000)\n  \
+         d: Dimensionality (default: 128)\n  \
+         max_leaf_size: Stop splitting below this size (default: 256)\n  \
+         branching_factor: Optional fixed fan-out; omit for HBC √K meso default\n\n\
+         Example:\n  {} 50000 64 128\n  {} 50000 64 128 16",
+        program, program, program
     );
 }
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
 
-    let mut n: usize = 1_000_000;
-    let mut d: usize = 768;
-    let mut k: usize = 10_000;
+    let mut n: usize = 100_000;
+    let mut d: usize = 128;
+    let mut max_leaf_size: usize = 256;
+    let mut branching_factor: Option<usize> = None;
 
     if args.len() > 1 {
         if args[1] == "-h" || args[1] == "--help" {
@@ -30,27 +41,47 @@ fn main() -> ExitCode {
         d = args[2].parse().unwrap_or(d);
     }
     if args.len() > 3 {
-        k = args[3].parse().unwrap_or(k);
+        max_leaf_size = args[3].parse().unwrap_or(max_leaf_size);
+    }
+    if args.len() > 4 {
+        branching_factor = args[4].parse().ok();
     }
 
-    println!("Parameters: n={}, d={}, k={}", n, d, k);
-    println!("Generating {} vectors with d={}", n, d);
+    println!(
+        "Parameters: n={n}, d={d}, max_leaf_size={max_leaf_size}, branching_factor={branching_factor:?}"
+    );
+    println!("Generating {n} vectors with d={d}");
     let data = make_blobs(n, d, 100, true, 1.0, 10.0, 42);
 
-    let mut cfg = HierarchicalSuperKMeansConfig::default();
+    let mut cfg = HierarchicalSuperKMeansConfig {
+        max_leaf_size,
+        branching_factor,
+        ..Default::default()
+    };
     cfg.base.verbose = env::var("SUPERKMEANS_VERBOSE").is_ok();
-    let mut kmeans = HierarchicalSuperKMeans::with_config(k, d, cfg);
+    let mut kmeans = HierarchicalSuperKMeans::with_config(d, cfg);
 
-    println!("Running HierarchicalSuperKMeans with {} clusters...", k);
+    println!("Running HierarchicalSuperKMeans...");
     let mut timer = TicToc::new();
     timer.tic();
     let centroids = kmeans.train(&data, n);
     timer.toc();
-    let construction_time_ms = timer.milliseconds();
-    println!("Index built in: {} ms", construction_time_ms);
+    println!("Index built in: {} ms", timer.milliseconds());
+    println!(
+        "Tree: n_leaves={}, nodes={}, root_size={}",
+        kmeans.tree.n_leaves,
+        kmeans.tree.nodes.len(),
+        kmeans.tree.node(kmeans.tree.root).size()
+    );
 
     let assignments = kmeans.assign(&data, &centroids, n);
     println!("Got {} assignments", assignments.len());
+
+    let stats = SuperKMeans::cluster_balance_stats(&assignments, n, kmeans.tree.n_leaves);
+    println!(
+        "Leaf balance: mean={:.1} min={} max={} cv={:.3}",
+        stats.mean, stats.min, stats.max, stats.cv
+    );
 
     ExitCode::SUCCESS
 }

@@ -101,21 +101,6 @@ fn invalid_n_less_than_n_clusters() {
 }
 
 #[test]
-#[should_panic(expected = "Not enough samples")]
-fn invalid_sampling_fraction_too_low() {
-    let n = 10_000;
-    let d = 32;
-    let data = default_blobs(n, d, 10);
-    let cfg = SuperKMeansConfig {
-        sampling_fraction: 0.0001,
-        max_points_per_cluster: 1,
-        ..Default::default()
-    };
-    let mut kmeans = SuperKMeans::with_config(10, d, cfg);
-    kmeans.train(&data, n);
-}
-
-#[test]
 #[should_panic(expected = "n_clusters must be positive")]
 fn invalid_zero_n_clusters() {
     let _ = SuperKMeans::new(0, 32);
@@ -132,36 +117,6 @@ fn invalid_zero_dimensionality() {
 fn invalid_zero_iters() {
     let cfg = SuperKMeansConfig {
         iters: 0,
-        ..Default::default()
-    };
-    let _ = SuperKMeans::with_config(10, 32, cfg);
-}
-
-#[test]
-#[should_panic(expected = "sampling_fraction must be positive")]
-fn invalid_zero_sampling_fraction() {
-    let cfg = SuperKMeansConfig {
-        sampling_fraction: 0.0,
-        ..Default::default()
-    };
-    let _ = SuperKMeans::with_config(10, 32, cfg);
-}
-
-#[test]
-#[should_panic(expected = "sampling_fraction must be positive")]
-fn invalid_negative_sampling_fraction() {
-    let cfg = SuperKMeansConfig {
-        sampling_fraction: -0.5,
-        ..Default::default()
-    };
-    let _ = SuperKMeans::with_config(10, 32, cfg);
-}
-
-#[test]
-#[should_panic(expected = "sampling_fraction must be <= 1.0")]
-fn invalid_sampling_fraction_above_one() {
-    let cfg = SuperKMeansConfig {
-        sampling_fraction: 1.5,
         ..Default::default()
     };
     let _ = SuperKMeans::with_config(10, 32, cfg);
@@ -213,7 +168,6 @@ fn early_termination_shift_below_tol_stops() {
         tol: 1e-2,
         verbose: false,
         seed: 42,
-        sampling_fraction: 1.0,
         ..Default::default()
     };
     let mut k_early = SuperKMeans::with_config(n_clusters, d, cfg_early);
@@ -225,7 +179,6 @@ fn early_termination_shift_below_tol_stops() {
         early_termination: false,
         verbose: false,
         seed: 42,
-        sampling_fraction: 1.0,
         ..Default::default()
     };
     let mut k_no_early = SuperKMeans::with_config(n_clusters, d, cfg_no_early);
@@ -258,7 +211,6 @@ fn early_termination_disabled_runs_all_iterations() {
         iters: max_iters,
         early_termination: false,
         verbose: false,
-        sampling_fraction: 1.0,
         ..Default::default()
     };
     let mut kmeans = SuperKMeans::with_config(n_clusters, d, cfg);
@@ -316,7 +268,6 @@ fn pre_rotated_data_produces_identical_results() {
         verbose: false,
         data_already_rotated: false,
         unrotate_centroids: false,
-        sampling_fraction: 1.0,
         ..Default::default()
     };
     let mut k1 = SuperKMeans::with_config(k, d, cfg1);
@@ -334,7 +285,6 @@ fn pre_rotated_data_produces_identical_results() {
         verbose: false,
         data_already_rotated: true,
         unrotate_centroids: true, // should be forced to false by the constructor
-        sampling_fraction: 1.0,
         ..Default::default()
     };
     let mut k2 = SuperKMeans::with_config(k, d, cfg2);
@@ -399,7 +349,6 @@ fn train_owned_matches_train() {
     let cfg = SuperKMeansConfig {
         iters: 10,
         seed: 42,
-        sampling_fraction: 1.0,
         ..Default::default()
     };
     let mut borrowed = SuperKMeans::with_config(k, d, cfg.clone());
@@ -411,46 +360,33 @@ fn train_owned_matches_train() {
     assert_centroids_match(&centroids_borrowed, &centroids_owned, 1e-4);
 }
 
-#[test]
-fn train_owned_matches_train_with_sampling() {
-    let n = 5_000;
-    let d = 64;
-    let k = 50;
-    let data = default_blobs(n, d, k);
-
-    let cfg = SuperKMeansConfig {
-        iters: 10,
-        seed: 42,
-        sampling_fraction: 0.5,
-        ..Default::default()
-    };
-    let mut borrowed = SuperKMeans::with_config(k, d, cfg.clone());
-    let centroids_borrowed = borrowed.train(&data, n);
-
-    let mut owned = SuperKMeans::with_config(k, d, cfg);
-    let centroids_owned = owned.train_owned(data.clone(), n);
-
-    assert_centroids_match(&centroids_borrowed, &centroids_owned, 1e-4);
-}
-
+/// The owned path rotates the caller's buffer in place rather than allocating a
+/// second copy, so it must still land on exactly the same tree.
 #[test]
 fn hierarchical_train_owned_matches_train() {
     use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig};
 
     let n = 10_000;
     let d = 64;
-    let k = 200;
-    let data = make_blobs(n, d, k, false, 1.0, 10.0, 42);
+    let data = make_blobs(n, d, 200, false, 1.0, 10.0, 42);
 
-    let mut cfg = HierarchicalSuperKMeansConfig::default();
+    let mut cfg = HierarchicalSuperKMeansConfig {
+        max_leaf_size: 50,
+        branching_factor: Some(8),
+        ..Default::default()
+    };
     cfg.base.seed = 42;
     cfg.base.suppress_warnings = true;
 
-    let mut borrowed = HierarchicalSuperKMeans::with_config(k, d, cfg.clone());
+    let mut borrowed = HierarchicalSuperKMeans::with_config(d, cfg.clone());
     let centroids_borrowed = borrowed.train(&data, n);
 
-    let mut owned = HierarchicalSuperKMeans::with_config(k, d, cfg);
+    let mut owned = HierarchicalSuperKMeans::with_config(d, cfg);
     let centroids_owned = owned.train_owned(data.clone(), n);
 
+    assert_eq!(
+        borrowed.tree.n_leaves, owned.tree.n_leaves,
+        "owned path built a different tree"
+    );
     assert_centroids_match(&centroids_borrowed, &centroids_owned, 1e-4);
 }

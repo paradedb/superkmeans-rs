@@ -1,6 +1,6 @@
 [package]
 name = "superkmeans-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.89"
 authors = ["ParadeDB <support@paradedb.com>"]
@@ -42,6 +42,11 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 
+[profile.bench]
+inherits = "release"
+debug = true
+split-debuginfo = "packed"
+
 [[example]]
 name = "simple_clustering"
 path = "examples/simple_clustering.rs"
@@ -52,6 +57,10 @@ path = "examples/hierarchical_clustering.rs"
 
 [[bench]]
 name = "cohere"
+harness = false
+
+[[bench]]
+name = "ivf_recall"
 harness = false
 
 [[bench]]
