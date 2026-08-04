@@ -68,21 +68,24 @@ assert_eq!(assignments.len(), n);
 ### Tuning
 
 `SuperKMeansConfig` exposes the knobs from the C++ original — number of
-iterations, sampling fraction, thread count, RNG seed, early-termination
-tolerances, ADSampling pruning bounds, and more. Start from the defaults and
-override what you need:
+iterations, sampling fraction, RNG seed, early-termination tolerances,
+ADSampling pruning bounds, and more. Start from the defaults and override what
+you need:
 
 ```rust
 use superkmeans::{SuperKMeans, SuperKMeansConfig};
 
 let mut cfg = SuperKMeansConfig::default();
 cfg.iters = 20;          // more refinement passes
-cfg.n_threads = 8;       // 0 = use all available cores
 cfg.seed = 7;            // deterministic runs
 cfg.verbose = true;      // log per-iteration statistics
 
 let mut kmeans = SuperKMeans::with_config(1000, 768, cfg);
 ```
+
+Training runs on the ambient rayon thread pool, so the width comes from
+`RAYON_NUM_THREADS` or from calling `train` inside your own
+`ThreadPool::install`.
 
 ### Hierarchical clustering
 

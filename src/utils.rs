@@ -166,6 +166,26 @@ const REDUCTION_PARALLEL_MIN_ELEMENTS: usize = 64 * 1024;
 /// where the measured crossover sits.
 const SCALE_PARALLEL_MIN_ELEMENTS: usize = 1024 * 1024;
 
+/// Input size below which a sequential pass wins for the per-cluster scatter,
+/// which unlike the row-wise kernels reads a matrix far larger than it writes.
+///
+/// Its work scales with the rows it reads, so this is the term that has to cover
+/// rayon's dispatch. `cargo bench --bench utils` puts the crossover between 256K
+/// and 512K elements read: at 192K the parallel form still loses (0.6-0.7x), at
+/// 384K it is within noise (1.0-1.2x), and by 768K it is clearly ahead
+/// (1.4-1.7x).
+const SCATTER_PARALLEL_MIN_INPUT_ELEMENTS: usize = 512 * 1024;
+
+/// Output size below which a sequential pass wins for the per-cluster scatter,
+/// which splits its *output* over rayon rather than its input.
+///
+/// A band of clusters is the unit of parallel work, so a small `n_clusters × d`
+/// leaves nothing worth dividing however much data is read: measured at 12K
+/// elements the parallel form never gets ahead (0.9-1.2x) even over 8M elements
+/// of input, while at 16K and up it holds 1.1-2.0x. Both ends reproduce at
+/// d=128 and d=768, so the product is what matters, not either factor.
+const SCATTER_PARALLEL_MIN_OUTPUT_ELEMENTS: usize = 16 * 1024;
+
 /// Total squared distance the centroids moved this iteration, summed over the
 /// first `n_clusters` rows of two `n_clusters × d` row-major matrices.
 ///
@@ -216,6 +236,135 @@ pub fn centroid_shift_parallel(
         .take(n_clusters)
         .map(|(new_row, prev_row)| row_shift(new_row, prev_row))
         .sum()
+}
+
+/// Total the vectors assigned to each cluster, and count how many landed there.
+///
+/// This is k-means' M-step, and it stops one step short of a centroid: each row
+/// of `centroids` comes back holding its cluster's *sum*, not its mean, since the
+/// count to divide by is only known once the pass is over. [`mean_rows_by_count`]
+/// finishes the job.
+///
+/// `assignments[i]` names the cluster owning vector `i`, so the vector count
+/// comes from `assignments` and the cluster count from `cluster_sizes`. Both
+/// outputs are overwritten rather than accumulated into, and any row of
+/// `centroids` past `cluster_sizes.len()` is left alone. A vector assigned
+/// outside that range is skipped.
+///
+/// Dispatches between [`sum_rows_by_assignment_sequential`] and
+/// [`sum_rows_by_assignment_parallel`], which agree bit for bit: both total a
+/// given cluster in vector order, so unlike the reduction kernels the choice
+/// cannot perturb the result. Both are public so benchmarks can measure where the
+/// crossover lies. Unlike the row-wise kernels this takes two thresholds, because
+/// the input and the output limit it independently — see
+/// [`SCATTER_PARALLEL_MIN_INPUT_ELEMENTS`] and
+/// [`SCATTER_PARALLEL_MIN_OUTPUT_ELEMENTS`].
+///
+/// # Panics
+///
+/// If `centroids` is shorter than `cluster_sizes.len() * d`.
+pub fn sum_rows_by_assignment(
+    vectors: &[f32],
+    assignments: &[u32],
+    centroids: &mut [f32],
+    cluster_sizes: &mut [u32],
+    d: usize,
+) {
+    let enough_input = assignments.len() * d >= SCATTER_PARALLEL_MIN_INPUT_ELEMENTS;
+    let enough_output = cluster_sizes.len() * d >= SCATTER_PARALLEL_MIN_OUTPUT_ELEMENTS;
+    if enough_input && enough_output {
+        sum_rows_by_assignment_parallel(vectors, assignments, centroids, cluster_sizes, d);
+    } else {
+        sum_rows_by_assignment_sequential(vectors, assignments, centroids, cluster_sizes, d);
+    }
+}
+
+/// Single-threaded [`sum_rows_by_assignment`]: one pass, scattering each vector
+/// into whichever cluster owns it.
+pub fn sum_rows_by_assignment_sequential(
+    vectors: &[f32],
+    assignments: &[u32],
+    centroids: &mut [f32],
+    cluster_sizes: &mut [u32],
+    d: usize,
+) {
+    let n_clusters = cluster_sizes.len();
+    sum_rows_in_band(
+        vectors,
+        assignments,
+        &mut centroids[..n_clusters * d],
+        cluster_sizes,
+        0,
+        d,
+    );
+}
+
+/// One rayon work item per band of clusters [`sum_rows_by_assignment`].
+pub fn sum_rows_by_assignment_parallel(
+    vectors: &[f32],
+    assignments: &[u32],
+    centroids: &mut [f32],
+    cluster_sizes: &mut [u32],
+    d: usize,
+) {
+    let n_clusters = cluster_sizes.len();
+    if n_clusters == 0 {
+        return;
+    }
+
+    // Splitting the output rather than the input is what keeps the scatter safe:
+    // each task owns a disjoint band of clusters, so no two tasks ever write the
+    // same centroid and no private accumulators are needed. The price is that
+    // every task walks the whole assignment vector to pick out the vectors it
+    // owns, so the bands are made as wide as the pool allows instead of being
+    // left to rayon to subdivide further.
+    let per_task = n_clusters.div_ceil(rayon::current_num_threads().max(1));
+    centroids[..n_clusters * d]
+        .par_chunks_mut(per_task * d)
+        .zip(cluster_sizes.par_chunks_mut(per_task))
+        .enumerate()
+        .for_each(|(task, (centroids, cluster_sizes))| {
+            sum_rows_in_band(
+                vectors,
+                assignments,
+                centroids,
+                cluster_sizes,
+                task * per_task,
+                d,
+            );
+        });
+}
+
+/// Sum the vectors belonging to the `cluster_sizes.len()` clusters starting at
+/// `first_cluster`, ignoring every other vector.
+fn sum_rows_in_band(
+    vectors: &[f32],
+    assignments: &[u32],
+    centroids: &mut [f32],
+    cluster_sizes: &mut [u32],
+    first_cluster: usize,
+    d: usize,
+) {
+    centroids.fill(0.0);
+    cluster_sizes.fill(0);
+
+    let band = first_cluster..first_cluster + cluster_sizes.len();
+    for (vector, &cluster) in vectors.chunks_exact(d).zip(assignments) {
+        let cluster = cluster as usize;
+        if !band.contains(&cluster) {
+            continue;
+        }
+        let local = cluster - first_cluster;
+        cluster_sizes[local] += 1;
+        accumulate_vector(&mut centroids[local * d..(local + 1) * d], vector);
+    }
+}
+
+#[inline]
+fn accumulate_vector(centroid: &mut [f32], vector: &[f32]) {
+    for (sum, &v) in centroid.iter_mut().zip(vector) {
+        *sum += v;
+    }
 }
 
 /// Replace each row of an `n_rows × d` row-major matrix of sums with its
@@ -364,6 +513,137 @@ mod tests {
         let prev = [0.0, 0.0, 0.0, 0.0];
         assert_eq!(centroid_shift_sequential(&new, &prev, 1, 2), 5.0);
         assert_eq!(centroid_shift_parallel(&new, &prev, 1, 2), 5.0);
+    }
+
+    #[test]
+    fn sum_rows_by_assignment_totals_the_members_of_each_cluster() {
+        // Vectors 0 and 2 go to cluster 0, vector 1 to cluster 1.
+        let vectors = [1.0, 2.0, 10.0, 20.0, 3.0, 4.0];
+        let assignments = [0, 1, 0];
+
+        for sum_rows in [
+            sum_rows_by_assignment_sequential,
+            sum_rows_by_assignment_parallel,
+        ] {
+            let mut centroids = [0.0; 4];
+            let mut cluster_sizes = [0; 2];
+            sum_rows(
+                &vectors,
+                &assignments,
+                &mut centroids,
+                &mut cluster_sizes,
+                2,
+            );
+            assert_eq!(centroids, [4.0, 6.0, 10.0, 20.0]);
+            assert_eq!(cluster_sizes, [2, 1]);
+        }
+    }
+
+    #[test]
+    fn sum_rows_by_assignment_overwrites_whatever_the_last_iteration_left() {
+        // Training reuses one buffer per iteration, so the previous sums must not
+        // survive into this one — including for a cluster that drew no vectors.
+        let vectors = [1.0, 2.0];
+        let assignments = [0];
+
+        for sum_rows in [
+            sum_rows_by_assignment_sequential,
+            sum_rows_by_assignment_parallel,
+        ] {
+            let mut centroids = [100.0; 4];
+            let mut cluster_sizes = [7; 2];
+            sum_rows(
+                &vectors,
+                &assignments,
+                &mut centroids,
+                &mut cluster_sizes,
+                2,
+            );
+            assert_eq!(centroids, [1.0, 2.0, 0.0, 0.0]);
+            assert_eq!(cluster_sizes, [1, 0]);
+        }
+    }
+
+    #[test]
+    fn sum_rows_by_assignment_ignores_vectors_past_the_assignments() {
+        // Callers pass whole data buffers, which outlive the sample count they are
+        // currently training.
+        let vectors = [1.0, 2.0, 100.0, 100.0];
+        let assignments = [0];
+
+        for sum_rows in [
+            sum_rows_by_assignment_sequential,
+            sum_rows_by_assignment_parallel,
+        ] {
+            let mut centroids = [0.0; 4];
+            let mut cluster_sizes = [0; 2];
+            sum_rows(
+                &vectors,
+                &assignments,
+                &mut centroids,
+                &mut cluster_sizes,
+                2,
+            );
+            assert_eq!(centroids, [1.0, 2.0, 0.0, 0.0]);
+            assert_eq!(cluster_sizes, [1, 0]);
+        }
+    }
+
+    #[test]
+    fn sum_rows_by_assignment_leaves_centroids_past_the_cluster_count_alone() {
+        // The cluster count comes from `cluster_sizes`, and centroid buffers are
+        // sized for the widest split a caller will train, not the current one.
+        let vectors = [1.0, 2.0];
+        let assignments = [0];
+
+        for sum_rows in [
+            sum_rows_by_assignment_sequential,
+            sum_rows_by_assignment_parallel,
+        ] {
+            let mut centroids = [0.0, 0.0, 9.0, 9.0];
+            let mut cluster_sizes = [0; 1];
+            sum_rows(
+                &vectors,
+                &assignments,
+                &mut centroids,
+                &mut cluster_sizes,
+                2,
+            );
+            assert_eq!(centroids, [1.0, 2.0, 9.0, 9.0]);
+        }
+    }
+
+    #[test]
+    fn sum_rows_by_assignment_variants_agree_bit_for_bit() {
+        // Each cluster is totalled in vector order either way, so dispatching on
+        // size cannot move a result — worth pinning, since the reduction kernels
+        // only manage to agree approximately.
+        let (n, d, k) = (2_000, 24, 7);
+        let vectors = make_blobs(n, d, k, false, 1.0, 10.0, 3);
+        let assignments: Vec<u32> = (0..n).map(|i| (i * 7 % k) as u32).collect();
+
+        let mut sequential = vec![0.0_f32; k * d];
+        let mut sequential_sizes = vec![0_u32; k];
+        sum_rows_by_assignment_sequential(
+            &vectors,
+            &assignments,
+            &mut sequential,
+            &mut sequential_sizes,
+            d,
+        );
+
+        let mut parallel = vec![0.0_f32; k * d];
+        let mut parallel_sizes = vec![0_u32; k];
+        sum_rows_by_assignment_parallel(
+            &vectors,
+            &assignments,
+            &mut parallel,
+            &mut parallel_sizes,
+            d,
+        );
+
+        assert_eq!(sequential, parallel);
+        assert_eq!(sequential_sizes, parallel_sizes);
     }
 
     #[test]

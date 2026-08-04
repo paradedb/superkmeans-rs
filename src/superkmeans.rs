@@ -15,7 +15,7 @@ use crate::common::{
     X_BATCH_SIZE, Y_BATCH_SIZE,
 };
 use crate::layout;
-use crate::utils::{centroid_shift, mean_rows_by_count, normalize_rows_l2};
+use crate::utils::{centroid_shift, mean_rows_by_count, normalize_rows_l2, sum_rows_by_assignment};
 
 /// Configuration parameters for SuperKMeans clustering.
 #[derive(Clone, Debug)]
@@ -593,8 +593,6 @@ impl SuperKMeans {
                 &mut self.distances,
                 &mut self.gemm_buf,
             );
-            self.horizontal_centroids.iter_mut().for_each(|v| *v = 0.0);
-            self.cluster_sizes.iter_mut().for_each(|v| *v = 0);
         } else {
             // Partial norms for pruning.
             self.centroid_norms = compute_partial_norms_row_major(
@@ -623,11 +621,16 @@ impl SuperKMeans {
                 not_pruned_counts,
                 &mut self.gemm_buf,
             );
-            self.horizontal_centroids.iter_mut().for_each(|v| *v = 0.0);
-            self.cluster_sizes.iter_mut().for_each(|v| *v = 0);
         }
 
-        self.update_centroids(data, n_samples, n_clusters);
+        // M-step: total each cluster, which `consolidate_centroids` then averages.
+        sum_rows_by_assignment(
+            data,
+            &self.assignments[..n_samples],
+            &mut self.horizontal_centroids,
+            &mut self.cluster_sizes[..n_clusters],
+            d,
+        );
 
         let mut avg_not_pruned_pct = -1.0_f32;
         let old_partial_d = self.partial_d;
@@ -688,43 +691,7 @@ impl SuperKMeans {
         self.iteration_stats.push(stats);
     }
 
-    pub(crate) fn update_centroids(&mut self, data: &[f32], n_samples: usize, n_clusters: usize) {
-        let d = self.d;
-        // For correctness with rayon, parallelise over centroids: each thread
-        // handles a contiguous slice c0..c1 of clusters and scans all samples,
-        // matching the C++ kernel.
-        let nt = self.n_threads.max(1);
-        let hc_ptr = self.horizontal_centroids.as_mut_ptr() as usize;
-        let cs_ptr = self.cluster_sizes.as_mut_ptr() as usize;
-        let assignments = &self.assignments;
-        rayon::scope(|s| {
-            for rank in 0..nt {
-                let c0 = n_clusters * rank / nt;
-                let c1 = n_clusters * (rank + 1) / nt;
-                s.spawn(move |_| {
-                    let hc = hc_ptr as *mut f32;
-                    let cs = cs_ptr as *mut u32;
-                    for i in 0..n_samples {
-                        let ci = assignments[i] as usize;
-                        if ci >= c0 && ci < c1 {
-                            unsafe {
-                                *cs.add(ci) = (*cs.add(ci)) + 1;
-                            }
-                            let vector = &data[i * d..(i + 1) * d];
-                            unsafe {
-                                let row = hc.add(ci * d);
-                                for j in 0..d {
-                                    *row.add(j) += vector[j];
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-        });
-    }
-
-    /// Turn the sums left by [`Self::update_centroids`] into usable centroids:
+    /// Turn the sums left by [`sum_rows_by_assignment`] into usable centroids:
     /// take each cluster's mean, reseed the empty ones, and — for angular
     /// distance — put the result back on the unit sphere.
     ///
