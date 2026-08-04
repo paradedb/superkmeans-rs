@@ -10,10 +10,8 @@ use crate::common::{
     N_CLUSTERS_THRESHOLD_FOR_PRUNING,
 };
 use crate::layout;
-use crate::superkmeans::{
-    SuperKMeans, SuperKMeansConfig, SuperKMeansIterationStats, compute_norms_row_major,
-    compute_partial_norms_row_major,
-};
+use crate::superkmeans::{SuperKMeans, SuperKMeansConfig, SuperKMeansIterationStats};
+use crate::utils::{squared_norms, squared_norms_partial};
 
 /// Hierarchical-specific config — wraps SuperKMeansConfig with extra phase iters.
 #[derive(Clone, Debug)]
@@ -180,10 +178,8 @@ impl HierarchicalSuperKMeans {
         self.base.prev_centroids[..self.n_mesoclusters * d]
             .copy_from_slice(&self.base.horizontal_centroids[..self.n_mesoclusters * d]);
 
-        self.base.data_norms =
-            compute_norms_row_major(&data_to_cluster, self.base.n_samples, d, true);
-        self.base.centroid_norms =
-            compute_norms_row_major(&self.base.prev_centroids, self.n_mesoclusters, d, true);
+        self.base.data_norms = squared_norms(&data_to_cluster, self.base.n_samples, d);
+        self.base.centroid_norms = squared_norms(&self.base.prev_centroids, self.n_mesoclusters, d);
 
         let immutable_data_norms = self.base.data_norms.clone();
 
@@ -201,7 +197,7 @@ impl HierarchicalSuperKMeans {
         for iter_idx in 0..self.config.iters_mesoclustering {
             let use_gemm_only = iter_idx == 0 || always_gemm_only;
             if !use_gemm_only && !partial_norms_computed {
-                self.base.data_norms = compute_partial_norms_row_major(
+                self.base.data_norms = squared_norms_partial(
                     &data_to_cluster,
                     self.base.n_samples,
                     d,
@@ -301,8 +297,7 @@ impl HierarchicalSuperKMeans {
             self.base.n_clusters = n_clusters;
             self.base.prev_centroids[..n_fine * d]
                 .copy_from_slice(&self.base.horizontal_centroids[..n_fine * d]);
-            self.base.centroid_norms =
-                compute_norms_row_major(&self.base.prev_centroids, n_fine, d, true);
+            self.base.centroid_norms = squared_norms(&self.base.prev_centroids, n_fine, d);
 
             let fine_always_gemm_only = d < DIMENSION_THRESHOLD_FOR_PRUNING
                 || self.base.config.use_blas_only
@@ -314,7 +309,7 @@ impl HierarchicalSuperKMeans {
             for fine_iter_idx in 0..self.config.iters_fineclustering {
                 let use_gemm_only = fine_iter_idx == 0 || fine_always_gemm_only;
                 if !use_gemm_only && !fine_partial_norms_computed {
-                    self.base.data_norms = compute_partial_norms_row_major(
+                    self.base.data_norms = squared_norms_partial(
                         &mesocluster_buffer[..mesocluster_size * d],
                         mesocluster_size,
                         d,
@@ -377,15 +372,14 @@ impl HierarchicalSuperKMeans {
             .copy_from_slice(&final_centroids[..n_clusters * d]);
         self.base.assignments[..self.base.n_samples]
             .copy_from_slice(&final_assignments[..self.base.n_samples]);
-        self.base.centroid_norms =
-            compute_norms_row_major(&self.base.prev_centroids, n_clusters, d, true);
+        self.base.centroid_norms = squared_norms(&self.base.prev_centroids, n_clusters, d);
 
         let refinement_always_gemm_only =
             d < DIMENSION_THRESHOLD_FOR_PRUNING || n_clusters <= N_CLUSTERS_THRESHOLD_FOR_PRUNING;
         let mut refinement_partial_norms_computed = false;
         for refinement_iter_idx in 0..self.config.iters_refinement {
             if !refinement_always_gemm_only && !refinement_partial_norms_computed {
-                self.base.data_norms = compute_partial_norms_row_major(
+                self.base.data_norms = squared_norms_partial(
                     &data_to_cluster,
                     self.base.n_samples,
                     d,

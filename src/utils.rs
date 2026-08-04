@@ -129,18 +129,82 @@ pub fn compute_l2_squared(a: &[f32], b: &[f32]) -> f32 {
     s
 }
 
-pub fn compute_norms_row_major(data: &[f32], n: usize, d: usize) -> Vec<f32> {
-    let mut out = vec![0.0_f32; n];
-    data.par_chunks(d)
-        .zip(out.par_iter_mut())
-        .for_each(|(row, n_out)| {
-            let mut s = 0.0_f32;
-            for &v in row {
-                s += v * v;
-            }
-            *n_out = s;
-        });
-    out
+/// Squared L2 norm of each of the first `n_vectors` rows of an `n_vectors × d`
+/// row-major matrix.
+///
+/// These are the `‖x‖²` terms of the expansion `‖x − y‖² = ‖x‖² − 2x·y + ‖y‖²`,
+/// which is how the GEMM distance kernels avoid materializing differences: given
+/// both norm vectors, a single matrix product supplies every `x·y`. Squared, not
+/// rooted, because that is the form the expansion needs.
+pub fn squared_norms(vectors: &[f32], n_vectors: usize, d: usize) -> Vec<f32> {
+    squared_norms_partial(vectors, n_vectors, d, d)
+}
+
+/// [`squared_norms`] over just the leading `partial_d` dimensions of each row.
+///
+/// A prefix norm bounds the full one from below, which is what lets ADSampling
+/// reject a candidate after inspecting `partial_d` of its `d` dimensions. Values
+/// of `partial_d` above `d` are clamped.
+///
+/// Dispatches on the elements actually summed between
+/// [`squared_norms_partial_sequential`] and [`squared_norms_partial_parallel`] —
+/// see [`NORM_PARALLEL_MIN_ELEMENTS`]. The two agree bit for bit, since a row's
+/// norm is summed in the same order either way and only the rows are spread over
+/// rayon. Both are public so benchmarks can measure where the crossover lies.
+pub fn squared_norms_partial(
+    vectors: &[f32],
+    n_vectors: usize,
+    d: usize,
+    partial_d: usize,
+) -> Vec<f32> {
+    if n_vectors * partial_d.min(d) < NORM_PARALLEL_MIN_ELEMENTS {
+        squared_norms_partial_sequential(vectors, n_vectors, d, partial_d)
+    } else {
+        squared_norms_partial_parallel(vectors, n_vectors, d, partial_d)
+    }
+}
+
+/// Single-threaded [`squared_norms_partial`].
+pub fn squared_norms_partial_sequential(
+    vectors: &[f32],
+    n_vectors: usize,
+    d: usize,
+    partial_d: usize,
+) -> Vec<f32> {
+    debug_assert!(vectors.len() >= n_vectors * d);
+    let dims = partial_d.min(d);
+    let mut norms = vec![0.0_f32; n_vectors];
+    vectors
+        .chunks_exact(d)
+        .zip(norms.iter_mut())
+        .for_each(|(vector, norm)| *norm = squared_norm(&vector[..dims]));
+    norms
+}
+
+/// One rayon work item per vector [`squared_norms_partial`].
+pub fn squared_norms_partial_parallel(
+    vectors: &[f32],
+    n_vectors: usize,
+    d: usize,
+    partial_d: usize,
+) -> Vec<f32> {
+    debug_assert!(vectors.len() >= n_vectors * d);
+    let dims = partial_d.min(d);
+    let mut norms = vec![0.0_f32; n_vectors];
+    vectors
+        .par_chunks_exact(d)
+        .zip(norms.par_iter_mut())
+        .for_each(|(vector, norm)| *norm = squared_norm(&vector[..dims]));
+    norms
+}
+
+#[inline]
+fn squared_norm(vector: &[f32]) -> f32 {
+    let mut sum = 0.0_f32;
+    for &v in vector {
+        sum += v * v;
+    }
+    sum
 }
 
 /// Matrix size below which a sequential pass beats spreading the rows over rayon,
@@ -155,6 +219,21 @@ pub fn compute_norms_row_major(data: &[f32], n: usize, d: usize) -> Vec<f32> {
 /// Calibrated for those non-worker calls. Crossing into the pool once at the top
 /// of training instead would move the crossover down.
 const REDUCTION_PARALLEL_MIN_ELEMENTS: usize = 64 * 1024;
+
+/// The same crossover for the per-vector squared norm, at twice the bar the other
+/// row reductions clear.
+///
+/// It reads one matrix where [`centroid_shift`] walks two, so an element costs
+/// half the bandwidth and sequential throughput runs at 2-5.5 Gelem/s depending on
+/// the row length. A given element count therefore buys less time to cover the
+/// dispatch with. `cargo bench --bench utils` has the parallel form still behind
+/// at 64K elements summed (0.2-0.4x) and ahead from 128K on (1.2-1.6x), with only
+/// one shape in between — 64 rows of 1536 — worth parallelizing.
+///
+/// Measured against the elements *summed*, `n_vectors * partial_d`, not the
+/// footprint walked: prefix norms stride over a matrix several times that size
+/// and still track the summed count.
+const NORM_PARALLEL_MIN_ELEMENTS: usize = 128 * 1024;
 
 /// The same crossover for kernels that only *scale* each element, which sits 16x
 /// higher.
@@ -513,6 +592,48 @@ mod tests {
         let prev = [0.0, 0.0, 0.0, 0.0];
         assert_eq!(centroid_shift_sequential(&new, &prev, 1, 2), 5.0);
         assert_eq!(centroid_shift_parallel(&new, &prev, 1, 2), 5.0);
+    }
+
+    #[test]
+    fn squared_norms_squares_without_rooting() {
+        // (3,4) and (0,2): 25 and 4, not 5 and 2.
+        let vectors = [3.0, 4.0, 0.0, 2.0];
+        assert_eq!(squared_norms(&vectors, 2, 2), [25.0, 4.0]);
+    }
+
+    #[test]
+    fn squared_norms_ignores_vectors_past_the_count() {
+        // Callers pass whole data buffers, which outlive the sample count they are
+        // currently training.
+        let vectors = [3.0, 4.0, 100.0, 100.0];
+        assert_eq!(squared_norms(&vectors, 1, 2), [25.0]);
+    }
+
+    #[test]
+    fn squared_norms_partial_sums_only_the_leading_dimensions() {
+        // Each row keeps its full stride of 4; only the first 2 are summed, so the
+        // trailing pair must not reach the result.
+        let vectors = [3.0, 4.0, 90.0, 90.0, 1.0, 0.0, 70.0, 70.0];
+
+        for norms in [
+            squared_norms_partial_sequential,
+            squared_norms_partial_parallel,
+        ] {
+            assert_eq!(norms(&vectors, 2, 4, 2), [25.0, 1.0]);
+        }
+    }
+
+    #[test]
+    fn squared_norms_partial_clamps_a_prefix_wider_than_the_row() {
+        // `partial_d` is tuned at runtime and can be asked to exceed `d`.
+        let vectors = [3.0, 4.0];
+
+        for norms in [
+            squared_norms_partial_sequential,
+            squared_norms_partial_parallel,
+        ] {
+            assert_eq!(norms(&vectors, 1, 2, 99), [25.0]);
+        }
     }
 
     #[test]

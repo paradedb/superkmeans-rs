@@ -8,8 +8,9 @@
 //! Every case is named for its shape, `n` vectors by `d` dimensions by `k`
 //! clusters, in that order and omitting whatever a kernel does not take — so
 //! 100000 vectors of 768 dimensions over 1000 clusters reads `n100_000_d768_k1000`,
-//! and a kernel that only walks centroids reads `d768_k1000`. A filter therefore
-//! picks out one dimensionality or width across every group at once.
+//! and a kernel that only walks centroids reads `d768_k1000`. `p` stands in for
+//! `k` where a kernel reads a prefix of each vector rather than clustering it. A
+//! filter therefore picks out one dimensionality or width across every group.
 //!
 //! Run:
 //!   cargo bench --bench utils
@@ -26,6 +27,7 @@ use criterion::{
 use superkmeans::utils::{
     centroid_shift_parallel, centroid_shift_sequential, make_blobs, mean_rows_by_count_parallel,
     mean_rows_by_count_sequential, normalize_rows_l2_parallel, normalize_rows_l2_sequential,
+    squared_norms_partial_parallel, squared_norms_partial_sequential,
     sum_rows_by_assignment_parallel, sum_rows_by_assignment_sequential,
 };
 
@@ -47,6 +49,11 @@ fn centroid_id(d: usize, k: usize) -> String {
 /// Id for a shape that also reads a vector set: `n100_000_d768_k1000`.
 fn vector_id(n: usize, d: usize, k: usize) -> String {
     format!("n{}_{}", readable(n), centroid_id(d, k))
+}
+
+/// Id for a shape that reads only a prefix of each vector: `n100_000_d768_p96`.
+fn prefix_id(n: usize, d: usize, partial_d: usize) -> String {
+    format!("n{}_d{}_p{}", readable(n), readable(d), readable(partial_d))
 }
 
 /// Group a magnitude into thousands once it gets long enough to misread, at the
@@ -100,6 +107,53 @@ fn bench_centroid_shift(c: &mut Criterion) {
                     ))
                 });
             });
+        }
+    }
+
+    group.finish();
+}
+
+/// `partial_d` is swept as a fraction of `d` as well as at `d` itself, since a
+/// prefix norm reads a strided slice of the matrix: it sums fewer elements than it
+/// pulls cache lines for, so it is worth checking whether the crossover follows
+/// the elements summed or the footprint walked.
+fn bench_squared_norms(c: &mut Criterion) {
+    const VECTORS: [usize; 5] = [8, 64, 512, 4096, 32768];
+
+    let mut group = c.benchmark_group("squared_norms");
+    configure(&mut group);
+
+    for d in DIMS {
+        for n in VECTORS {
+            let vectors = make_blobs(n, d, n.min(8), false, 1.0, 10.0, 1);
+
+            for partial_d in [d, d / 8] {
+                let id = prefix_id(n, d, partial_d);
+
+                group.throughput(Throughput::Elements((n * partial_d) as u64));
+
+                group.bench_function(BenchmarkId::new("sequential", &id), |b| {
+                    b.iter(|| {
+                        black_box(squared_norms_partial_sequential(
+                            black_box(&vectors),
+                            n,
+                            d,
+                            partial_d,
+                        ))
+                    });
+                });
+
+                group.bench_function(BenchmarkId::new("parallel", &id), |b| {
+                    b.iter(|| {
+                        black_box(squared_norms_partial_parallel(
+                            black_box(&vectors),
+                            n,
+                            d,
+                            partial_d,
+                        ))
+                    });
+                });
+            }
         }
     }
 
@@ -221,6 +275,7 @@ fn bench_normalize_rows_l2(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_centroid_shift,
+    bench_squared_norms,
     bench_sum_rows_by_assignment,
     bench_mean_rows_by_count,
     bench_normalize_rows_l2
