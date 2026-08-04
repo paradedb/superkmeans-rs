@@ -45,6 +45,6 @@ pub use superkmeans::{
     ClusterBalanceStats, SuperKMeans, SuperKMeansConfig, SuperKMeansIterationStats,
 };
 pub use utils::{
-    TicToc, compute_l2_squared, compute_norms_row_major, find_nearest_neighbor_brute_force,
-    generate_random_vectors, make_blobs,
+    TicToc, centroid_shift, compute_l2_squared, compute_norms_row_major,
+    find_nearest_neighbor_brute_force, generate_random_vectors, make_blobs,
 };

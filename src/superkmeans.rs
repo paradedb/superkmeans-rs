@@ -15,6 +15,7 @@ use crate::common::{
     X_BATCH_SIZE, Y_BATCH_SIZE,
 };
 use crate::layout;
+use crate::utils::{centroid_shift, mean_rows_by_count, normalize_rows_l2};
 
 /// Configuration parameters for SuperKMeans clustering.
 #[derive(Clone, Debug)]
@@ -641,7 +642,12 @@ impl SuperKMeans {
 
         self.consolidate_centroids(n_samples, n_clusters);
         self.compute_cost();
-        self.compute_shift(n_clusters);
+        self.shift = centroid_shift(
+            &self.horizontal_centroids,
+            &self.prev_centroids,
+            n_clusters,
+            d,
+        );
 
         let stats = SuperKMeansIterationStats {
             iteration: (iter_idx + 1) as usize,
@@ -718,25 +724,24 @@ impl SuperKMeans {
         });
     }
 
+    /// Turn the sums left by [`Self::update_centroids`] into usable centroids:
+    /// take each cluster's mean, reseed the empty ones, and — for angular
+    /// distance — put the result back on the unit sphere.
+    ///
+    /// Normalizing last matters: [`Self::split_clusters`] perturbs and blends
+    /// rows, so those have to land on the sphere too.
     pub(crate) fn consolidate_centroids(&mut self, n_samples: usize, n_clusters: usize) {
         let d = self.d;
-        self.horizontal_centroids
-            .par_chunks_mut(d)
-            .zip(self.cluster_sizes.par_iter())
-            .for_each(|(row, &size)| {
-                if size == 0 {
-                    return;
-                }
-                let mult = 1.0 / size as f32;
-                for v in row.iter_mut() {
-                    *v *= mult;
-                }
-            });
+        mean_rows_by_count(
+            &mut self.horizontal_centroids,
+            &self.cluster_sizes[..n_clusters],
+            d,
+        );
 
         self.split_clusters(n_samples, n_clusters);
 
         if self.config.angular {
-            self.postprocess_centroids(n_clusters);
+            normalize_rows_l2(&mut self.horizontal_centroids, n_clusters, d);
         }
     }
 
@@ -820,45 +825,9 @@ impl SuperKMeans {
         }
     }
 
-    pub(crate) fn postprocess_centroids(&mut self, n_clusters: usize) {
-        let d = self.d;
-        self.horizontal_centroids
-            .par_chunks_mut(d)
-            .take(n_clusters)
-            .for_each(|row| {
-                let mut sum = 0.0_f32;
-                for v in row.iter() {
-                    sum += v * v;
-                }
-                let norm = 1.0 / sum.sqrt().max(f32::EPSILON);
-                for v in row.iter_mut() {
-                    *v *= norm;
-                }
-            });
-    }
-
     pub(crate) fn compute_cost(&mut self) {
         self.prev_cost = self.cost;
         self.cost = self.distances.iter().sum::<f32>();
-    }
-
-    pub(crate) fn compute_shift(&mut self, n_clusters: usize) {
-        let d = self.d;
-        let total: f32 = self
-            .horizontal_centroids
-            .par_chunks(d)
-            .zip(self.prev_centroids.par_chunks(d))
-            .take(n_clusters)
-            .map(|(new_row, prev_row)| {
-                let mut acc = 0.0_f32;
-                for k in 0..d {
-                    let diff = new_row[k] - prev_row[k];
-                    acc += diff * diff;
-                }
-                acc
-            })
-            .sum();
-        self.shift = total;
     }
 
     pub(crate) fn tune_partial_d(

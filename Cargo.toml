@@ -53,3 +53,7 @@ path = "examples/hierarchical_clustering.rs"
 [[bench]]
 name = "cohere"
 harness = false
+
+[[bench]]
+name = "utils"
+harness = false
