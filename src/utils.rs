@@ -453,8 +453,7 @@ fn accumulate_vector(centroid: &mut [f32], vector: &[f32]) {
 /// take — so a caller that cares about empty clusters has to repair them.
 ///
 /// Dispatches on matrix size between [`mean_rows_by_count_sequential`] and
-/// [`mean_rows_by_count_parallel`], against a much higher bar than the reduction
-/// kernels use — see [`SCALE_PARALLEL_MIN_ELEMENTS`].
+/// [`mean_rows_by_count_parallel`].
 pub fn mean_rows_by_count(rows: &mut [f32], counts: &[u32], d: usize) {
     if counts.len() * d < SCALE_PARALLEL_MIN_ELEMENTS {
         mean_rows_by_count_sequential(rows, counts, d);
