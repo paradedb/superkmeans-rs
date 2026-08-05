@@ -15,6 +15,10 @@ use crate::common::{
     X_BATCH_SIZE, Y_BATCH_SIZE,
 };
 use crate::layout;
+use crate::utils::{
+    centroid_shift, mean_rows_by_count, normalize_rows_l2, squared_norms, squared_norms_partial,
+    sum_rows_by_assignment,
+};
 
 /// Configuration parameters for SuperKMeans clustering.
 #[derive(Clone, Debug)]
@@ -292,8 +296,8 @@ impl SuperKMeans {
         self.rotate_or_copy_into_prev_centroids(rotate);
 
         // Compute full norms for first GEMM iteration.
-        self.data_norms = compute_norms_row_major(&data_to_cluster, n_samples, d, true);
-        self.centroid_norms = compute_norms_row_major(&self.prev_centroids, n_clusters, d, true);
+        self.data_norms = squared_norms(&data_to_cluster, n_samples, d);
+        self.centroid_norms = squared_norms(&self.prev_centroids, n_clusters, d);
 
         // Optional recall tracking — skipped for the minimal port; the algorithm runs
         // identically without queries (early-termination on shift/cost still works).
@@ -312,12 +316,8 @@ impl SuperKMeans {
         for iter_idx in 0..self.config.iters {
             let use_gemm_only = (iter_idx == 0) || always_gemm_only;
             if !use_gemm_only && !partial_norms_computed {
-                self.data_norms = compute_partial_norms_row_major(
-                    &data_to_cluster,
-                    n_samples,
-                    d,
-                    self.partial_d as usize,
-                );
+                self.data_norms =
+                    squared_norms_partial(&data_to_cluster, n_samples, d, self.partial_d as usize);
                 partial_norms_computed = true;
             }
             self.run_iteration(
@@ -351,8 +351,8 @@ impl SuperKMeans {
         let n_centroids = centroids.len() / d;
         let mut result_assignments = vec![0_u32; n_vectors];
         let mut result_distances = vec![0.0_f32; n_vectors];
-        let vector_norms = compute_norms_row_major(vectors, n_vectors, d, true);
-        let centroid_norms = compute_norms_row_major(centroids, n_centroids, d, true);
+        let vector_norms = squared_norms(vectors, n_vectors, d);
+        let centroid_norms = squared_norms(centroids, n_centroids, d);
         let mut buf = Vec::new();
         batch::find_nearest_neighbor(
             vectors,
@@ -409,7 +409,7 @@ impl SuperKMeans {
 
         // Norms from the rotated centroids (the pruning space), not the passed-in
         // `centroids` (unrotated; used only by the brute-force fallback).
-        let centroid_partial_norms = compute_partial_norms_row_major(
+        let centroid_partial_norms = squared_norms_partial(
             &self.horizontal_centroids,
             n_centroids,
             d,
@@ -421,7 +421,7 @@ impl SuperKMeans {
 
         if self.config.sampling_fraction == 1.0 {
             let data_partial_norms =
-                compute_partial_norms_row_major(data_p, n_vectors, d, self.partial_d as usize);
+                squared_norms_partial(data_p, n_vectors, d, self.partial_d as usize);
             // Seed assignments from training run; for sampling_fraction=1, training assignments
             // match the natural indices.
             result_assignments
@@ -476,7 +476,7 @@ impl SuperKMeans {
             }
 
             let data_partial_norms =
-                compute_partial_norms_row_major(data_p, n_vectors, d, self.partial_d as usize);
+                squared_norms_partial(data_p, n_vectors, d, self.partial_d as usize);
             batch::find_nearest_neighbor_with_pruning(
                 data_p,
                 &self.horizontal_centroids,
@@ -537,7 +537,7 @@ impl SuperKMeans {
         }
 
         let data_partial_norms =
-            compute_partial_norms_row_major(data_p, n_vectors, d, self.partial_d as usize);
+            squared_norms_partial(data_p, n_vectors, d, self.partial_d as usize);
         batch::find_nearest_neighbor_with_pruning(
             data_p,
             &self.horizontal_centroids,
@@ -578,8 +578,7 @@ impl SuperKMeans {
         }
 
         if gemm_only {
-            self.centroid_norms =
-                compute_norms_row_major(&self.prev_centroids, n_clusters, d, true);
+            self.centroid_norms = squared_norms(&self.prev_centroids, n_clusters, d);
             batch::find_nearest_neighbor(
                 data,
                 &self.prev_centroids,
@@ -592,16 +591,10 @@ impl SuperKMeans {
                 &mut self.distances,
                 &mut self.gemm_buf,
             );
-            self.horizontal_centroids.iter_mut().for_each(|v| *v = 0.0);
-            self.cluster_sizes.iter_mut().for_each(|v| *v = 0);
         } else {
             // Partial norms for pruning.
-            self.centroid_norms = compute_partial_norms_row_major(
-                &self.prev_centroids,
-                n_clusters,
-                d,
-                self.partial_d as usize,
-            );
+            self.centroid_norms =
+                squared_norms_partial(&self.prev_centroids, n_clusters, d, self.partial_d as usize);
             for v in not_pruned_counts.iter_mut() {
                 *v = 0;
             }
@@ -622,11 +615,16 @@ impl SuperKMeans {
                 not_pruned_counts,
                 &mut self.gemm_buf,
             );
-            self.horizontal_centroids.iter_mut().for_each(|v| *v = 0.0);
-            self.cluster_sizes.iter_mut().for_each(|v| *v = 0);
         }
 
-        self.update_centroids(data, n_samples, n_clusters);
+        // M-step: total each cluster, which `consolidate_centroids` then averages.
+        sum_rows_by_assignment(
+            data,
+            &self.assignments[..n_samples],
+            &mut self.horizontal_centroids,
+            &mut self.cluster_sizes[..n_clusters],
+            d,
+        );
 
         let mut avg_not_pruned_pct = -1.0_f32;
         let old_partial_d = self.partial_d;
@@ -635,13 +633,18 @@ impl SuperKMeans {
             avg_not_pruned_pct = avg;
             if changed {
                 self.data_norms =
-                    compute_partial_norms_row_major(data, n_samples, d, self.partial_d as usize);
+                    squared_norms_partial(data, n_samples, d, self.partial_d as usize);
             }
         }
 
         self.consolidate_centroids(n_samples, n_clusters);
         self.compute_cost();
-        self.compute_shift(n_clusters);
+        self.shift = centroid_shift(
+            &self.horizontal_centroids,
+            &self.prev_centroids,
+            n_clusters,
+            d,
+        );
 
         let stats = SuperKMeansIterationStats {
             iteration: (iter_idx + 1) as usize,
@@ -682,61 +685,24 @@ impl SuperKMeans {
         self.iteration_stats.push(stats);
     }
 
-    pub(crate) fn update_centroids(&mut self, data: &[f32], n_samples: usize, n_clusters: usize) {
-        let d = self.d;
-        // For correctness with rayon, parallelise over centroids: each thread
-        // handles a contiguous slice c0..c1 of clusters and scans all samples,
-        // matching the C++ kernel.
-        let nt = self.n_threads.max(1);
-        let hc_ptr = self.horizontal_centroids.as_mut_ptr() as usize;
-        let cs_ptr = self.cluster_sizes.as_mut_ptr() as usize;
-        let assignments = &self.assignments;
-        rayon::scope(|s| {
-            for rank in 0..nt {
-                let c0 = n_clusters * rank / nt;
-                let c1 = n_clusters * (rank + 1) / nt;
-                s.spawn(move |_| {
-                    let hc = hc_ptr as *mut f32;
-                    let cs = cs_ptr as *mut u32;
-                    for i in 0..n_samples {
-                        let ci = assignments[i] as usize;
-                        if ci >= c0 && ci < c1 {
-                            unsafe {
-                                *cs.add(ci) = (*cs.add(ci)) + 1;
-                            }
-                            let vector = &data[i * d..(i + 1) * d];
-                            unsafe {
-                                let row = hc.add(ci * d);
-                                for j in 0..d {
-                                    *row.add(j) += vector[j];
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-        });
-    }
-
+    /// Turn the sums left by [`sum_rows_by_assignment`] into usable centroids:
+    /// take each cluster's mean, reseed the empty ones, and — for angular
+    /// distance — put the result back on the unit sphere.
+    ///
+    /// Normalizing last matters: [`Self::split_clusters`] perturbs and blends
+    /// rows, so those have to land on the sphere too.
     pub(crate) fn consolidate_centroids(&mut self, n_samples: usize, n_clusters: usize) {
         let d = self.d;
-        self.horizontal_centroids
-            .par_chunks_mut(d)
-            .zip(self.cluster_sizes.par_iter())
-            .for_each(|(row, &size)| {
-                if size == 0 {
-                    return;
-                }
-                let mult = 1.0 / size as f32;
-                for v in row.iter_mut() {
-                    *v *= mult;
-                }
-            });
+        mean_rows_by_count(
+            &mut self.horizontal_centroids,
+            &self.cluster_sizes[..n_clusters],
+            d,
+        );
 
         self.split_clusters(n_samples, n_clusters);
 
         if self.config.angular {
-            self.postprocess_centroids(n_clusters);
+            normalize_rows_l2(&mut self.horizontal_centroids, n_clusters, d);
         }
     }
 
@@ -820,45 +786,9 @@ impl SuperKMeans {
         }
     }
 
-    pub(crate) fn postprocess_centroids(&mut self, n_clusters: usize) {
-        let d = self.d;
-        self.horizontal_centroids
-            .par_chunks_mut(d)
-            .take(n_clusters)
-            .for_each(|row| {
-                let mut sum = 0.0_f32;
-                for v in row.iter() {
-                    sum += v * v;
-                }
-                let norm = 1.0 / sum.sqrt().max(f32::EPSILON);
-                for v in row.iter_mut() {
-                    *v *= norm;
-                }
-            });
-    }
-
     pub(crate) fn compute_cost(&mut self) {
         self.prev_cost = self.cost;
         self.cost = self.distances.iter().sum::<f32>();
-    }
-
-    pub(crate) fn compute_shift(&mut self, n_clusters: usize) {
-        let d = self.d;
-        let total: f32 = self
-            .horizontal_centroids
-            .par_chunks(d)
-            .zip(self.prev_centroids.par_chunks(d))
-            .take(n_clusters)
-            .map(|(new_row, prev_row)| {
-                let mut acc = 0.0_f32;
-                for k in 0..d {
-                    let diff = new_row[k] - prev_row[k];
-                    acc += diff * diff;
-                }
-                acc
-            })
-            .sum();
-        self.shift = total;
     }
 
     pub(crate) fn tune_partial_d(
@@ -1105,38 +1035,6 @@ impl SuperKMeans {
             max,
         }
     }
-}
-
-pub(crate) fn compute_norms_row_major(data: &[f32], n: usize, d: usize, _full: bool) -> Vec<f32> {
-    let mut out = vec![0.0_f32; n];
-    out.par_iter_mut().enumerate().for_each(|(i, dst)| {
-        let row = &data[i * d..(i + 1) * d];
-        let mut s = 0.0_f32;
-        for &v in row {
-            s += v * v;
-        }
-        *dst = s;
-    });
-    out
-}
-
-pub(crate) fn compute_partial_norms_row_major(
-    data: &[f32],
-    n: usize,
-    d: usize,
-    partial_d: usize,
-) -> Vec<f32> {
-    let p = partial_d.min(d);
-    let mut out = vec![0.0_f32; n];
-    out.par_iter_mut().enumerate().for_each(|(i, dst)| {
-        let row = &data[i * d..i * d + p];
-        let mut s = 0.0_f32;
-        for &v in row {
-            s += v * v;
-        }
-        *dst = s;
-    });
-    out
 }
 
 /// Borrow two disjoint rows of a row-major matrix mutably.
