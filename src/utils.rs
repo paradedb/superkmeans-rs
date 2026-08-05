@@ -145,12 +145,6 @@ pub fn squared_norms(vectors: &[f32], n_vectors: usize, d: usize) -> Vec<f32> {
 /// A prefix norm bounds the full one from below, which is what lets ADSampling
 /// reject a candidate after inspecting `partial_d` of its `d` dimensions. Values
 /// of `partial_d` above `d` are clamped.
-///
-/// Dispatches on the elements actually summed between
-/// [`squared_norms_partial_sequential`] and [`squared_norms_partial_parallel`] —
-/// see [`NORM_PARALLEL_MIN_ELEMENTS`]. The two agree bit for bit, since a row's
-/// norm is summed in the same order either way and only the rows are spread over
-/// rayon. Both are public so benchmarks can measure where the crossover lies.
 pub fn squared_norms_partial(
     vectors: &[f32],
     n_vectors: usize,
@@ -329,15 +323,6 @@ pub fn centroid_shift_parallel(
 /// outputs are overwritten rather than accumulated into, and any row of
 /// `centroids` past `cluster_sizes.len()` is left alone. A vector assigned
 /// outside that range is skipped.
-///
-/// Dispatches between [`sum_rows_by_assignment_sequential`] and
-/// [`sum_rows_by_assignment_parallel`], which agree bit for bit: both total a
-/// given cluster in vector order, so unlike the reduction kernels the choice
-/// cannot perturb the result. Both are public so benchmarks can measure where the
-/// crossover lies. Unlike the row-wise kernels this takes two thresholds, because
-/// the input and the output limit it independently — see
-/// [`SCATTER_PARALLEL_MIN_INPUT_ELEMENTS`] and
-/// [`SCATTER_PARALLEL_MIN_OUTPUT_ELEMENTS`].
 ///
 /// # Panics
 ///
