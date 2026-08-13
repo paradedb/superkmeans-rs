@@ -1,11 +1,11 @@
 //! Core SuperKMeans algorithm: BLAS+pruning k-means.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use rand_distr::{Distribution, Uniform, WeightedIndex};
-use rayon::prelude::*;
+use rand_distr::{Distribution, Uniform};
 
 use crate::adsampling::ADSamplingPruner;
 use crate::batch;
@@ -21,11 +21,12 @@ use crate::utils::{
 };
 
 /// Configuration parameters for SuperKMeans clustering.
+///
+/// There is no sampling knob: [`SuperKMeans::train`] clusters exactly the rows
+/// it is handed. Subsample before calling if you want to train on less data.
 #[derive(Clone, Debug)]
 pub struct SuperKMeansConfig {
     pub iters: u32,
-    pub sampling_fraction: f32,
-    pub max_points_per_cluster: u32,
     pub n_threads: u32,
     pub seed: u64,
     pub use_blas_only: bool,
@@ -52,8 +53,6 @@ impl Default for SuperKMeansConfig {
     fn default() -> Self {
         Self {
             iters: 10,
-            sampling_fraction: 0.3,
-            max_points_per_cluster: 256,
             n_threads: 0,
             seed: 42,
             use_blas_only: false,
@@ -105,7 +104,9 @@ pub struct SuperKMeans {
     pub config: SuperKMeansConfig,
     pub n_threads: usize,
 
-    pub pruner: ADSamplingPruner,
+    /// Shared because building one runs an O(d³) Householder QR; callers that
+    /// need many instances at the same `d` reuse a single rotation matrix.
+    pub pruner: Arc<ADSamplingPruner>,
 
     // Row-major centroids (this iteration & previous iteration).
     pub horizontal_centroids: Vec<f32>,
@@ -120,8 +121,6 @@ pub struct SuperKMeans {
     // most recent kernel that wrote them.
     pub data_norms: Vec<f32>,
     pub centroid_norms: Vec<f32>,
-
-    pub sampled_indices: Vec<usize>,
 
     // Geometry.
     pub vertical_d: usize,
@@ -153,18 +152,34 @@ impl SuperKMeans {
     pub fn with_config(
         n_clusters: usize,
         dimensionality: usize,
+        config: SuperKMeansConfig,
+    ) -> Self {
+        assert!(dimensionality > 0, "dimensionality must be positive");
+        let pruner = Arc::new(ADSamplingPruner::new(
+            dimensionality,
+            PRUNER_INITIAL_THRESHOLD,
+            config.seed,
+        ));
+        Self::with_shared_pruner(n_clusters, dimensionality, config, pruner)
+    }
+
+    /// Like [`Self::with_config`], but adopts an existing rotation matrix.
+    ///
+    /// [`ADSamplingPruner::new`] runs an O(d³) Householder QR, which dominates
+    /// construction at large `d`. Callers that build many instances for the
+    /// same dimensionality should build the pruner once and share it.
+    pub fn with_shared_pruner(
+        n_clusters: usize,
+        dimensionality: usize,
         mut config: SuperKMeansConfig,
+        pruner: Arc<ADSamplingPruner>,
     ) -> Self {
         assert!(n_clusters > 0, "n_clusters must be positive");
         assert!(dimensionality > 0, "dimensionality must be positive");
         assert!(config.iters > 0, "iters must be positive");
-        assert!(
-            config.sampling_fraction > 0.0,
-            "sampling_fraction must be positive"
-        );
-        assert!(
-            config.sampling_fraction <= 1.0,
-            "sampling_fraction must be <= 1.0"
+        assert_eq!(
+            pruner.num_dimensions, dimensionality,
+            "pruner dimensionality must match"
         );
 
         if config.data_already_rotated {
@@ -175,7 +190,6 @@ impl SuperKMeans {
         } else {
             config.n_threads as usize
         };
-        let pruner = ADSamplingPruner::new(dimensionality, PRUNER_INITIAL_THRESHOLD, config.seed);
         let split = layout::get_dimension_split(dimensionality);
         Self {
             d: dimensionality,
@@ -190,7 +204,6 @@ impl SuperKMeans {
             distances: Vec::new(),
             data_norms: Vec::new(),
             centroid_norms: Vec::new(),
-            sampled_indices: Vec::new(),
             vertical_d: split.vertical_d,
             horizontal_d: split.horizontal_d,
             partial_d: 0,
@@ -212,9 +225,9 @@ impl SuperKMeans {
         self.train_with_queries(data, n, &[], 0)
     }
 
-    /// Like `train`, but takes ownership of `data`. When no subsampling is
-    /// configured, the buffer is rotated in place, so peak memory is one copy
-    /// of the training set instead of two.
+    /// Like [`Self::train`], but takes ownership of `data` so the buffer can be
+    /// rotated in place. Peak memory is then one copy of the training set
+    /// rather than two.
     pub fn train_owned(&mut self, data: Vec<f32>, n: usize) -> Vec<f32> {
         self.train_impl(Cow::Owned(data), n, &[], 0)
     }
@@ -249,13 +262,8 @@ impl SuperKMeans {
         }
 
         self.iteration_stats.clear();
-        self.n_samples = self.compute_n_vectors_to_sample(n);
-        assert!(
-            self.n_samples >= self.n_clusters,
-            "Not enough samples to train (n_samples={}, n_clusters={})",
-            self.n_samples,
-            self.n_clusters
-        );
+        // Every row handed in is clustered; sampling belongs to the caller.
+        self.n_samples = n;
 
         let d = self.d;
         let n_clusters = self.n_clusters;
@@ -269,13 +277,8 @@ impl SuperKMeans {
         self.data_norms = vec![0.0_f32; n_samples];
         self.centroid_norms = vec![0.0_f32; n_clusters];
 
-        self.partial_d = (MIN_PARTIAL_D).max((self.vertical_d as u32) / 2);
-        if self.partial_d as usize > self.vertical_d {
-            self.partial_d = self.vertical_d as u32;
-        }
-
         if self.config.verbose {
-            println!("Front dimensions (d') = {}", self.partial_d);
+            println!("Front dimensions (d') = {}", self.initial_partial_d());
             println!("Trailing dimensions (d'') = {}", d - self.vertical_d);
         }
 
@@ -283,12 +286,9 @@ impl SuperKMeans {
         let rotate = !self.config.data_already_rotated;
         self.generate_centroids(&data, n, rotate);
 
-        if self.config.verbose {
-            println!("Sampling data...");
-        }
         let data_to_cluster = match data {
-            Cow::Borrowed(borrowed) => self.sample_and_rotate_vectors(borrowed, n, rotate),
-            Cow::Owned(owned) => self.sample_and_rotate_vectors_owned(owned, n, rotate),
+            Cow::Borrowed(borrowed) => self.rotate_vectors(borrowed, n, rotate),
+            Cow::Owned(owned) => self.rotate_vectors_owned(owned, n, rotate),
         };
 
         // horizontal_centroids currently holds the unrotated Forgy samples.
@@ -304,6 +304,28 @@ impl SuperKMeans {
         let _ = queries;
         let _ = n_queries;
 
+        self.run_core_loop(&data_to_cluster, self.config.iters);
+
+        self.trained = true;
+        self.get_output_centroids(self.config.unrotate_centroids)
+    }
+
+    /// The Lloyd driver: alternate assignment and centroid update for `iters`
+    /// passes, widening `d'` as the pruning bound tightens and stopping early
+    /// on convergence.
+    ///
+    /// Callers own the setup: per-cluster and per-sample buffers sized for
+    /// `self.n_samples` / `self.n_clusters`, initial centroids in
+    /// `prev_centroids` (rotated domain), and full-width norms in `data_norms`
+    /// and `centroid_norms`. Both [`Self::train`] and the hierarchical
+    /// splitter go through here.
+    pub(crate) fn run_core_loop(&mut self, data: &[f32], iters: u32) {
+        let d = self.d;
+        let n_clusters = self.n_clusters;
+        let n_samples = self.n_samples;
+
+        self.partial_d = self.initial_partial_d();
+
         let always_gemm_only = d < DIMENSION_THRESHOLD_FOR_PRUNING
             || self.config.use_blas_only
             || n_clusters <= N_CLUSTERS_THRESHOLD_FOR_PRUNING;
@@ -313,15 +335,15 @@ impl SuperKMeans {
 
         let mut not_pruned_counts = vec![0_usize; n_samples];
 
-        for iter_idx in 0..self.config.iters {
+        for iter_idx in 0..iters {
             let use_gemm_only = (iter_idx == 0) || always_gemm_only;
             if !use_gemm_only && !partial_norms_computed {
                 self.data_norms =
-                    squared_norms_partial(&data_to_cluster, n_samples, d, self.partial_d as usize);
+                    squared_norms_partial(data, n_samples, d, self.partial_d as usize);
                 partial_norms_computed = true;
             }
             self.run_iteration(
-                &data_to_cluster,
+                data,
                 iter_idx,
                 iter_idx == 0,
                 use_gemm_only,
@@ -339,9 +361,6 @@ impl SuperKMeans {
                 break;
             }
         }
-
-        self.trained = true;
-        self.get_output_centroids(self.config.unrotate_centroids)
     }
 
     /// Brute-force assignment: returns the index of the nearest centroid for
@@ -369,7 +388,21 @@ impl SuperKMeans {
         result_assignments
     }
 
-    /// Fast assignment of training points using pruning.
+    /// Re-assign the training set to its nearest centroid using the pruning path.
+    ///
+    /// Each point's pruning threshold is seeded with the centroid it landed on
+    /// during training, which is what makes pruning pay: starting from that
+    /// tight bound rather than a full GEMM over the first centroid batch is
+    /// worth roughly 1.8x in the paper's ablation.
+    ///
+    /// A *different* set of vectors has no such seed available, so it needs a
+    /// cold-start strategy and is deliberately not handled here — use
+    /// [`Self::assign`], which is exact but unpruned.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the model is untrained, or if `n_vectors` differs from the row
+    /// count passed to training.
     pub fn assign_training_points(
         &mut self,
         vectors: &[f32],
@@ -379,6 +412,12 @@ impl SuperKMeans {
         assert!(
             self.trained,
             "assign_training_points requires training first"
+        );
+        assert_eq!(
+            n_vectors, self.n_samples,
+            "assign_training_points re-assigns the training set; pass the {} rows given to \
+             train, or use assign() for a different set",
+            self.n_samples
         );
         let d = self.d;
         let n_centroids = centroids.len() / d;
@@ -396,7 +435,7 @@ impl SuperKMeans {
             return self.assign(vectors, centroids, n_vectors);
         }
 
-        self.partial_d = (MIN_PARTIAL_D).max((self.vertical_d as u32) / 2);
+        self.partial_d = self.initial_partial_d();
 
         let mut not_pruned_counts = vec![0_usize; n_vectors];
         let mut data_buffer = vec![0.0_f32; n_vectors * d];
@@ -416,128 +455,16 @@ impl SuperKMeans {
             self.partial_d as usize,
         );
 
-        let mut result_assignments = vec![0_u32; n_vectors];
-        let mut result_distances = vec![0.0_f32; n_vectors];
-
-        if self.config.sampling_fraction == 1.0 {
-            let data_partial_norms =
-                squared_norms_partial(data_p, n_vectors, d, self.partial_d as usize);
-            // Seed assignments from training run; for sampling_fraction=1, training assignments
-            // match the natural indices.
-            result_assignments
-                .copy_from_slice(&self.assignments[..n_vectors.min(self.assignments.len())]);
-            batch::find_nearest_neighbor_with_pruning(
-                data_p,
-                &self.horizontal_centroids,
-                n_vectors,
-                n_centroids,
-                d,
-                self.vertical_d,
-                self.horizontal_d,
-                &data_partial_norms,
-                &centroid_partial_norms,
-                &mut result_assignments,
-                &mut result_distances,
-                &self.pruner,
-                self.partial_d as usize,
-                &mut not_pruned_counts,
-                &mut self.gemm_buf,
-            );
-            return result_assignments;
-        }
-
-        // For non-full sampling, seed assignments with a distribution proportional to
-        // the trained cluster sizes (matches the FAISS-style heuristic in the C++).
-        let mut rng = ChaCha8Rng::seed_from_u64(self.config.seed.wrapping_add(1));
-        if self.config.sampling_fraction > 0.8 {
-            let n_samples = self.n_samples;
-            for cur in 0..n_samples {
-                let orig = self.sampled_indices[cur];
-                if orig < n_vectors {
-                    result_assignments[orig] = self.assignments[cur];
-                }
-            }
-            let weights: Vec<u32> = self
-                .cluster_sizes
-                .iter()
-                .copied()
-                .map(|s| s.max(1))
-                .collect();
-            let weighted = WeightedIndex::new(&weights).expect("non-empty weights");
-            for cur in n_samples..n_vectors {
-                let orig = if cur < self.sampled_indices.len() {
-                    self.sampled_indices[cur]
-                } else {
-                    cur
-                };
-                if orig < n_vectors {
-                    result_assignments[orig] = weighted.sample(&mut rng) as u32;
-                }
-            }
-
-            let data_partial_norms =
-                squared_norms_partial(data_p, n_vectors, d, self.partial_d as usize);
-            batch::find_nearest_neighbor_with_pruning(
-                data_p,
-                &self.horizontal_centroids,
-                n_vectors,
-                n_centroids,
-                d,
-                self.vertical_d,
-                self.horizontal_d,
-                &data_partial_norms,
-                &centroid_partial_norms,
-                &mut result_assignments,
-                &mut result_distances,
-                &self.pruner,
-                self.partial_d as usize,
-                &mut not_pruned_counts,
-                &mut self.gemm_buf,
-            );
-            return result_assignments;
-        }
-
-        // Very small sampling fractions: meso-cluster the centroids to seed assignments.
-        let new_n_centroids = ((n_centroids as f64).sqrt() as usize).max(1);
-        let tmp_config = SuperKMeansConfig {
-            iters: 10,
-            sampling_fraction: 1.0,
-            use_blas_only: false,
-            verbose: self.config.verbose,
-            suppress_warnings: self.config.suppress_warnings,
-            seed: self.config.seed,
-            angular: self.config.angular,
-            data_already_rotated: self.config.data_already_rotated,
-            ..Default::default()
-        };
-        let mut tmp_kmeans = SuperKMeans::with_config(new_n_centroids, d, tmp_config);
-        let meso_centroids = tmp_kmeans.train(centroids, n_centroids);
-        let meso_assignments = tmp_kmeans.assign(vectors, &meso_centroids, n_vectors);
-        let centroids_to_meso = tmp_kmeans.assign(centroids, &meso_centroids, n_centroids);
-        let mut meso_to_original = vec![0_u32; new_n_centroids];
-        for c in 0..n_centroids {
-            meso_to_original[centroids_to_meso[c] as usize] = c as u32;
-        }
-        let n_samples = self.n_samples;
-        for cur in 0..n_samples {
-            let orig = self.sampled_indices[cur];
-            if orig < n_vectors {
-                result_assignments[orig] = self.assignments[cur];
-            }
-        }
-        for cur in n_samples..n_vectors {
-            let orig = if cur < self.sampled_indices.len() {
-                self.sampled_indices[cur]
-            } else {
-                cur
-            };
-            if orig < n_vectors {
-                result_assignments[orig] = meso_to_original[meso_assignments[orig] as usize];
-            }
-        }
-
         let data_partial_norms =
             squared_norms_partial(data_p, n_vectors, d, self.partial_d as usize);
+
+        // Training row i is input row i, so the trained assignments seed directly.
+        assert!(
+            self.assignments.len() >= n_vectors,
+            "training assignments were not retained; use assign() instead"
+        );
+        let mut result_assignments = self.assignments[..n_vectors].to_vec();
+        let mut result_distances = vec![0.0_f32; n_vectors];
         batch::find_nearest_neighbor_with_pruning(
             data_p,
             &self.horizontal_centroids,
@@ -786,6 +713,15 @@ impl SuperKMeans {
         }
     }
 
+    /// The starting `d'`: half the vertically-stored dimensions, floored at
+    /// [`MIN_PARTIAL_D`] and capped at what is actually stored vertically.
+    /// [`Self::tune_partial_d`] widens or narrows it from here.
+    fn initial_partial_d(&self) -> u32 {
+        MIN_PARTIAL_D
+            .max(self.vertical_d as u32 / 2)
+            .min(self.vertical_d as u32)
+    }
+
     pub(crate) fn compute_cost(&mut self) {
         self.prev_cost = self.cost;
         self.cost = self.distances.iter().sum::<f32>();
@@ -863,15 +799,6 @@ impl SuperKMeans {
         false
     }
 
-    pub(crate) fn compute_n_vectors_to_sample(&self, n: usize) -> usize {
-        if self.config.sampling_fraction == 1.0 {
-            return n;
-        }
-        let by_clusters = self.n_clusters * self.config.max_points_per_cluster as usize;
-        let by_n = ((n as f64) * self.config.sampling_fraction as f64).floor() as usize;
-        by_n.min(by_clusters)
-    }
-
     pub(crate) fn generate_centroids(&mut self, data: &[f32], n: usize, rotate: bool) {
         let d = self.d;
         let n_clusters = self.n_clusters;
@@ -898,73 +825,27 @@ impl SuperKMeans {
         }
     }
 
-    pub(crate) fn sample_and_rotate_vectors(
-        &mut self,
-        data: &[f32],
-        n: usize,
-        rotate: bool,
-    ) -> Vec<f32> {
-        let samples = self.gather_samples(data, n);
+    /// Copy the `n` rows to cluster into an owned buffer, rotating into the
+    /// pruning domain on the way when `rotate` is set.
+    fn rotate_vectors(&self, data: &[f32], n: usize, rotate: bool) -> Vec<f32> {
+        let len = n * self.d;
         if rotate {
-            let mut rotated = vec![0.0_f32; self.n_samples * self.d];
-            self.pruner.rotate(&samples, &mut rotated, self.n_samples);
+            let mut rotated = vec![0.0_f32; len];
+            self.pruner.rotate(&data[..len], &mut rotated, n);
             rotated
         } else {
-            samples
+            data[..len].to_vec()
         }
     }
 
-    /// Owned variant: when no subsampling is needed, rotates `data` in place
-    /// instead of allocating a second full-size buffer.
-    pub(crate) fn sample_and_rotate_vectors_owned(
-        &mut self,
-        mut data: Vec<f32>,
-        n: usize,
-        rotate: bool,
-    ) -> Vec<f32> {
-        let mut samples = if self.n_samples < n {
-            self.gather_samples(&data, n)
-        } else {
-            self.sampled_indices = (0..n).collect();
-            if self.config.verbose {
-                println!("Using {} vectors", self.n_samples);
-            }
-            data.truncate(self.n_samples * self.d);
-            data
-        };
+    /// Owned variant: rotates `data` in place instead of allocating a second
+    /// full-size buffer.
+    fn rotate_vectors_owned(&self, mut data: Vec<f32>, n: usize, rotate: bool) -> Vec<f32> {
+        data.truncate(n * self.d);
         if rotate {
-            self.pruner.rotate_in_place(&mut samples, self.n_samples);
+            self.pruner.rotate_in_place(&mut data, n);
         }
-        samples
-    }
-
-    fn gather_samples(&mut self, data: &[f32], n: usize) -> Vec<f32> {
-        let d = self.d;
-        let n_samples = self.n_samples;
-
-        if n_samples < n {
-            if self.config.verbose {
-                println!("Sampling {} vectors", n_samples);
-            }
-            let mut rng = ChaCha8Rng::seed_from_u64(self.config.seed);
-            self.sampled_indices = (0..n).collect();
-            for i in (1..n).rev() {
-                let j = rng.gen_range(0..=i);
-                self.sampled_indices.swap(i, j);
-            }
-            let mut samples = vec![0.0_f32; n_samples * d];
-            samples.par_chunks_mut(d).enumerate().for_each(|(i, dst)| {
-                let src = self.sampled_indices[i] * d;
-                dst.copy_from_slice(&data[src..src + d]);
-            });
-            samples
-        } else {
-            self.sampled_indices = (0..n).collect();
-            if self.config.verbose {
-                println!("Using {} vectors", n_samples);
-            }
-            data[..n_samples * d].to_vec()
-        }
+        data
     }
 
     /// Copy horizontal_centroids -> prev_centroids, applying rotation if needed.

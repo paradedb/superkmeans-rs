@@ -43,7 +43,6 @@ fn each_point_assigned_to_nearest_centroid() {
 
     let cfg = SuperKMeansConfig {
         iters: 10,
-        sampling_fraction: 1.0,
         verbose: false,
         seed: 42,
         unrotate_centroids: true,
@@ -85,7 +84,6 @@ fn each_point_assigned_to_nearest_centroid_high_dim() {
 
     let cfg = SuperKMeansConfig {
         iters: 10,
-        sampling_fraction: 1.0,
         verbose: false,
         seed: 123,
         unrotate_centroids: true,
@@ -125,7 +123,6 @@ fn use_train_state_matches_brute_force() {
 
     let cfg = SuperKMeansConfig {
         iters: 5,
-        sampling_fraction: 1.0,
         verbose: false,
         seed: 42,
         unrotate_centroids: true,
@@ -147,8 +144,10 @@ fn use_train_state_matches_brute_force() {
     );
 }
 
+/// Sampling is the caller's job, so training on a subset is just training on a
+/// smaller slice. The pruned assign path has to hold up there too.
 #[test]
-fn use_train_state_matches_brute_force_sampled() {
+fn use_train_state_matches_brute_force_on_a_caller_side_sample() {
     let n = 5_000;
     let d = 128;
     let n_clusters = 300;
@@ -156,25 +155,27 @@ fn use_train_state_matches_brute_force_sampled() {
 
     let cfg = SuperKMeansConfig {
         iters: 5,
-        sampling_fraction: 0.5,
         verbose: false,
         seed: 42,
         unrotate_centroids: true,
         ..Default::default()
     };
     let mut kmeans = SuperKMeans::with_config(n_clusters, d, cfg);
-    let centroids = kmeans.train(&data, n);
 
-    let fast = kmeans.assign_training_points(&data, &centroids, n);
-    let brute = kmeans.assign(&data, &centroids, n);
-    assert_eq!(fast.len(), n);
-    assert_eq!(brute.len(), n);
+    let sampled = n / 2;
+    let sample = &data[..sampled * d];
+    let centroids = kmeans.train(sample, sampled);
+
+    let fast = kmeans.assign_training_points(sample, &centroids, sampled);
+    let brute = kmeans.assign(sample, &centroids, sampled);
+    assert_eq!(fast.len(), sampled);
+    assert_eq!(brute.len(), sampled);
 
     let matches = fast.iter().zip(&brute).filter(|(a, b)| a == b).count();
-    let pct = 100.0 * matches as f64 / n as f64;
+    let pct = 100.0 * matches as f64 / sampled as f64;
     assert!(
         pct >= 98.0,
-        "use_train_state (sampled) should match brute force >=98%; got {pct:.2}% ({matches}/{n})"
+        "use_train_state should match brute force >=98%; got {pct:.2}% ({matches}/{sampled})"
     );
 }
 
@@ -188,7 +189,6 @@ fn use_train_state_matches_brute_force_full() {
 
     let cfg = SuperKMeansConfig {
         iters: 15,
-        sampling_fraction: 1.0,
         verbose: false,
         seed: 42,
         unrotate_centroids: true,
@@ -217,7 +217,6 @@ fn all_clusters_non_empty() {
 
     let cfg = SuperKMeansConfig {
         iters: 15,
-        sampling_fraction: 1.0,
         verbose: false,
         seed: 42,
         unrotate_centroids: true,

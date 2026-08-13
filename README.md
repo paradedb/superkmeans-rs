@@ -25,8 +25,9 @@ dimensionality grows.
   when you want the last bit of throughput (see [BLAS backends](#blas-backends)).
 - **Parallel** — training and assignment are parallelized with
   [`rayon`](https://crates.io/crates/rayon).
-- **Hierarchical clustering** — `HierarchicalSuperKMeans` builds a two-level
-  clustering for very large numbers of clusters.
+- **Hierarchical clustering** — `HierarchicalSuperKMeans` iteratively builds a
+  balanced cluster tree (HBC) until every leaf is below a size cap, using a
+  √K meso root split by default.
 
 > **Note:** the crate is published as `superkmeans-rs` but the library target
 > is named `superkmeans`, so you import it as `use superkmeans::...`.
@@ -68,9 +69,8 @@ assert_eq!(assignments.len(), n);
 ### Tuning
 
 `SuperKMeansConfig` exposes the knobs from the C++ original — number of
-iterations, sampling fraction, RNG seed, early-termination tolerances,
-ADSampling pruning bounds, and more. Start from the defaults and override what
-you need:
+iterations, RNG seed, early-termination tolerances, ADSampling pruning bounds,
+and more. Start from the defaults and override what you need:
 
 ```rust
 use superkmeans::{SuperKMeans, SuperKMeansConfig};
@@ -87,9 +87,30 @@ Training runs on the ambient rayon thread pool, so the width comes from
 `RAYON_NUM_THREADS` or from calling `train` inside your own
 `ThreadPool::install`.
 
+`train` clusters exactly the rows you hand it — there is no sampling knob.
+Training on a subset is usually worth it (on 200k Cohere vectors, a 25% sample
+halved build time and cost under a point of recall@100); just subsample before
+calling `train` and pass the full set to `assign`.
+
 ### Hierarchical clustering
 
-For very large `k`, `HierarchicalSuperKMeans` clusters in two levels:
+`HierarchicalSuperKMeans` recursively splits the data until every leaf has at
+most `max_leaf_size` points. `train` returns the leaf centroids; the full tree
+is on `kmeans.tree`. The cluster count is emergent and lands near
+`n / max_leaf_size`.
+
+By default the root splits into `ceil(sqrt(K))` children with
+`K = ceil(n / max_leaf_size)`, and each deeper split uses
+`k = ceil(n_i / max_leaf_size)` so an oversized subtree finishes in one pass.
+Set `branching_factor = Some(b)` for a fixed fan-out (e.g. 2 for a balanced
+k-means tree).
+
+Leaves come out evenly sized without an explicit balance penalty: each split
+rebalances its own undersized clusters.
+
+Splits reorder the training set in place rather than copying each child out.
+With `train_owned` peak memory is one copy of the training set; `train` must
+duplicate the caller's slice before rotating it.
 
 ```rust
 use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, make_blobs};
@@ -98,10 +119,15 @@ let n = 100_000;
 let d = 256;
 let data = make_blobs(n, d, 100, true, 1.0, 10.0, 42);
 
-let mut kmeans =
-    HierarchicalSuperKMeans::with_config(10_000, d, HierarchicalSuperKMeansConfig::default());
+let cfg = HierarchicalSuperKMeansConfig {
+    max_leaf_size: 256,
+    ..Default::default()
+};
+
+let mut kmeans = HierarchicalSuperKMeans::with_config(d, cfg);
 let centroids = kmeans.train(&data, n);
 let assignments = kmeans.assign(&data, &centroids, n);
+assert_eq!(centroids.len(), kmeans.tree.n_leaves * d);
 ```
 
 ## BLAS backends
