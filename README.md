@@ -123,8 +123,7 @@ assert_eq!(assignments.len(), n);
 
 `train_iter` requires a [`Clone`] iterator. A source that cannot be cloned
 (for example a file re-read each pass) implements [`Dataset`] and calls
-`train_dataset`. Hierarchical clustering cannot use that path: it partitions
-by reordering rows in place so each child is a contiguous block (see below).
+`train_dataset`. Hierarchical clustering is not on that path yet (see below).
 
 ### Hierarchical clustering
 
@@ -144,13 +143,16 @@ rebalances its own undersized clusters.
 
 Splits reorder the training set in place rather than copying each child out.
 With `train_owned` peak memory is one copy of the training set; `train` must
-duplicate the caller's slice before rotating it. That in-place permute is why
-`HierarchicalSuperKMeans` has no `train_iter` / `train_dataset`: child splits
-are slices of the permuted buffer (`data_offset` / `size` on each tree node),
-not filtered replays of the original stream. The local k-means run at a node
-could stream if those members were already a restartable `Matrix` source, but
-building the tree still needs random-access partition, so the full set stays
-in RAM.
+duplicate the caller's slice before rotating it. That permute is why
+`HierarchicalSuperKMeans` has no `train_iter` / `train_dataset` today: child
+splits are slices of the permuted buffer (`data_offset` / `size`), not
+filtered replays of the original stream.
+
+A streaming hierarchical builder is a follow-on (not in this crate yet): meso
+root via the existing `Matrix` / `Dataset` path, then each further split from
+a restartable iterator of that cluster’s member `Matrix` batches. The in-place
+permute and `data_offset` would go away; assignments, centroids, and the tree
+would stay in RAM.
 
 ```rust
 use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, make_blobs};
