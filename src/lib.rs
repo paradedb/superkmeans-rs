@@ -29,19 +29,23 @@ compile_error!(
 pub mod adsampling;
 pub mod batch;
 pub mod common;
+pub mod dataset;
 pub mod distance;
 pub mod gemm;
 pub mod hierarchical;
 pub mod layout;
+pub mod matrix;
 pub mod pdxearch;
 pub mod superkmeans;
 pub mod utils;
 
 pub use common::{DistanceFunction, KnnCandidate};
+pub use dataset::{Dataset, IterDataset};
 pub use hierarchical::{
     ClusterTree, HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig,
     HierarchicalSuperKMeansIterationStats, NodeId, TreeNode,
 };
+pub use matrix::{Matrix, MatrixChunks};
 pub use superkmeans::{
     ClusterBalanceStats, SuperKMeans, SuperKMeansConfig, SuperKMeansIterationStats,
 };

@@ -11,7 +11,7 @@ use rand_distr::Distribution as _;
 
 use superkmeans::adsampling::ADSamplingPruner;
 use superkmeans::common::PRUNER_INITIAL_THRESHOLD;
-use superkmeans::{SuperKMeans, SuperKMeansConfig, make_blobs};
+use superkmeans::{Dataset, Matrix, SuperKMeans, SuperKMeansConfig, make_blobs};
 
 fn default_blobs(n: usize, d: usize, n_clusters: usize) -> Vec<f32> {
     make_blobs(n, d, n_clusters, false, 1.0, 10.0, 42)
@@ -389,4 +389,122 @@ fn hierarchical_train_owned_matches_train() {
         "owned path built a different tree"
     );
     assert_centroids_match(&centroids_borrowed, &centroids_owned, 1e-4);
+}
+
+/// Streaming `train_iter` over GEMM-sized [`Matrix`] chunks produces a usable
+/// clustering of the same cardinality as the in-memory path.
+#[test]
+fn train_iter_chunks_clusters_all_points() {
+    let n = 4_000;
+    let d = 32;
+    let n_clusters = 20;
+    let data = default_blobs(n, d, n_clusters);
+    let view = Matrix::new(&data, n, d);
+
+    let cfg = SuperKMeansConfig {
+        iters: 10,
+        seed: 42,
+        verbose: false,
+        ..Default::default()
+    };
+    let mut streamed = SuperKMeans::with_config(n_clusters, d, cfg);
+    let centroids = streamed.train_iter(view.chunks(256));
+    assert!(streamed.trained);
+    assert_eq!(centroids.len(), n_clusters * d);
+    assert_eq!(streamed.n_samples, n);
+    assert_eq!(streamed.assignments.len(), n);
+
+    let assignments = streamed.assign(&data, &centroids, n);
+    let used: HashSet<u32> = assignments.iter().copied().collect();
+    assert_eq!(
+        used.len(),
+        n_clusters,
+        "expected all {n_clusters} clusters to be used, only {} were",
+        used.len()
+    );
+}
+
+/// Single-vector matrices (`n = 1`) are packed into work batches; walking the
+/// same rows in the same order must match fat batches bit-for-bit, because
+/// assignment is per-point and centroid sums accumulate in stream order.
+#[test]
+fn train_iter_unit_matrices_match_batched() {
+    let n = 1_500;
+    let d = 16;
+    let k = 12;
+    let data = default_blobs(n, d, k);
+    let view = Matrix::new(&data, n, d);
+
+    let cfg = SuperKMeansConfig {
+        iters: 8,
+        seed: 7,
+        early_termination: false,
+        verbose: false,
+        ..Default::default()
+    };
+
+    let mut batched = SuperKMeans::with_config(k, d, cfg.clone());
+    let centroids_batched = batched.train_iter(view.chunks(128));
+
+    let unit: Vec<Matrix<'_>> = (0..n)
+        .map(|i| Matrix::vector(&data[i * d..(i + 1) * d]))
+        .collect();
+    let mut singles = SuperKMeans::with_config(k, d, cfg);
+    let centroids_singles = singles.train_iter(unit.into_iter());
+
+    assert_centroids_match(&centroids_batched, &centroids_singles, 1e-5);
+    assert_eq!(batched.assignments, singles.assignments);
+}
+
+/// A custom [`Dataset`] that re-reads the same `n × d` buffer each pass.
+struct ReplaySlice<'a> {
+    data: &'a [f32],
+    d: usize,
+    chunk_rows: usize,
+}
+
+impl Dataset for ReplaySlice<'_> {
+    fn for_each_batch(&mut self, f: &mut dyn FnMut(Matrix<'_>)) {
+        for chunk in Matrix::from_slice(self.data, self.d).chunks(self.chunk_rows) {
+            f(chunk);
+        }
+    }
+}
+
+#[test]
+fn train_dataset_replays_a_custom_source() {
+    let n = 2_000;
+    let d = 24;
+    let k = 15;
+    let data = default_blobs(n, d, k);
+
+    let cfg = SuperKMeansConfig {
+        iters: 6,
+        seed: 3,
+        verbose: false,
+        ..Default::default()
+    };
+    let mut via_iter = SuperKMeans::with_config(k, d, cfg.clone());
+    let view = Matrix::new(&data, n, d);
+    let centroids_iter = via_iter.train_iter(view.chunks(64));
+
+    let mut via_dataset = SuperKMeans::with_config(k, d, cfg);
+    let mut source = ReplaySlice {
+        data: &data,
+        d,
+        chunk_rows: 64,
+    };
+    let centroids_dataset = via_dataset.train_dataset(&mut source);
+
+    assert_centroids_match(&centroids_iter, &centroids_dataset, 1e-5);
+}
+
+#[test]
+#[should_panic(expected = "n must be >= n_clusters")]
+fn train_iter_rejects_fewer_rows_than_clusters() {
+    let d = 8;
+    let data = [0.0_f32; 16];
+    let view = Matrix::new(&data, 2, d);
+    let mut kmeans = SuperKMeans::new(4, d);
+    let _ = kmeans.train_iter(view.chunks(2));
 }

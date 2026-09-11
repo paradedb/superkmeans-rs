@@ -43,8 +43,10 @@ The minimum supported Rust version (MSRV) is **1.89** (required by the AVX512 in
 
 ## Quick Start
 
-Vectors are passed as a single row-major `&[f32]` slice of length `n * d`
-(`n` vectors of dimensionality `d`):
+Training data is always a contiguous row-major `n × d` buffer of `f32`s
+(`n` vectors of dimensionality `d`). The in-memory path still takes that as a
+flat `&[f32]`; streaming training yields the same layout as [`Matrix`]
+items (`n = 1` is one vector, `n > 1` is a batch):
 
 ```rust
 use superkmeans::{SuperKMeans, SuperKMeansConfig, make_blobs};
@@ -91,6 +93,38 @@ Training runs on the ambient rayon thread pool, so the width comes from
 Training on a subset is usually worth it (on 200k Cohere vectors, a 25% sample
 halved build time and cost under a point of recall@100); just subsample before
 calling `train` and pass the full set to `assign`.
+
+### Streaming training
+
+K-means only needs one pass over the points per Lloyd iteration (assign,
+recompute centroids, measure how far they moved). When the full set cannot
+stay in RAM, hand SuperKMeans an iterator of [`Matrix`] views instead of one
+giant slice. Each item is still a contiguous `&[f32]` of length `n * d`:
+
+```rust
+use superkmeans::{Matrix, SuperKMeans, SuperKMeansConfig, make_blobs};
+
+let n = 10_000;
+let d = 128;
+let k = 100;
+let data = make_blobs(n, d, k, true, 1.0, 10.0, 42);
+let view = Matrix::new(&data, n, d);
+
+let mut kmeans = SuperKMeans::with_config(k, d, SuperKMeansConfig::default());
+
+// Replayable iterator of batches. `clone()` must yield the same rows again —
+// k-means walks the stream once to sample initial centroids and once per
+// iteration. Prefer fat batches so GEMM / rayon stay saturated; single-vector
+// items (`Matrix::vector`) are packed automatically.
+let centroids = kmeans.train_iter(view.chunks(1_024));
+let assignments = kmeans.assign(&data, &centroids, n);
+assert_eq!(assignments.len(), n);
+```
+
+`train_iter` requires a [`Clone`] iterator. A source that cannot be cloned
+(for example a file re-read each pass) implements [`Dataset`] and calls
+`train_dataset`. Hierarchical clustering still splits by reordering rows in
+place, so it needs the training set in memory (`train` / `train_owned`).
 
 ### Hierarchical clustering
 

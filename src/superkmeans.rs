@@ -1,6 +1,5 @@
 //! Core SuperKMeans algorithm: BLAS+pruning k-means.
 
-use std::borrow::Cow;
 use std::sync::Arc;
 
 use rand::{Rng, SeedableRng};
@@ -14,10 +13,12 @@ use crate::common::{
     N_CLUSTERS_THRESHOLD_FOR_PRUNING, PRUNER_INITIAL_THRESHOLD, RECALL_CONVERGENCE_PATIENCE,
     X_BATCH_SIZE, Y_BATCH_SIZE,
 };
+use crate::dataset::{self, Dataset, IterDataset};
 use crate::layout;
+use crate::matrix::Matrix;
 use crate::utils::{
-    centroid_shift, mean_rows_by_count, normalize_rows_l2, squared_norms, squared_norms_partial,
-    sum_rows_by_assignment,
+    accumulate_rows_by_assignment, centroid_shift, mean_rows_by_count, normalize_rows_l2,
+    squared_norms, squared_norms_partial, sum_rows_by_assignment,
 };
 
 /// Configuration parameters for SuperKMeans clustering.
@@ -221,30 +222,26 @@ impl SuperKMeans {
     }
 
     /// Train the model and return row-major centroids (n_clusters × d).
+    ///
+    /// `data` is a single in-memory [`Matrix`]: a contiguous `n × d` slice.
+    /// Training no longer keeps a second rotated copy of that buffer; each
+    /// GEMM-sized work batch is rotated into scratch instead. Callers that
+    /// still have the full set in RAM can keep using this entry point.
     pub fn train(&mut self, data: &[f32], n: usize) -> Vec<f32> {
         self.train_with_queries(data, n, &[], 0)
     }
 
-    /// Like [`Self::train`], but takes ownership of `data` so the buffer can be
-    /// rotated in place. Peak memory is then one copy of the training set
-    /// rather than two.
+    /// Like [`Self::train`], but takes ownership of `data`.
+    ///
+    /// Peak working set is one copy of the training set plus a GEMM-sized
+    /// rotation scratch buffer (the owned buffer is not rotated in place).
     pub fn train_owned(&mut self, data: Vec<f32>, n: usize) -> Vec<f32> {
-        self.train_impl(Cow::Owned(data), n, &[], 0)
+        self.train(&data, n)
     }
 
     pub fn train_with_queries(
         &mut self,
         data: &[f32],
-        n: usize,
-        queries: &[f32],
-        n_queries: usize,
-    ) -> Vec<f32> {
-        self.train_impl(Cow::Borrowed(data), n, queries, n_queries)
-    }
-
-    fn train_impl(
-        &mut self,
-        data: Cow<'_, [f32]>,
         n: usize,
         queries: &[f32],
         n_queries: usize,
@@ -261,53 +258,383 @@ impl SuperKMeans {
             panic!("Queries must be provided if n_queries > 0 and sample_queries is false");
         }
 
-        self.iteration_stats.clear();
-        // Every row handed in is clustered; sampling belongs to the caller.
-        self.n_samples = n;
-
         let d = self.d;
-        let n_clusters = self.n_clusters;
-        let n_samples = self.n_samples;
-
-        self.horizontal_centroids = vec![0.0_f32; n_clusters * d];
-        self.prev_centroids = vec![0.0_f32; n_clusters * d];
-        self.cluster_sizes = vec![0_u32; n_clusters];
-        self.assignments = vec![0_u32; n_samples];
-        self.distances = vec![0.0_f32; n_samples];
-        self.data_norms = vec![0.0_f32; n_samples];
-        self.centroid_norms = vec![0.0_f32; n_clusters];
-
-        if self.config.verbose {
-            println!("Front dimensions (d') = {}", self.initial_partial_d());
-            println!("Trailing dimensions (d'') = {}", d - self.vertical_d);
-        }
-
-        // Sample initial centroids (Forgy) and rotate them into prev_centroids/horizontal_centroids.
+        let mut view = Matrix::new(&data[..n * d], n, d);
+        self.prepare_train_state(n);
         let rotate = !self.config.data_already_rotated;
-        self.generate_centroids(&data, n, rotate);
-
-        let data_to_cluster = match data {
-            Cow::Borrowed(borrowed) => self.rotate_vectors(borrowed, n, rotate),
-            Cow::Owned(owned) => self.rotate_vectors_owned(owned, n, rotate),
-        };
-
-        // horizontal_centroids currently holds the unrotated Forgy samples.
-        // Rotate (or copy) into prev_centroids.
+        self.generate_centroids(view.as_slice(), n, rotate);
         self.rotate_or_copy_into_prev_centroids(rotate);
-
-        // Compute full norms for first GEMM iteration.
-        self.data_norms = squared_norms(&data_to_cluster, n_samples, d);
-        self.centroid_norms = squared_norms(&self.prev_centroids, n_clusters, d);
 
         // Optional recall tracking — skipped for the minimal port; the algorithm runs
         // identically without queries (early-termination on shift/cost still works).
         let _ = queries;
         let _ = n_queries;
 
-        self.run_core_loop(&data_to_cluster, self.config.iters);
+        self.run_dataset_loop(&mut view, rotate);
+        self.finish_train()
+    }
 
+    /// Train from a restartable iterator of [`Matrix`] batches.
+    ///
+    /// Each item is an `n × d` view (`n = 1` is a single vector). The iterator
+    /// must be [`Clone`] so every Lloyd pass can replay the stream in the same
+    /// order. Small items are packed into [`crate::common::X_BATCH_SIZE`] work batches so the
+    /// GEMM / rayon kernels stay saturated.
+    ///
+    /// Initial centroids are reservoir-sampled on the first pass (there is no
+    /// random access for Forgy). Subsequent passes assign, accumulate centroid
+    /// sums, and measure shift — the usual k-means loop — without retaining
+    /// the vector buffer.
+    ///
+    /// Sources that cannot be cloned (a file re-read each pass) should
+    /// implement [`Dataset`] and call [`Self::train_dataset`].
+    pub fn train_iter<'a, I>(&mut self, batches: I) -> Vec<f32>
+    where
+        I: IntoIterator<Item = Matrix<'a>>,
+        I::IntoIter: Clone,
+    {
+        let mut dataset = IterDataset::new(batches.into_iter());
+        self.train_dataset(&mut dataset)
+    }
+
+    /// Train from any restartable [`Dataset`].
+    ///
+    /// [`Dataset::for_each_batch`] is invoked once to reservoir-sample initial
+    /// centroids (and count `n`), then once per Lloyd iteration. Each call
+    /// must yield the same matrices in the same order.
+    pub fn train_dataset<D: Dataset + ?Sized>(&mut self, data: &mut D) -> Vec<f32> {
+        assert!(!self.trained, "The clustering has already been trained");
+        let rotate = !self.config.data_already_rotated;
+        let (n, sampled) = self.reservoir_sample(data);
+        self.prepare_train_state(n);
+        self.install_sampled_centroids(&sampled, rotate);
+        self.rotate_or_copy_into_prev_centroids(rotate);
+        self.run_dataset_loop(data, rotate);
+        self.finish_train()
+    }
+
+    fn prepare_train_state(&mut self, n: usize) {
+        assert!(n > 0, "n must be positive");
+        assert!(
+            n >= self.n_clusters,
+            "n must be >= n_clusters ({} < {})",
+            n,
+            self.n_clusters
+        );
+        self.iteration_stats.clear();
+        self.n_samples = n;
+
+        let d = self.d;
+        let n_clusters = self.n_clusters;
+        self.horizontal_centroids = vec![0.0_f32; n_clusters * d];
+        self.prev_centroids = vec![0.0_f32; n_clusters * d];
+        self.cluster_sizes = vec![0_u32; n_clusters];
+        self.assignments = vec![0_u32; n];
+        self.distances = vec![0.0_f32; n];
+        // Per-batch norms are computed on the fly; this field stays empty on
+        // the streaming path. Hierarchical training still fills it for
+        // [`Self::run_core_loop`].
+        self.data_norms.clear();
+        self.centroid_norms = vec![0.0_f32; n_clusters];
+
+        if self.config.verbose {
+            println!("Front dimensions (d') = {}", self.initial_partial_d());
+            println!("Trailing dimensions (d'') = {}", d - self.vertical_d);
+        }
+    }
+
+    fn finish_train(&mut self) -> Vec<f32> {
         self.trained = true;
         self.get_output_centroids(self.config.unrotate_centroids)
+    }
+
+    /// One streaming pass: count `n` and reservoir-sample `k` raw (unrotated)
+    /// vectors. Algorithm R, seeded from [`SuperKMeansConfig::seed`].
+    fn reservoir_sample<D: Dataset + ?Sized>(&self, data: &mut D) -> (usize, Vec<f32>) {
+        let d = self.d;
+        let k = self.n_clusters;
+        let mut reservoir = vec![0.0_f32; k * d];
+        let mut n = 0usize;
+        let mut rng = ChaCha8Rng::seed_from_u64(self.config.seed);
+
+        data.for_each_batch(&mut |matrix| {
+            assert_eq!(
+                matrix.d(),
+                d,
+                "matrix dimensionality {} does not match the model ({d})",
+                matrix.d()
+            );
+            for row in matrix.rows() {
+                if n < k {
+                    reservoir[n * d..(n + 1) * d].copy_from_slice(row);
+                } else {
+                    let j = rng.gen_range(0..=n);
+                    if j < k {
+                        reservoir[j * d..(j + 1) * d].copy_from_slice(row);
+                    }
+                }
+                n += 1;
+            }
+        });
+        (n, reservoir)
+    }
+
+    fn install_sampled_centroids(&mut self, sampled: &[f32], rotate: bool) {
+        let d = self.d;
+        let n_clusters = self.n_clusters;
+        self.horizontal_centroids[..n_clusters * d].copy_from_slice(&sampled[..n_clusters * d]);
+        if rotate {
+            let mut rotated = vec![0.0_f32; n_clusters * d];
+            self.pruner
+                .rotate(&self.horizontal_centroids, &mut rotated, n_clusters);
+            self.horizontal_centroids[..n_clusters * d].copy_from_slice(&rotated);
+        }
+    }
+
+    /// Lloyd iterations over a restartable [`Dataset`].
+    ///
+    /// Each pass packs incoming matrices into [`crate::common::X_BATCH_SIZE`] work batches,
+    /// rotates that scratch (when needed), assigns with the existing GEMM /
+    /// pruning kernels, and accumulates centroid sums. Per-sample assignments
+    /// are retained (4 bytes / vector) so the next iteration can seed pruning;
+    /// the vector buffer itself is not.
+    fn run_dataset_loop<D: Dataset + ?Sized>(&mut self, data: &mut D, rotate_data: bool) {
+        let d = self.d;
+        let n_clusters = self.n_clusters;
+        let iters = self.config.iters;
+
+        self.partial_d = self.initial_partial_d();
+
+        let always_gemm_only = d < DIMENSION_THRESHOLD_FOR_PRUNING
+            || self.config.use_blas_only
+            || n_clusters <= N_CLUSTERS_THRESHOLD_FOR_PRUNING;
+        let mut best_recall = 0.0_f32;
+        let mut iters_without_improvement: usize = 0;
+
+        let mut rotate_scratch = Vec::new();
+        let mut not_pruned_counts = Vec::new();
+        let mut coalesce_buf = Vec::new();
+
+        for iter_idx in 0..iters {
+            let use_gemm_only = (iter_idx == 0) || always_gemm_only;
+            self.run_dataset_iteration(
+                data,
+                iter_idx,
+                iter_idx == 0,
+                use_gemm_only,
+                rotate_data,
+                &mut rotate_scratch,
+                &mut not_pruned_counts,
+                &mut coalesce_buf,
+            );
+
+            if self.config.early_termination
+                && self.should_stop_early(
+                    false,
+                    &mut best_recall,
+                    &mut iters_without_improvement,
+                    iter_idx,
+                )
+            {
+                break;
+            }
+        }
+    }
+
+    fn run_dataset_iteration<D: Dataset + ?Sized>(
+        &mut self,
+        data: &mut D,
+        iter_idx: u32,
+        is_first_iter: bool,
+        gemm_only: bool,
+        rotate_data: bool,
+        rotate_scratch: &mut Vec<f32>,
+        not_pruned_counts: &mut Vec<usize>,
+        coalesce_buf: &mut Vec<f32>,
+    ) {
+        let d = self.d;
+        let n_clusters = self.n_clusters;
+        let n_samples = self.n_samples;
+
+        if !is_first_iter {
+            std::mem::swap(&mut self.horizontal_centroids, &mut self.prev_centroids);
+        }
+
+        self.horizontal_centroids[..n_clusters * d].fill(0.0);
+        self.cluster_sizes[..n_clusters].fill(0);
+
+        if gemm_only {
+            self.centroid_norms = squared_norms(&self.prev_centroids, n_clusters, d);
+        } else {
+            self.centroid_norms =
+                squared_norms_partial(&self.prev_centroids, n_clusters, d, self.partial_d as usize);
+        }
+
+        let mut offset = 0usize;
+        let mut not_pruned_sum = 0.0_f64;
+
+        {
+            let prev_centroids = &self.prev_centroids;
+            let centroid_norms = &self.centroid_norms;
+            let pruner = Arc::clone(&self.pruner);
+            let vertical_d = self.vertical_d;
+            let horizontal_d = self.horizontal_d;
+            let partial_d = self.partial_d as usize;
+            let assignments = &mut self.assignments;
+            let distances = &mut self.distances;
+            let gemm_buf = &mut self.gemm_buf;
+            let horizontal_centroids = &mut self.horizontal_centroids;
+            let cluster_sizes = &mut self.cluster_sizes;
+
+            dataset::visit_work_batches(data, d, X_BATCH_SIZE, coalesce_buf, |batch| {
+                let n = batch.n();
+                assert!(
+                    offset + n <= n_samples,
+                    "dataset produced more rows on a later pass ({}) than the init pass ({n_samples})",
+                    offset + n
+                );
+
+                let work: &[f32] = if rotate_data {
+                    rotate_scratch.resize(n * d, 0.0);
+                    pruner.rotate(batch.as_slice(), rotate_scratch, n);
+                    rotate_scratch.as_slice()
+                } else {
+                    batch.as_slice()
+                };
+
+                let norms = if gemm_only {
+                    squared_norms(work, n, d)
+                } else {
+                    squared_norms_partial(work, n, d, partial_d)
+                };
+
+                let assign = &mut assignments[offset..offset + n];
+                let dist = &mut distances[offset..offset + n];
+
+                if gemm_only {
+                    batch::find_nearest_neighbor(
+                        work,
+                        prev_centroids,
+                        n,
+                        n_clusters,
+                        d,
+                        &norms,
+                        centroid_norms,
+                        assign,
+                        dist,
+                        gemm_buf,
+                    );
+                } else {
+                    not_pruned_counts.clear();
+                    not_pruned_counts.resize(n, 0);
+                    batch::find_nearest_neighbor_with_pruning(
+                        work,
+                        prev_centroids,
+                        n,
+                        n_clusters,
+                        d,
+                        vertical_d,
+                        horizontal_d,
+                        &norms,
+                        centroid_norms,
+                        assign,
+                        dist,
+                        &pruner,
+                        partial_d,
+                        not_pruned_counts,
+                        gemm_buf,
+                    );
+                    not_pruned_sum += not_pruned_counts.iter().map(|&v| v as f64).sum::<f64>();
+                }
+
+                accumulate_rows_by_assignment(work, assign, horizontal_centroids, cluster_sizes, d);
+                offset += n;
+            });
+        }
+
+        assert_eq!(
+            offset, n_samples,
+            "dataset length changed between passes ({offset} != {n_samples})"
+        );
+
+        let mut avg_not_pruned_pct = -1.0_f32;
+        let old_partial_d = self.partial_d;
+        if !gemm_only {
+            avg_not_pruned_pct = self.apply_partial_d_from_avg(
+                (not_pruned_sum / (n_samples as f64 * n_clusters as f64)) as f32,
+            );
+        }
+
+        self.consolidate_centroids(n_samples, n_clusters);
+        self.compute_cost();
+        self.shift = centroid_shift(
+            &self.horizontal_centroids,
+            &self.prev_centroids,
+            n_clusters,
+            d,
+        );
+
+        self.push_iteration_stats(iter_idx, gemm_only, avg_not_pruned_pct, old_partial_d);
+    }
+
+    fn apply_partial_d_from_avg(&mut self, avg: f32) -> f32 {
+        if avg > self.config.max_not_pruned_pct {
+            let increase = ((self.partial_d as f32)
+                * self.config.adjustment_factor_for_partial_d
+                * 2.0) as u32;
+            self.partial_d = (self.partial_d + increase.max(1)).min(self.vertical_d as u32);
+        } else if avg < self.config.min_not_pruned_pct {
+            let decrease =
+                ((self.partial_d as f32) * self.config.adjustment_factor_for_partial_d) as u32;
+            self.partial_d = (self.partial_d.saturating_sub(decrease.max(1))).max(MIN_PARTIAL_D);
+        }
+        avg
+    }
+
+    fn push_iteration_stats(
+        &mut self,
+        iter_idx: u32,
+        gemm_only: bool,
+        avg_not_pruned_pct: f32,
+        old_partial_d: u32,
+    ) {
+        let stats = SuperKMeansIterationStats {
+            iteration: (iter_idx + 1) as usize,
+            objective: self.cost,
+            shift: self.shift,
+            split: self.n_split,
+            recall: self.recall,
+            not_pruned_pct: if gemm_only { -1.0 } else { avg_not_pruned_pct },
+            partial_d: if gemm_only { 0 } else { old_partial_d },
+            is_gemm_only: gemm_only,
+        };
+        if self.config.verbose {
+            let improvement = if iter_idx > 0 {
+                1.0 - (self.cost / self.prev_cost.max(f32::EPSILON))
+            } else {
+                0.0
+            };
+            print!(
+                "Iteration {}/{} | Objective: {:.4} | Objective improvement: {:.4} | Shift: {:.4} | Split: {}",
+                iter_idx + 1,
+                self.config.iters,
+                self.cost,
+                improvement,
+                self.shift,
+                self.n_split
+            );
+            if gemm_only {
+                println!(" [BLAS-only]");
+            } else {
+                println!(
+                    " | Not Pruned %: {:.4} | d': {} -> {}",
+                    avg_not_pruned_pct * 100.0,
+                    old_partial_d,
+                    self.partial_d
+                );
+            }
+        }
+        self.iteration_stats.push(stats);
     }
 
     /// The Lloyd driver: alternate assignment and centroid update for `iters`
@@ -573,43 +900,7 @@ impl SuperKMeans {
             d,
         );
 
-        let stats = SuperKMeansIterationStats {
-            iteration: (iter_idx + 1) as usize,
-            objective: self.cost,
-            shift: self.shift,
-            split: self.n_split,
-            recall: self.recall,
-            not_pruned_pct: if gemm_only { -1.0 } else { avg_not_pruned_pct },
-            partial_d: if gemm_only { 0 } else { old_partial_d },
-            is_gemm_only: gemm_only,
-        };
-        if self.config.verbose {
-            let improvement = if iter_idx > 0 {
-                1.0 - (self.cost / self.prev_cost.max(f32::EPSILON))
-            } else {
-                0.0
-            };
-            print!(
-                "Iteration {}/{} | Objective: {:.4} | Objective improvement: {:.4} | Shift: {:.4} | Split: {}",
-                iter_idx + 1,
-                self.config.iters,
-                self.cost,
-                improvement,
-                self.shift,
-                self.n_split
-            );
-            if gemm_only {
-                println!(" [BLAS-only]");
-            } else {
-                println!(
-                    " | Not Pruned %: {:.4} | d': {} -> {}",
-                    avg_not_pruned_pct * 100.0,
-                    old_partial_d,
-                    self.partial_d
-                );
-            }
-        }
-        self.iteration_stats.push(stats);
+        self.push_iteration_stats(iter_idx, gemm_only, avg_not_pruned_pct, old_partial_d);
     }
 
     /// Turn the sums left by [`sum_rows_by_assignment`] into usable centroids:
@@ -738,18 +1029,8 @@ impl SuperKMeans {
             .take(n_samples)
             .map(|&v| v as f64)
             .sum();
-        let avg = (sum / (n_samples as f64 * n_y as f64)) as f32;
         let old_partial_d = self.partial_d;
-        if avg > self.config.max_not_pruned_pct {
-            let increase = ((self.partial_d as f32)
-                * self.config.adjustment_factor_for_partial_d
-                * 2.0) as u32;
-            self.partial_d = (self.partial_d + increase.max(1)).min(self.vertical_d as u32);
-        } else if avg < self.config.min_not_pruned_pct {
-            let decrease =
-                ((self.partial_d as f32) * self.config.adjustment_factor_for_partial_d) as u32;
-            self.partial_d = (self.partial_d.saturating_sub(decrease.max(1))).max(MIN_PARTIAL_D);
-        }
+        let avg = self.apply_partial_d_from_avg((sum / (n_samples as f64 * n_y as f64)) as f32);
         (avg, old_partial_d != self.partial_d)
     }
 
@@ -823,29 +1104,6 @@ impl SuperKMeans {
                 .rotate(&self.horizontal_centroids, &mut rotated, n_clusters);
             self.horizontal_centroids[..n_clusters * d].copy_from_slice(&rotated);
         }
-    }
-
-    /// Copy the `n` rows to cluster into an owned buffer, rotating into the
-    /// pruning domain on the way when `rotate` is set.
-    fn rotate_vectors(&self, data: &[f32], n: usize, rotate: bool) -> Vec<f32> {
-        let len = n * self.d;
-        if rotate {
-            let mut rotated = vec![0.0_f32; len];
-            self.pruner.rotate(&data[..len], &mut rotated, n);
-            rotated
-        } else {
-            data[..len].to_vec()
-        }
-    }
-
-    /// Owned variant: rotates `data` in place instead of allocating a second
-    /// full-size buffer.
-    fn rotate_vectors_owned(&self, mut data: Vec<f32>, n: usize, rotate: bool) -> Vec<f32> {
-        data.truncate(n * self.d);
-        if rotate {
-            self.pruner.rotate_in_place(&mut data, n);
-        }
-        data
     }
 
     /// Copy horizontal_centroids -> prev_centroids, applying rotation if needed.
