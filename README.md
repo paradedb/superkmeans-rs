@@ -123,8 +123,8 @@ assert_eq!(assignments.len(), n);
 
 `train_iter` requires a [`Clone`] iterator. A source that cannot be cloned
 (for example a file re-read each pass) implements [`Dataset`] and calls
-`train_dataset`. Hierarchical clustering still splits by reordering rows in
-place, so it needs the training set in memory (`train` / `train_owned`).
+`train_dataset`. Hierarchical clustering cannot use that path: it partitions
+by reordering rows in place so each child is a contiguous block (see below).
 
 ### Hierarchical clustering
 
@@ -144,7 +144,13 @@ rebalances its own undersized clusters.
 
 Splits reorder the training set in place rather than copying each child out.
 With `train_owned` peak memory is one copy of the training set; `train` must
-duplicate the caller's slice before rotating it.
+duplicate the caller's slice before rotating it. That in-place permute is why
+`HierarchicalSuperKMeans` has no `train_iter` / `train_dataset`: child splits
+are slices of the permuted buffer (`data_offset` / `size` on each tree node),
+not filtered replays of the original stream. The local k-means run at a node
+could stream if those members were already a restartable `Matrix` source, but
+building the tree still needs random-access partition, so the full set stays
+in RAM.
 
 ```rust
 use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, make_blobs};
