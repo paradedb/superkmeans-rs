@@ -123,7 +123,8 @@ assert_eq!(assignments.len(), n);
 
 `train_iter` requires a [`Clone`] iterator. A source that cannot be cloned
 (for example a file re-read each pass) implements [`Dataset`] and calls
-`train_dataset`. Hierarchical clustering is not on that path yet (see below).
+`train_dataset`. These entry points retain assignments and distances for all rows.
+Use `train_spillable` below to bound that state as well.
 
 ### Hierarchical clustering
 
@@ -148,11 +149,8 @@ duplicate the caller's slice before rotating it. That permute is why
 splits are slices of the permuted buffer (`data_offset` / `size`), not
 filtered replays of the original stream.
 
-A streaming hierarchical builder is a follow-on (not in this crate yet): meso
-root via the existing `Matrix` / `Dataset` path, then each further split from
-a restartable iterator of that cluster’s member `Matrix` batches. The in-place
-permute and `data_offset` would go away; assignments, centroids, and the tree
-would stay in RAM.
+The separate `train_spillable` entry point uses temporary partitions instead of
+permuting a resident dataset. The existing in-memory entry points remain available.
 
 ```rust
 use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, make_blobs};
@@ -171,6 +169,50 @@ let centroids = kmeans.train(&data, n);
 let assignments = kmeans.assign(&data, &centroids, n);
 assert_eq!(centroids.len(), kmeans.tree.n_leaves * d);
 ```
+
+### Spillable training
+
+Both `SuperKMeans` and `HierarchicalSuperKMeans` accept a batch source, a
+temporary-storage provider, and a workspace budget:
+
+```rust,no_run
+use superkmeans::{FileTempStorage, HierarchicalSuperKMeans, Matrix, SpillOptions};
+
+let mut storage = FileTempStorage;
+let mut model = HierarchicalSuperKMeans::new(d);
+let centroids = model.train_spillable(
+    &mut Matrix::new(&data, n, d),
+    &mut storage,
+    SpillOptions { memory_budget: 64 * 1024 * 1024 },
+)?;
+```
+
+The source is consumed once into temporary storage. For a source that is not
+already in RAM, implement `TryDataset` to yield borrowed batches and propagate
+I/O errors. Existing `Dataset` implementations also work. `TempMatrix` provides
+a file-backed source with append and row replacement for reservoir sampling.
+
+Vectors and assignment history live in temporary files; distances, norms,
+centroid sums and GEMM scratch use bounded work buffers. Hierarchical training
+processes one split at a time and uses at most three internal files, with
+partitions represented by ranges in shared files. Files are reclaimed on drop,
+including on errors. `TempStorage` only creates seekable files; a custom file's
+`Drop` implements cleanup. It has no `Send` or `Sync` requirement, so a PostgreSQL
+caller can supply `BufFile` wrappers while keeping I/O on its backend thread.
+
+The workspace budget includes active local centroid buffers and the provider's
+declared per-file buffering. Caller-owned input, the shared `O(d²)` rotation,
+retained model/tree, and iteration statistics are additional memory. A fixed
+`max_leaf_size` still produces more model centroids as the training set grows.
+A budget that cannot hold one batch and the local centroids returns an error.
+Row counts above `u32::MAX` are rejected because cluster counts use `u32`.
+
+Spillable training does not retain per-row assignments on the model. Use
+`assign` on bounded input batches when assignments are needed afterwards.
+Initialization uses reservoir sampling, so results need not match the
+in-memory path's shuffled initialization. Within a fixed configuration and
+workspace budget, changing source batch boundaries preserves the work batches.
+Tree `data_offset` values describe logical split order, not physical file offsets.
 
 ## BLAS backends
 

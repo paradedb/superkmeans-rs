@@ -36,6 +36,7 @@ pub mod hierarchical;
 pub mod layout;
 pub mod matrix;
 pub mod pdxearch;
+pub mod spill;
 pub mod superkmeans;
 pub mod utils;
 
@@ -46,6 +47,7 @@ pub use hierarchical::{
     HierarchicalSuperKMeansIterationStats, NodeId, TreeNode,
 };
 pub use matrix::{Matrix, MatrixChunks};
+pub use spill::{FileTempStorage, SpillOptions, TempMatrix, TempStorage, TryDataset};
 pub use superkmeans::{
     ClusterBalanceStats, SuperKMeans, SuperKMeansConfig, SuperKMeansIterationStats,
 };

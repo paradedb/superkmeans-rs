@@ -19,6 +19,8 @@ use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::Arc;
 
+mod spillable;
+
 use crate::adsampling::ADSamplingPruner;
 use crate::common::HIERARCHICAL_PRUNER_INITIAL_THRESHOLD;
 use crate::superkmeans::{SuperKMeans, SuperKMeansConfig, SuperKMeansIterationStats};
@@ -365,6 +367,11 @@ impl HierarchicalSuperKMeans {
 
         self.build_tree(&mut data_to_cluster, &mut norms, &mut scratch);
 
+        self.finish_tree(n_samples)
+    }
+
+    fn finish_tree(&mut self, n_samples: usize) -> Vec<f32> {
+        let d = self.base.d;
         let n_leaves = self.tree.n_leaves;
         assert!(n_leaves > 0, "tree produced no leaves");
 
