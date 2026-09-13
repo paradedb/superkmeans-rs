@@ -77,6 +77,7 @@ impl SuperKMeans {
             .copy_from_slice(&self.horizontal_centroids);
 
         let mut labels = storage.create()?;
+        let mut gemm_buf = Vec::new();
         let mut assignments = vec![0_u32; n.min(batch_rows)];
         let mut distances = vec![0.0_f32; assignments.len()];
         let mut not_pruned_counts = vec![0_usize; assignments.len()];
@@ -126,7 +127,7 @@ impl SuperKMeans {
                         &self.centroid_norms,
                         assign,
                         dist,
-                        &mut self.gemm_buf,
+                        &mut gemm_buf,
                     );
                 } else {
                     not_pruned_counts[..rows].fill(0);
@@ -145,7 +146,7 @@ impl SuperKMeans {
                         &self.pruner,
                         self.partial_d as usize,
                         &mut not_pruned_counts[..rows],
-                        &mut self.gemm_buf,
+                        &mut gemm_buf,
                     );
                     not_pruned_sum += not_pruned_counts[..rows]
                         .iter()
