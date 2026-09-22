@@ -361,7 +361,7 @@ fn train_owned_matches_train() {
 }
 
 /// The owned path rotates the caller's buffer in place rather than allocating a
-/// second copy, so it must still land on exactly the same tree.
+/// second copy, so it must still land on exactly the same centroids.
 #[test]
 fn hierarchical_train_owned_matches_train() {
     use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig};
@@ -372,7 +372,6 @@ fn hierarchical_train_owned_matches_train() {
 
     let mut cfg = HierarchicalSuperKMeansConfig {
         max_leaf_size: 50,
-        branching_factor: Some(8),
         ..Default::default()
     };
     cfg.base.seed = 42;
@@ -385,8 +384,8 @@ fn hierarchical_train_owned_matches_train() {
     let centroids_owned = owned.train_owned(data.clone(), n);
 
     assert_eq!(
-        borrowed.tree.n_leaves, owned.tree.n_leaves,
-        "owned path built a different tree"
+        borrowed.base.n_clusters, owned.base.n_clusters,
+        "owned path produced a different cluster count"
     );
     assert_centroids_match(&centroids_borrowed, &centroids_owned, 1e-4);
 }
