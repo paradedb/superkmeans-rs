@@ -62,6 +62,8 @@ def download(n: int, out: Path) -> None:
                 ds = load_dataset(
                     HF_DATASET,
                     "passages",
+                    # Pin the dataset contents to an immutable Hub commit.
+                    revision="e78737fe92ac1b783211b705c12207ca75fcc9b7",
                     split="train",
                     data_files={"train": [shard_path]},
                     streaming=False,
