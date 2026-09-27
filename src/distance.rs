@@ -13,9 +13,9 @@ const LANES: usize = 8;
 pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     let mut acc = [0.0_f32; LANES];
-    let mut ca = a.chunks_exact(LANES);
-    let mut cb = b.chunks_exact(LANES);
-    for (av, bv) in ca.by_ref().zip(cb.by_ref()) {
+    let (ca, ra) = a.as_chunks::<LANES>();
+    let (cb, rb) = b.as_chunks::<LANES>();
+    for (av, bv) in ca.iter().zip(cb) {
         // Independent accumulators — no cross-lane dependency, so this vectorizes.
         for l in 0..LANES {
             let d = av[l] - bv[l];
@@ -26,7 +26,7 @@ pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
     for l in 0..LANES {
         s += acc[l];
     }
-    for (x, y) in ca.remainder().iter().zip(cb.remainder()) {
+    for (x, y) in ra.iter().zip(rb) {
         let d = x - y;
         s += d * d;
     }
