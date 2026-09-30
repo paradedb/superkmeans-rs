@@ -9,6 +9,11 @@
 //! clusters (`use_aggressive_split`).
 //!
 //! Splits permute rows in place, so peak memory is one copy of the training set.
+//!
+//! Data that doesn't fit in memory trains in two steps: [`HierarchicalSuperKMeans::train_meso`]
+//! streams the meso split over a [`Dataset`], and
+//! [`HierarchicalSuperKMeans::train_meso_cluster`] splits one meso cluster at a
+//! time in memory.
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -17,6 +22,8 @@ use std::sync::Arc;
 
 use crate::adsampling::ADSamplingPruner;
 use crate::common::HIERARCHICAL_PRUNER_INITIAL_THRESHOLD;
+use crate::dataset::{Dataset, IterDataset};
+use crate::matrix::Matrix;
 use crate::superkmeans::{SuperKMeans, SuperKMeansConfig, SuperKMeansIterationStats};
 use crate::utils::squared_norms;
 
@@ -56,11 +63,61 @@ pub struct HierarchicalSuperKMeansIterationStats {
     pub local_runs: Vec<SuperKMeansIterationStats>,
 }
 
-/// One cluster still waiting to be split: a contiguous row range of the
-/// (permuted) training set.
-struct Pending {
-    offset: usize,
-    len: usize,
+/// Result of [`HierarchicalSuperKMeans::train_meso`]: the scanned rows grouped
+/// by meso cluster.
+#[derive(Clone, Debug)]
+pub struct MesoPartition {
+    /// `n_meso + 1` boundaries into [`Self::rows`]. Every meso cluster is
+    /// non-empty.
+    pub offsets: Vec<usize>,
+    /// 0-based scan positions grouped by meso cluster, ascending within each.
+    pub rows: Vec<u32>,
+    /// Per-iteration statistics of the streaming meso run.
+    pub stats: Vec<SuperKMeansIterationStats>,
+}
+
+impl MesoPartition {
+    pub fn n_meso(&self) -> usize {
+        self.offsets.len() - 1
+    }
+
+    /// Scan positions of meso cluster `m`, ascending.
+    pub fn meso_rows(&self, m: usize) -> &[u32] {
+        &self.rows[self.offsets[m]..self.offsets[m + 1]]
+    }
+}
+
+/// Result of [`HierarchicalSuperKMeans::train_meso_cluster`]: the fine
+/// clusters of one meso cluster.
+#[derive(Clone, Debug)]
+pub struct FineClusters {
+    /// Row-major fine centroids, `n_fine × d`; unrotated when
+    /// `unrotate_centroids` is set, as for [`HierarchicalSuperKMeans::train`].
+    pub centroids: Vec<f32>,
+    /// `n_fine + 1` boundaries into [`Self::order`].
+    pub offsets: Vec<usize>,
+    /// Positions `0..n` of the input rows, grouped by fine cluster.
+    pub order: Vec<u32>,
+    /// Per-iteration statistics of every local k-means run.
+    pub stats: Vec<SuperKMeansIterationStats>,
+}
+
+impl FineClusters {
+    pub fn n_fine(&self) -> usize {
+        self.offsets.len() - 1
+    }
+
+    /// Input positions assigned to fine cluster `c`.
+    pub fn members(&self, c: usize) -> &[u32] {
+        &self.order[self.offsets[c]..self.offsets[c + 1]]
+    }
+}
+
+/// A cluster produced by one split: a contiguous row range of the (permuted)
+/// training set and its centroid.
+struct Child {
+    range: Range<usize>,
+    centroid: Vec<f32>,
 }
 
 /// Hierarchical k-means: a \(\lceil\sqrt{K}\rceil\) meso split, then repeated
@@ -154,6 +211,7 @@ impl HierarchicalSuperKMeans {
 
     fn train_impl(&mut self, data: Cow<'_, [f32]>, n: usize) -> Vec<f32> {
         assert!(n > 0, "n must be positive");
+        assert!(u32::try_from(n).is_ok(), "n must fit in u32");
         assert!(!self.base.trained, "already trained");
 
         let d = self.base.d;
@@ -183,8 +241,16 @@ impl HierarchicalSuperKMeans {
         };
 
         let mut norms = squared_norms(&data_to_cluster, n, d);
+        let mut ids: Vec<u32> = (0..n as u32).collect();
+        let mut rows = Subset {
+            data: &mut data_to_cluster,
+            norms: &mut norms,
+            ids: &mut ids,
+        };
         let mut scratch = PartitionScratch::new(n, d);
-        let (centroids, sizes) = self.cluster(&mut data_to_cluster, &mut norms, &mut scratch);
+        let mut local_runs = Vec::new();
+        let (centroids, sizes) = self.cluster(&mut rows, &mut scratch, &mut local_runs);
+        self.iteration_stats.local_runs = local_runs;
 
         let n_clusters = sizes.len();
         assert!(n_clusters > 0, "clustering produced no clusters");
@@ -215,114 +281,265 @@ impl HierarchicalSuperKMeans {
         self.base.assign(vectors, centroids, n_vectors)
     }
 
-    /// Meso split, then re-cluster every group that is still over `max_leaf_size`.
+    /// Streaming meso step: cluster the `n` rows `data` scans into
+    /// \(\lceil\sqrt{K}\rceil\) meso clusters without holding them in memory,
+    /// and group their scan positions by meso cluster.
     ///
-    /// Returns the fine centroids (rotated) and one size per cluster. Sizes sum
-    /// to the sample length, and each size is at most `max_leaf_size`.
-    fn cluster(
-        &mut self,
-        data: &mut [f32],
-        norms: &mut [f32],
-        scratch: &mut PartitionScratch,
-    ) -> (Vec<f32>, Vec<u32>) {
-        let d = self.base.d;
-        let n = norms.len();
-        assert!(n > 0, "cluster requires a non-empty sample");
-        debug_assert_eq!(data.len(), n * d);
-
-        let mut centroids = Vec::new();
-        let mut sizes = Vec::new();
+    /// Takes one pass to pick the starting centroids and one per meso
+    /// iteration ([`HierarchicalSuperKMeansConfig::iters_meso`]); none when
+    /// all `n` rows fit in one leaf. Feed each meso cluster's rows to
+    /// [`Self::train_meso_cluster`] to finish the clustering.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error [`Dataset::for_each_batch`] fails with.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n` is zero or exceeds `u32::MAX`, or if a pass yields other
+    /// than `n` rows.
+    pub fn train_meso<D: Dataset + ?Sized>(
+        &self,
+        data: &mut D,
+        n: usize,
+    ) -> Result<MesoPartition, D::Error> {
+        assert!(n > 0, "n must be positive");
+        assert!(u32::try_from(n).is_ok(), "n must fit in u32");
 
         let k_meso = self.meso_clusters(n);
         if k_meso < 2 {
-            centroids.extend(mean_rows(data, n, d));
-            sizes.push(n as u32);
-            return (centroids, sizes);
+            return Ok(MesoPartition {
+                offsets: vec![0, n],
+                rows: (0..n as u32).collect(),
+                stats: Vec::new(),
+            });
         }
 
-        let mut queue = VecDeque::new();
-        self.split_range(
-            data,
-            norms,
-            0..n,
+        let mut skm = self.new_superkmeans_from_config(
             k_meso,
-            self.config.iters_meso,
-            scratch,
-            &mut queue,
+            LocalSkmMode::Meso {
+                iters: self.config.iters_meso,
+            },
+        );
+        skm.train_dataset(data)?;
+        assert_eq!(
+            skm.n_samples, n,
+            "dataset yielded {} rows, expected {n}",
+            skm.n_samples
+        );
+
+        let (mut offsets, rows) = group_by_assignment(&skm.assignments, k_meso);
+        // The clustering collapsed onto one cluster; bisect so no meso
+        // cluster has to hold every row.
+        if offsets.len() < 3 {
+            offsets = vec![0, n / 2, n];
+        }
+        Ok(MesoPartition {
+            offsets,
+            rows,
+            stats: skm.iteration_stats,
+        })
+    }
+
+    /// [`Self::train_meso`] over a replayable iterator of [`Matrix`] batches.
+    /// `clone()` on the iterator must yield the same batches again.
+    pub fn train_meso_iter<'a, I>(&self, batches: I, n: usize) -> MesoPartition
+    where
+        I: IntoIterator<Item = Matrix<'a>>,
+        I::IntoIter: Clone,
+    {
+        let mut dataset = IterDataset::new(batches.into_iter());
+        match self.train_meso(&mut dataset, n) {
+            Ok(partition) => partition,
+            Err(never) => match never {},
+        }
+    }
+
+    /// Fine step for one meso cluster: split its `n` row-major vectors until
+    /// every cluster holds at most `max_leaf_size` of them.
+    ///
+    /// `data` is borrowed so the caller keeps the original vectors, e.g. to
+    /// write them out in [`FineClusters::order`]; the rotated working copy is
+    /// internal. Independent meso clusters can be trained in parallel.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n` is zero or exceeds `u32::MAX`, or `data` holds fewer than
+    /// `n` vectors.
+    pub fn train_meso_cluster(&self, data: &[f32], n: usize) -> FineClusters {
+        assert!(n > 0, "n must be positive");
+        assert!(u32::try_from(n).is_ok(), "n must fit in u32");
+        let d = self.base.d;
+        let len = n * d;
+        assert!(data.len() >= len, "data holds fewer than {n} vectors");
+
+        let base = &self.config.base;
+        let mut work = if base.data_already_rotated {
+            data[..len].to_vec()
+        } else {
+            let mut rotated = vec![0.0_f32; len];
+            self.pruner.rotate(&data[..len], &mut rotated, n);
+            rotated
+        };
+        let mut norms = squared_norms(&work, n, d);
+        let mut ids: Vec<u32> = (0..n as u32).collect();
+        let mut rows = Subset {
+            data: &mut work,
+            norms: &mut norms,
+            ids: &mut ids,
+        };
+        let meso = Child {
+            range: 0..n,
+            centroid: mean_rows(rows.data, n, d),
+        };
+
+        let mut scratch = PartitionScratch::new(n, d);
+        let mut stats = Vec::new();
+        let mut centroids = Vec::new();
+        let mut sizes = Vec::new();
+        self.split_to_leaves(
+            &mut rows,
+            meso,
+            &mut scratch,
+            &mut stats,
             &mut centroids,
             &mut sizes,
         );
 
-        while let Some(Pending { offset, len }) = queue.pop_front() {
-            let k = self.fine_clusters(len);
-            if k < 2 {
-                let start = offset * d;
-                centroids.extend(mean_rows(&data[start..start + len * d], len, d));
-                sizes.push(len as u32);
-                continue;
-            }
-            self.split_range(
-                data,
-                norms,
-                offset..offset + len,
-                k,
-                self.config.iters_fine,
-                scratch,
-                &mut queue,
-                &mut centroids,
-                &mut sizes,
-            );
+        let n_fine = sizes.len();
+        if base.unrotate_centroids && !base.data_already_rotated {
+            let mut out = vec![0.0_f32; centroids.len()];
+            self.pruner.unrotate(&centroids, &mut out, n_fine);
+            centroids = out;
         }
+        let mut offsets = Vec::with_capacity(n_fine + 1);
+        offsets.push(0);
+        for &size in &sizes {
+            offsets.push(offsets.last().unwrap() + size as usize);
+        }
+        FineClusters {
+            centroids,
+            offsets,
+            order: ids,
+            stats,
+        }
+    }
 
+    /// Meso split, then split each meso cluster down to leaves.
+    ///
+    /// Returns the fine centroids (rotated) and one size per cluster. Sizes sum
+    /// to the sample length, and each size is at most `max_leaf_size`. Fine
+    /// clusters come out grouped by meso cluster, and `rows` ends up in the
+    /// same order.
+    fn cluster(
+        &self,
+        rows: &mut Subset<'_>,
+        scratch: &mut PartitionScratch,
+        stats: &mut Vec<SuperKMeansIterationStats>,
+    ) -> (Vec<f32>, Vec<u32>) {
+        assert!(rows.len() > 0, "cluster requires a non-empty sample");
+        let mut centroids = Vec::new();
+        let mut sizes = Vec::new();
+        for meso in self.split_meso(rows, scratch, stats) {
+            self.split_to_leaves(rows, meso, scratch, stats, &mut centroids, &mut sizes);
+        }
         (centroids, sizes)
     }
 
-    /// Cluster `range` into `k` groups. Groups that fit under `max_leaf_size`
-    /// are emitted; the rest go back on `queue`.
-    fn split_range(
-        &mut self,
-        data: &mut [f32],
-        norms: &mut [f32],
+    /// The \(\lceil\sqrt{K}\rceil\) meso split of every row in `rows`.
+    ///
+    /// A sample that already fits in one leaf comes back as a single meso
+    /// cluster covering all of it.
+    fn split_meso(
+        &self,
+        rows: &mut Subset<'_>,
+        scratch: &mut PartitionScratch,
+        stats: &mut Vec<SuperKMeansIterationStats>,
+    ) -> Vec<Child> {
+        let n = rows.len();
+        let k_meso = self.meso_clusters(n);
+        if k_meso < 2 {
+            return vec![Child {
+                range: 0..n,
+                centroid: mean_rows(rows.data, n, self.base.d),
+            }];
+        }
+        self.split_node(rows, 0..n, k_meso, self.config.iters_meso, scratch, stats)
+    }
+
+    /// Split `meso` until every leaf holds at most `max_leaf_size` rows,
+    /// appending each leaf's centroid and size in row order, so the sizes'
+    /// running sum gives each leaf's row range.
+    fn split_to_leaves(
+        &self,
+        rows: &mut Subset<'_>,
+        meso: Child,
+        scratch: &mut PartitionScratch,
+        stats: &mut Vec<SuperKMeansIterationStats>,
+        centroids: &mut Vec<f32>,
+        sizes: &mut Vec<u32>,
+    ) {
+        let mut leaves = Vec::new();
+        let mut queue = VecDeque::from([meso]);
+        while let Some(node) = queue.pop_front() {
+            let k = self.fine_clusters(node.range.len());
+            if k < 2 {
+                leaves.push(node);
+                continue;
+            }
+            queue.extend(self.split_node(
+                rows,
+                node.range,
+                k,
+                self.config.iters_fine,
+                scratch,
+                stats,
+            ));
+        }
+
+        // The queue finishes small children before their larger siblings'
+        // descendants, so leaves come off it out of row order.
+        leaves.sort_unstable_by_key(|leaf| leaf.range.start);
+        for leaf in leaves {
+            sizes.push(leaf.range.len() as u32);
+            centroids.extend(leaf.centroid);
+        }
+    }
+
+    /// Cluster `range` into `k` groups and permute its rows so each group is
+    /// contiguous. Returns the non-empty groups.
+    fn split_node(
+        &self,
+        rows: &mut Subset<'_>,
         range: Range<usize>,
         k: usize,
         iters: u32,
         scratch: &mut PartitionScratch,
-        queue: &mut VecDeque<Pending>,
-        centroids: &mut Vec<f32>,
-        sizes: &mut Vec<u32>,
-    ) {
+        stats: &mut Vec<SuperKMeansIterationStats>,
+    ) -> Vec<Child> {
         let d = self.base.d;
-        let (split_centroids, assignments) = self.local_kmeans(
-            &data[range.start * d..range.end * d],
-            &norms[range.start..range.end],
-            k,
-            iters,
-        );
-        let (offsets, repaired) =
-            self.partition_and_repair(data, norms, range.clone(), &assignments, k, scratch);
+        let mut node = rows.slice(range.clone());
+        let (split_centroids, assignments) =
+            self.local_kmeans(node.data, node.norms, k, iters, stats);
+        let (offsets, repaired) = partition_and_repair(&mut node, &assignments, k, scratch);
 
-        for (cluster, bounds) in offsets.windows(2).enumerate() {
-            let (start, end) = (bounds[0], bounds[1]);
-            if start == end {
-                continue;
-            }
-            let child_offset = range.start + start;
-            let child_len = end - start;
-            if child_len > self.config.max_leaf_size {
-                queue.push_back(Pending {
-                    offset: child_offset,
-                    len: child_len,
-                });
-                continue;
-            }
-            if repaired {
-                let start = child_offset * d;
-                centroids.extend(mean_rows(&data[start..start + child_len * d], child_len, d));
-            } else {
-                centroids.extend_from_slice(&split_centroids[cluster * d..(cluster + 1) * d]);
-            }
-            sizes.push(child_len as u32);
-        }
+        offsets
+            .windows(2)
+            .enumerate()
+            .filter(|(_, bounds)| bounds[1] > bounds[0])
+            .map(|(cluster, bounds)| {
+                let (start, end) = (bounds[0], bounds[1]);
+                let centroid = if repaired {
+                    mean_rows(&node.data[start * d..end * d], end - start, d)
+                } else {
+                    split_centroids[cluster * d..(cluster + 1) * d].to_vec()
+                };
+                Child {
+                    range: range.start + start..range.start + end,
+                    centroid,
+                }
+            })
+            .collect()
     }
 
     /// How many meso clusters a sample of `n` points should start with.
@@ -347,36 +564,6 @@ impl HierarchicalSuperKMeans {
         if k < 2 { 0 } else { k }
     }
 
-    /// Partition `range` by `assignments`. If the clustering collapsed to fewer
-    /// than two non-empty groups, bisect instead and report `repaired = true`.
-    fn partition_and_repair(
-        &self,
-        data: &mut [f32],
-        norms: &mut [f32],
-        range: Range<usize>,
-        assignments: &[u32],
-        k: usize,
-        scratch: &mut PartitionScratch,
-    ) -> (Vec<usize>, bool) {
-        let n_sub = range.end - range.start;
-        let d = self.base.d;
-        let mut offsets = {
-            let mut subset = Subset {
-                data: &mut data[range.start * d..range.end * d],
-                norms: &mut norms[range.start..range.end],
-            };
-            subset.partition(assignments, k, scratch)
-        };
-
-        // The clustering collapsed onto one cluster; bisect so the
-        // max_leaf_size invariant stays reachable.
-        if offsets.windows(2).filter(|b| b[1] > b[0]).count() < 2 {
-            offsets = vec![0, (n_sub / 2).clamp(1, n_sub - 1), n_sub];
-            return (offsets, true);
-        }
-        (offsets, false)
-    }
-
     fn new_superkmeans_from_config(&self, n_clusters: usize, mode: LocalSkmMode) -> SuperKMeans {
         Self::new_superkmeans(
             n_clusters,
@@ -397,6 +584,7 @@ impl HierarchicalSuperKMeans {
         let mut cfg = base_config.clone();
         match mode {
             LocalSkmMode::Root => {}
+            LocalSkmMode::Meso { iters } => cfg.iters = iters,
             LocalSkmMode::Split { iters } => {
                 // Subsets are already in the rotated domain from the root pass.
                 cfg.data_already_rotated = true;
@@ -413,11 +601,12 @@ impl HierarchicalSuperKMeans {
     /// only reorder rows, so they stay valid. Each call runs a fresh
     /// [`SuperKMeans`] through [`SuperKMeans::run_core_loop`].
     fn local_kmeans(
-        &mut self,
+        &self,
         subset: &[f32],
         norms: &[f32],
         k: usize,
         iters: u32,
+        stats: &mut Vec<SuperKMeansIterationStats>,
     ) -> (Vec<f32>, Vec<u32>) {
         let d = self.base.d;
         let n = norms.len();
@@ -441,9 +630,7 @@ impl HierarchicalSuperKMeans {
 
         skm.run_core_loop(subset, iters);
 
-        self.iteration_stats
-            .local_runs
-            .append(&mut skm.iteration_stats);
+        stats.append(&mut skm.iteration_stats);
         (skm.horizontal_centroids, skm.assignments)
     }
 }
@@ -464,16 +651,65 @@ fn mean_rows(data: &[f32], n: usize, d: usize) -> Vec<f32> {
     centroid
 }
 
+/// Stable counting sort of the positions `0..assignments.len()` by cluster.
+///
+/// Returns the boundaries of the non-empty clusters and the grouped
+/// positions, ascending within each cluster.
+fn group_by_assignment(assignments: &[u32], k: usize) -> (Vec<usize>, Vec<u32>) {
+    let mut next = vec![0_usize; k];
+    for &c in assignments {
+        next[c as usize] += 1;
+    }
+    let mut offsets = vec![0_usize];
+    let mut total = 0;
+    for slot in &mut next {
+        let count = *slot;
+        *slot = total;
+        total += count;
+        if count > 0 {
+            offsets.push(total);
+        }
+    }
+    let mut rows = vec![0_u32; assignments.len()];
+    for (row, &c) in assignments.iter().enumerate() {
+        rows[next[c as usize]] = row as u32;
+        next[c as usize] += 1;
+    }
+    (offsets, rows)
+}
+
+/// Partition `rows` by `assignments`. If the clustering collapsed to fewer
+/// than two non-empty groups, bisect instead and report `repaired = true`.
+fn partition_and_repair(
+    rows: &mut Subset<'_>,
+    assignments: &[u32],
+    k: usize,
+    scratch: &mut PartitionScratch,
+) -> (Vec<usize>, bool) {
+    let n_sub = rows.len();
+    let offsets = rows.partition(assignments, k, scratch);
+
+    // The clustering collapsed onto one cluster; bisect so the
+    // max_leaf_size invariant stays reachable.
+    if offsets.windows(2).filter(|b| b[1] > b[0]).count() < 2 {
+        return (vec![0, (n_sub / 2).clamp(1, n_sub - 1), n_sub], true);
+    }
+    (offsets, false)
+}
+
 /// The contiguous block of training rows one split owns.
 ///
-/// `data` and `norms` are parallel — row `i` of `data` has norm `norms[i]` —
-/// and [`Subset::partition`] permutes them together so a split can hand each
+/// `data`, `norms` and `ids` are parallel — row `i` of `data` has norm
+/// `norms[i]` and started out as input row `ids[i]` — and
+/// [`Subset::partition`] permutes them together so a split can hand each
 /// child a contiguous sub-range.
 struct Subset<'a> {
     /// Row-major vectors, `n * d` floats.
     data: &'a mut [f32],
     /// Squared L2 norm of each row.
     norms: &'a mut [f32],
+    /// Input position of each row.
+    ids: &'a mut [u32],
 }
 
 impl Subset<'_> {
@@ -484,6 +720,16 @@ impl Subset<'_> {
 
     fn dim(&self) -> usize {
         self.data.len() / self.len()
+    }
+
+    /// The rows in `range`, reborrowed as their own subset.
+    fn slice(&mut self, range: Range<usize>) -> Subset<'_> {
+        let d = self.dim();
+        Subset {
+            data: &mut self.data[range.start * d..range.end * d],
+            norms: &mut self.norms[range.clone()],
+            ids: &mut self.ids[range],
+        }
     }
 
     /// Group rows by their entry in `assignments`, in place, returning the
@@ -533,6 +779,7 @@ impl Subset<'_> {
 
             held.copy_from_slice(&self.data[start * d..(start + 1) * d]);
             let mut held_norm = self.norms[start];
+            let mut held_id = self.ids[start];
             // Walk the cycle, leaving each row at its destination and picking up
             // whatever it displaced, until the chain closes back on `start`.
             let mut cur = start;
@@ -544,10 +791,12 @@ impl Subset<'_> {
                 visited[next] = true;
                 held.swap_with_slice(&mut self.data[next * d..(next + 1) * d]);
                 std::mem::swap(&mut held_norm, &mut self.norms[next]);
+                std::mem::swap(&mut held_id, &mut self.ids[next]);
                 cur = next;
             }
             self.data[start * d..(start + 1) * d].copy_from_slice(held);
             self.norms[start] = held_norm;
+            self.ids[start] = held_id;
         }
 
         offsets
@@ -583,6 +832,9 @@ impl PartitionScratch {
 enum LocalSkmMode {
     /// Placeholder / final model (respects the caller's rotation flags).
     Root,
+    /// Streaming meso run over the caller's scan, which is in the caller's
+    /// domain, so the rotation flags pass through.
+    Meso { iters: u32 },
     /// Per-split clustering over an already-rotated contiguous subset.
     Split { iters: u32 },
 }
@@ -791,10 +1043,12 @@ mod tests {
         let mut data: Vec<f32> = (0..n).flat_map(|i| [i as f32, i as f32]).collect();
         let mut norms: Vec<f32> = (0..n).map(|i| 2.0 * (i * i) as f32).collect();
         let assignments: Vec<u32> = vec![2, 0, 1, 2, 0, 1, 2, 0, 1];
+        let mut ids: Vec<u32> = (0..n as u32).collect();
 
         let mut subset = Subset {
             data: &mut data,
             norms: &mut norms,
+            ids: &mut ids,
         };
         let mut scratch = PartitionScratch::new(n, d);
         let offsets = subset.partition(&assignments, k, &mut scratch);
@@ -805,6 +1059,7 @@ mod tests {
         for (row, &src) in expected_src.iter().enumerate() {
             assert_eq!(data[row * d..(row + 1) * d], [src as f32, src as f32]);
             assert_eq!(norms[row], 2.0 * (src * src) as f32);
+            assert_eq!(ids[row] as usize, src);
         }
     }
 
@@ -824,10 +1079,12 @@ mod tests {
             .map(|i| (0..d).map(|j| value(i, j) * value(i, j)).sum())
             .collect();
         let assignments: Vec<u32> = (0..n).map(|i| ((i * 7) % k) as u32).collect();
+        let mut ids: Vec<u32> = (0..n as u32).collect();
 
         let mut subset = Subset {
             data: &mut data,
             norms: &mut norms,
+            ids: &mut ids,
         };
         let mut scratch = PartitionScratch::new(n, d);
         let offsets = subset.partition(&assignments, k, &mut scratch);
@@ -844,6 +1101,7 @@ mod tests {
             }
             let expected: f32 = (0..d).map(|j| value(src, j) * value(src, j)).sum();
             assert_eq!(norms[row], expected);
+            assert_eq!(ids[row] as usize, src);
 
             let c = assignments[src] as usize;
             assert!(
@@ -852,6 +1110,73 @@ mod tests {
             );
         }
         assert!(seen.iter().all(|&s| s), "the partition dropped rows");
+    }
+
+    /// Leaves come out in row order: the running sum of their sizes delimits
+    /// each leaf's rows, and those rows sit close to that leaf's centroid.
+    #[test]
+    fn leaves_are_emitted_in_row_order() {
+        let (n, d) = (3_000usize, 16usize);
+        let mut data = make_blobs(n, d, 12, true, 1.0, 5.0, 5);
+        let mut cfg = config(40);
+        cfg.base.data_already_rotated = true;
+        let kmeans = HierarchicalSuperKMeans::with_config(d, cfg);
+
+        let mut norms = squared_norms(&data, n, d);
+        let mut ids: Vec<u32> = (0..n as u32).collect();
+        let mut rows = Subset {
+            data: &mut data,
+            norms: &mut norms,
+            ids: &mut ids,
+        };
+        let mut scratch = PartitionScratch::new(n, d);
+        let (centroids, sizes) = kmeans.cluster(&mut rows, &mut scratch, &mut Vec::new());
+
+        let mut start = 0usize;
+        let mut total = 0.0f64;
+        for (leaf, &size) in sizes.iter().enumerate() {
+            let c = &centroids[leaf * d..(leaf + 1) * d];
+            for x in data[start * d..(start + size as usize) * d].chunks_exact(d) {
+                total += x.iter().zip(c).map(|(a, b)| (a - b) * (a - b)).sum::<f32>() as f64;
+            }
+            start += size as usize;
+        }
+        let distortion = total / n as f64;
+        assert!(
+            distortion < 0.5,
+            "rows are far from the centroid of the leaf they sit in: {distortion}"
+        );
+    }
+
+    /// Every split permutes `ids` with the rows, so after clustering each row
+    /// must still be the input row its id names, and the ids a permutation.
+    #[test]
+    fn cluster_keeps_ids_with_their_rows() {
+        let (n, d) = (3_000usize, 16usize);
+        let input = make_blobs(n, d, 12, true, 1.0, 5.0, 5);
+        let mut cfg = config(40);
+        cfg.base.data_already_rotated = true;
+        let kmeans = HierarchicalSuperKMeans::with_config(d, cfg);
+
+        let mut data = input.clone();
+        let mut norms = squared_norms(&data, n, d);
+        let mut ids: Vec<u32> = (0..n as u32).collect();
+        let mut rows = Subset {
+            data: &mut data,
+            norms: &mut norms,
+            ids: &mut ids,
+        };
+        let mut scratch = PartitionScratch::new(n, d);
+        let (_, sizes) = kmeans.cluster(&mut rows, &mut scratch, &mut Vec::new());
+
+        assert_eq!(sizes.iter().sum::<u32>() as usize, n);
+        let mut seen = vec![false; n];
+        for (row, &id) in ids.iter().enumerate() {
+            let id = id as usize;
+            assert!(!seen[id], "id {id} appears twice");
+            seen[id] = true;
+            assert_eq!(data[row * d..(row + 1) * d], input[id * d..(id + 1) * d]);
+        }
     }
 
     /// Building an `ADSamplingPruner` is an O(d³) Householder QR, so every
