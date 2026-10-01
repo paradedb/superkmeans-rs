@@ -20,8 +20,8 @@ use superkmeans::{
 
 const COHERE_N: usize = 1_000_000;
 const COHERE_D: usize = 1024;
-const TOP_K: usize = 100;
-const MAX_LEAF_SIZE: usize = 10;
+const TOP_K: usize = 10;
+const MAX_LEAF_SIZE: usize = 100;
 
 /// Read the first `rows` vectors of the Cohere dump, or `None` if it is absent.
 fn load_cohere(rows: usize) -> Option<(Vec<f32>, usize)> {
@@ -119,7 +119,7 @@ fn main() {
     let centroids = kmeans.train_owned(train_set, n_train);
     timer.toc();
     let build_secs = timer.milliseconds() / 1000.0;
-    let n_lists = kmeans.tree.n_leaves;
+    let n_lists = kmeans.base.n_clusters;
     println!("built {n_lists} lists in {build_secs:.2}s");
 
     // Assign the full base set, which is what actually fills the posting lists.

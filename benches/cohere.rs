@@ -20,7 +20,7 @@ use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, SuperK
 
 const N: usize = 1_000_000;
 const D: usize = 1024;
-const K: usize = 100_000;
+const K: usize = 10_000;
 /// Target roughly K leaves for the hierarchical bench (`N / max_leaf_size`).
 const HIER_MAX_LEAF_SIZE: usize = N / K;
 

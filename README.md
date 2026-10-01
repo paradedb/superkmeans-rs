@@ -25,9 +25,8 @@ dimensionality grows.
   when you want the last bit of throughput (see [BLAS backends](#blas-backends)).
 - **Parallel** — training and assignment are parallelized with
   [`rayon`](https://crates.io/crates/rayon).
-- **Hierarchical clustering** — `HierarchicalSuperKMeans` iteratively builds a
-  balanced cluster tree (HBC) until every leaf is below a size cap, using a
-  √K meso root split by default.
+- **Hierarchical clustering** — `HierarchicalSuperKMeans` splits into √K meso
+  clusters, then re-clusters any group still over a size cap.
 
 > **Note:** the crate is published as `superkmeans-rs` but the library target
 > is named `superkmeans`, so you import it as `use superkmeans::...`.
@@ -94,18 +93,14 @@ calling `train` and pass the full set to `assign`.
 
 ### Hierarchical clustering
 
-`HierarchicalSuperKMeans` recursively splits the data until every leaf has at
-most `max_leaf_size` points. `train` returns the leaf centroids; the full tree
-is on `kmeans.tree`. The cluster count is emergent and lands near
-`n / max_leaf_size`.
+`HierarchicalSuperKMeans` splits the sample into `ceil(sqrt(K))` meso clusters
+with `K = ceil(n / max_leaf_size)` (3 iterations), then re-clusters every group
+still larger than `max_leaf_size` into `ceil(n_i / max_leaf_size)` clusters
+(5 iterations) and repeats that until every cluster fits. `train` returns the
+fine centroids. The cluster count is emergent and lands near
+`n / max_leaf_size`; read it from `kmeans.base.n_clusters`.
 
-By default the root splits into `ceil(sqrt(K))` children with
-`K = ceil(n / max_leaf_size)`, and each deeper split uses
-`k = ceil(n_i / max_leaf_size)` so an oversized subtree finishes in one pass.
-Set `branching_factor = Some(b)` for a fixed fan-out (e.g. 2 for a balanced
-k-means tree).
-
-Leaves come out evenly sized without an explicit balance penalty: each split
+Clusters come out evenly sized without an explicit balance penalty: each split
 rebalances its own undersized clusters.
 
 Splits reorder the training set in place rather than copying each child out.
@@ -127,7 +122,7 @@ let cfg = HierarchicalSuperKMeansConfig {
 let mut kmeans = HierarchicalSuperKMeans::with_config(d, cfg);
 let centroids = kmeans.train(&data, n);
 let assignments = kmeans.assign(&data, &centroids, n);
-assert_eq!(centroids.len(), kmeans.tree.n_leaves * d);
+assert_eq!(centroids.len(), kmeans.base.n_clusters * d);
 ```
 
 ## BLAS backends
