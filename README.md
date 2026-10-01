@@ -35,7 +35,7 @@ dimensionality grows.
 
 ```toml
 [dependencies]
-superkmeans-rs = "0.1"
+superkmeans-rs = "0.3"
 ```
 
 The minimum supported Rust version (MSRV) is **1.89** (required by the AVX512 intrinsics used in the pruning kernels).
@@ -91,6 +91,30 @@ Training on a subset is usually worth it (on 200k Cohere vectors, a 25% sample
 halved build time and cost under a point of recall@100); just subsample before
 calling `train` and pass the full set to `assign`.
 
+### Streaming training
+
+When the data doesn't fit in memory, train from a replayable stream of
+`Matrix` batches instead of one slice. Each Lloyd iteration is one pass over
+the stream, plus one pass up front to pick the starting centroids; the only
+per-vector state kept between passes is one assignment (4 bytes).
+
+```rust
+use superkmeans::{Matrix, SuperKMeans, make_blobs};
+
+let (n, d, k) = (10_000, 128, 100);
+let data = make_blobs(n, d, k, true, 1.0, 10.0, 42);
+
+// Any `Clone` iterator of batches works, as long as every clone yields the
+// same vectors in the same order. Single vectors (`Matrix::vector`) are fine;
+// they get packed into GEMM-sized batches.
+let mut kmeans = SuperKMeans::new(k, d);
+let centroids = kmeans.train_iter(Matrix::new(&data, n, d).chunks(1_024));
+```
+
+Sources that can't be cloned or can fail (a file or index re-read on every
+pass) implement `Dataset` and call `train_dataset`, which returns the scan's
+error if one occurs.
+
 ### Hierarchical clustering
 
 `HierarchicalSuperKMeans` splits the sample into `ceil(sqrt(K))` meso clusters
@@ -125,6 +149,43 @@ let assignments = kmeans.assign(&data, &centroids, n);
 assert_eq!(centroids.len(), kmeans.base.n_clusters * d);
 ```
 
+#### Streaming hierarchical clustering
+
+Only the meso step needs every vector, and it streams: `train_meso` runs
+Lloyd's over a `Dataset` (or `train_meso_iter` over an iterator) and returns
+the scan positions grouped by meso cluster. Each meso cluster is about
+`sqrt(n * max_leaf_size)` vectors, small enough to load on its own, so the
+caller fetches one cluster at a time and hands it to `train_meso_cluster`,
+which runs the in-memory splits. Peak memory is one meso cluster plus a few
+bytes per vector, and the data is read `iters_meso + 1` times for the meso
+step plus once more to load the clusters.
+
+```rust
+use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, Matrix, make_blobs};
+
+let (n, d) = (100_000, 256);
+let data = make_blobs(n, d, 100, true, 1.0, 10.0, 42);
+let kmeans = HierarchicalSuperKMeans::with_config(d, HierarchicalSuperKMeansConfig::default());
+
+let meso = kmeans.train_meso_iter(Matrix::new(&data, n, d).chunks(4_096), n);
+for m in 0..meso.n_meso() {
+    let rows = meso.meso_rows(m); // ascending scan positions
+    let vectors: Vec<f32> = rows
+        .iter()
+        .flat_map(|&r| data[r as usize * d..(r as usize + 1) * d].iter().copied())
+        .collect();
+    let fine = kmeans.train_meso_cluster(&vectors, rows.len());
+    for c in 0..fine.n_fine() {
+        let centroid = &fine.centroids[c * d..(c + 1) * d];
+        let members = fine.members(c); // positions into `rows`
+        // ... write out this fine cluster
+    }
+}
+```
+
+Fine clusters come out grouped by meso cluster, so writing them in the order
+they are produced gives a cluster-ordered layout.
+
 ## BLAS backends
 
 The default backend is pure Rust and requires nothing to be installed. Two
@@ -139,10 +200,10 @@ optional features route the SGEMM calls through a vendor BLAS via
 
 ```toml
 # Linux / Windows: link a system OpenBLAS
-superkmeans-rs = { version = "0.1", features = ["openblas"] }
+superkmeans-rs = { version = "0.3", features = ["openblas"] }
 
 # macOS: use Apple Accelerate (AMX-backed on Apple Silicon)
-superkmeans-rs = { version = "0.1", features = ["accelerate"] }
+superkmeans-rs = { version = "0.3", features = ["accelerate"] }
 ```
 
 Enable **at most one** backend; `openblas` and `accelerate` are mutually
