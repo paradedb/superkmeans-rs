@@ -38,3 +38,30 @@ pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
 pub fn l2_squared_range(a: &[f32], b: &[f32], len: usize) -> f32 {
     l2_squared(&a[..len], &b[..len])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{LANES, l2_squared, l2_squared_range};
+
+    #[test]
+    fn distance_matches_scalar_across_chunk_boundaries() {
+        for len in [0, 1, LANES - 1, LANES, LANES + 1, 2 * LANES, 2 * LANES + 3] {
+            let a: Vec<f32> = (0..len).map(|i| i as f32 - 5.0).collect();
+            let b: Vec<f32> = (0..len).map(|i| 2.0 * i as f32 + 1.0).collect();
+            let expected: f32 = a.iter().zip(&b).map(|(x, y)| (x - y).powi(2)).sum();
+            assert_eq!(l2_squared(&a, &b), expected, "length {len}");
+            assert_eq!(l2_squared(&b, &a), expected, "length {len}");
+            assert_eq!(l2_squared(&a, &a), 0.0, "length {len}");
+        }
+    }
+
+    #[test]
+    fn range_ignores_values_after_the_prefix() {
+        let a = [1.0; LANES + 2];
+        let mut b = [3.0; LANES + 3];
+        b[LANES + 1] = 100.0;
+        for len in [0, LANES - 1, LANES, LANES + 1] {
+            assert_eq!(l2_squared_range(&a, &b, len), 4.0 * len as f32);
+        }
+    }
+}
