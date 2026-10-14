@@ -6,30 +6,28 @@
 [![Documentation](https://docs.rs/superkmeans-rs/badge.svg)](https://docs.rs/superkmeans-rs)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-A Rust port of **SuperKMeans**: fast k-means clustering for high-dimensional
+A Rust port of SuperKMeans for fast k-means clustering of high-dimensional
 vector embeddings.
 
 ## Overview
 
-`superkmeans-rs` re-implements the SuperKMeans C++ library in pure Rust (no
-FFI required). It is designed for clustering large collections of
-high-dimensional embeddings — the kind produced by text and image models — and
-uses [ADSampling](https://github.com/gaoj0017/ADSampling)-style distance
-pruning plus a cache-friendly matrix layout to keep assignment fast as
-dimensionality grows.
+`superkmeans-rs` implements the SuperKMeans C++ library in pure Rust, with no
+FFI required. It clusters large collections of high-dimensional embeddings,
+such as those produced by text and image models. It uses
+[ADSampling](https://github.com/gaoj0017/ADSampling)-style distance pruning and
+a cache-friendly matrix layout to keep assignment fast as dimensionality grows.
 
-- **Pure Rust by default** — the SGEMM inner loop runs on
-  [`matrixmultiply`](https://crates.io/crates/matrixmultiply); no system BLAS
-  is required to build or run.
-- **Optional vendor BLAS** — route SGEMM through OpenBLAS or Apple Accelerate
-  when you want the last bit of throughput (see [BLAS backends](#blas-backends)).
-- **Parallel** — training and assignment are parallelized with
+- The SGEMM inner loop uses
+  [`matrixmultiply`](https://crates.io/crates/matrixmultiply) by default, so no
+  system BLAS is required to build or run.
+- You can use OpenBLAS or Apple Accelerate for SGEMM calls. See
+  [BLAS backends](#blas-backends) for setup.
+- Training and assignment run in parallel with
   [`rayon`](https://crates.io/crates/rayon).
-- **Hierarchical clustering** — `HierarchicalSuperKMeans` iteratively builds a
-  balanced cluster tree (HBC) until every leaf is below a size cap, using a
-  √K meso root split by default.
+- `HierarchicalSuperKMeans` builds a balanced cluster tree (HBC) until every
+  leaf is below a size cap. By default, the root splits into √K clusters.
 
-> **Note:** the crate is published as `superkmeans-rs` but the library target
+> The crate is published as `superkmeans-rs` but the library target
 > is named `superkmeans`, so you import it as `use superkmeans::...`.
 
 ## Installation
@@ -39,7 +37,8 @@ dimensionality grows.
 superkmeans-rs = "0.1"
 ```
 
-The minimum supported Rust version (MSRV) is **1.89** (required by the AVX512 intrinsics used in the pruning kernels).
+The minimum supported Rust version (MSRV) is 1.89, which is required by the
+AVX512 intrinsics used in the pruning kernels.
 
 ## Quick Start
 
@@ -68,9 +67,9 @@ assert_eq!(assignments.len(), n);
 
 ### Tuning
 
-`SuperKMeansConfig` exposes the knobs from the C++ original — number of
-iterations, RNG seed, early-termination tolerances, ADSampling pruning bounds,
-and more. Start from the defaults and override what you need:
+`SuperKMeansConfig` provides the settings from the original C++ library,
+including the number of iterations, RNG seed, early-termination tolerances,
+and ADSampling pruning bounds. Start with the defaults and change what you need:
 
 ```rust
 use superkmeans::{SuperKMeans, SuperKMeansConfig};
@@ -83,34 +82,34 @@ cfg.verbose = true;      // log per-iteration statistics
 let mut kmeans = SuperKMeans::with_config(1000, 768, cfg);
 ```
 
-Training runs on the ambient rayon thread pool, so the width comes from
-`RAYON_NUM_THREADS` or from calling `train` inside your own
-`ThreadPool::install`.
+Training uses the current rayon thread pool. Set the thread count with
+`RAYON_NUM_THREADS`, or call `train` inside `ThreadPool::install` to use your
+own pool.
 
-`train` clusters exactly the rows you hand it — there is no sampling knob.
-Training on a subset is usually worth it (on 200k Cohere vectors, a 25% sample
-halved build time and cost under a point of recall@100); just subsample before
-calling `train` and pass the full set to `assign`.
+`train` clusters all the rows you pass to it. To train on a sample, select a
+subset before calling `train`, then pass the full set to `assign`. On 200,000
+Cohere vectors, training on a 25% sample halved build time with a loss of less
+than one point of recall@100.
 
 ### Hierarchical clustering
 
 `HierarchicalSuperKMeans` recursively splits the data until every leaf has at
-most `max_leaf_size` points. `train` returns the leaf centroids; the full tree
-is on `kmeans.tree`. The cluster count is emergent and lands near
+most `max_leaf_size` points. `train` returns the leaf centroids, and the full
+tree is available on `kmeans.tree`. The resulting cluster count is close to
 `n / max_leaf_size`.
 
-By default the root splits into `ceil(sqrt(K))` children with
+By default, the root splits into `ceil(sqrt(K))` children with
 `K = ceil(n / max_leaf_size)`, and each deeper split uses
 `k = ceil(n_i / max_leaf_size)` so an oversized subtree finishes in one pass.
-Set `branching_factor = Some(b)` for a fixed fan-out (e.g. 2 for a balanced
-k-means tree).
+Set `branching_factor = Some(b)` for a fixed fan-out, such as 2 for a balanced
+k-means tree.
 
-Leaves come out evenly sized without an explicit balance penalty: each split
-rebalances its own undersized clusters.
+Each split rebalances its undersized clusters, producing evenly sized leaves
+without an explicit balance penalty.
 
 Splits reorder the training set in place rather than copying each child out.
-With `train_owned` peak memory is one copy of the training set; `train` must
-duplicate the caller's slice before rotating it.
+With `train_owned`, peak memory is one copy of the training set. `train`
+duplicates the caller's slice before rotating it.
 
 ```rust
 use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, make_blobs};
@@ -132,15 +131,15 @@ assert_eq!(centroids.len(), kmeans.tree.n_leaves * d);
 
 ## BLAS backends
 
-The default backend is pure Rust and requires nothing to be installed. Two
-optional features route the SGEMM calls through a vendor BLAS via
+The default backend is pure Rust and needs no system libraries. Two optional
+features route SGEMM calls through a vendor BLAS using
 `cblas_sgemm`:
 
 | Feature       | Platform              | Requirement                                                   |
 |---------------|-----------------------|--------------------------------------------------------------|
-| _(default)_   | Any                   | None — uses `matrixmultiply`                                  |
-| `openblas`    | Linux / Windows / macOS | A system OpenBLAS (`libopenblas-dev`, Homebrew `openblas`, …) |
-| `accelerate`  | macOS                 | None — links the system Accelerate framework                 |
+| (default)     | Any                   | Uses `matrixmultiply`, with no system dependencies            |
+| `openblas`    | Linux / Windows / macOS | A system OpenBLAS installation, such as `libopenblas-dev` or Homebrew `openblas` |
+| `accelerate`  | macOS                 | Uses the system Accelerate framework                         |
 
 ```toml
 # Linux / Windows: link a system OpenBLAS
@@ -150,10 +149,9 @@ superkmeans-rs = { version = "0.1", features = ["openblas"] }
 superkmeans-rs = { version = "0.1", features = ["accelerate"] }
 ```
 
-Enable **at most one** backend; `openblas` and `accelerate` are mutually
-exclusive. When building with `openblas`, `build.rs` locates the library via
-`pkg-config`, or via the `OPENBLAS_LIB_DIR` environment variable for custom
-installs.
+Enable at most one backend. `openblas` and `accelerate` are mutually exclusive.
+When building with `openblas`, `build.rs` finds the library through `pkg-config`.
+For a custom installation, set the `OPENBLAS_LIB_DIR` environment variable.
 
 ## Examples
 
