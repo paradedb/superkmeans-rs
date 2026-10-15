@@ -27,9 +27,6 @@ a cache-friendly matrix layout to keep assignment fast as dimensionality grows.
 - `HierarchicalSuperKMeans` builds a balanced cluster tree (HBC) until every
   leaf is below a size cap. By default, the root splits into √K clusters.
 
-> The crate is published as `superkmeans-rs` but the library target
-> is named `superkmeans`, so you import it as `use superkmeans::...`.
-
 ## Installation
 
 ```toml
