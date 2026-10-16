@@ -43,7 +43,7 @@ pub use hierarchical::{
     HierarchicalSuperKMeansIterationStats, NodeId, TreeNode,
 };
 pub use superkmeans::{
-    ClusterBalanceStats, SuperKMeans, SuperKMeansConfig, SuperKMeansIterationStats,
+    ClusterBalanceStats, SuperKMeans, SuperKMeansConfig, SuperKMeansIterationStats, assign,
 };
 pub use utils::{
     TicToc, centroid_shift, compute_l2_squared, find_nearest_neighbor_brute_force,
