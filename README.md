@@ -24,8 +24,11 @@ a cache-friendly matrix layout to keep assignment fast as dimensionality grows.
   [BLAS backends](#blas-backends) for setup.
 - Training and assignment run in parallel with
   [`rayon`](https://crates.io/crates/rayon).
-- `HierarchicalSuperKMeans` builds a balanced cluster tree (HBC) until every
-  leaf is below a size cap. By default, the root splits into √K clusters.
+- **Hierarchical clustering** — `HierarchicalSuperKMeans` splits into √K meso
+  clusters, then re-clusters any group still over a size cap.
+
+> **Note:** the crate is published as `superkmeans-rs` but the library target
+> is named `superkmeans`, so you import it as `use superkmeans::...`.
 
 ## Installation
 
@@ -90,19 +93,15 @@ than one point of recall@100.
 
 ### Hierarchical clustering
 
-`HierarchicalSuperKMeans` recursively splits the data until every leaf has at
-most `max_leaf_size` points. `train` returns the leaf centroids, and the full
-tree is available on `kmeans.tree`. The resulting cluster count is close to
-`n / max_leaf_size`.
+`HierarchicalSuperKMeans` splits the sample into `ceil(sqrt(K))` meso clusters
+with `K = ceil(n / max_leaf_size)` (3 iterations), then re-clusters every group
+still larger than `max_leaf_size` into `ceil(n_i / max_leaf_size)` clusters
+(5 iterations) and repeats that until every cluster fits. `train` returns the
+fine centroids. The cluster count is emergent and lands near
+`n / max_leaf_size`; read it from `kmeans.base.n_clusters`.
 
-By default, the root splits into `ceil(sqrt(K))` children with
-`K = ceil(n / max_leaf_size)`, and each deeper split uses
-`k = ceil(n_i / max_leaf_size)` so an oversized subtree finishes in one pass.
-Set `branching_factor = Some(b)` for a fixed fan-out, such as 2 for a balanced
-k-means tree.
-
-Each split rebalances its undersized clusters, producing evenly sized leaves
-without an explicit balance penalty.
+Clusters come out evenly sized without an explicit balance penalty: each split
+rebalances its own undersized clusters.
 
 Splits reorder the training set in place rather than copying each child out.
 With `train_owned`, peak memory is one copy of the training set. `train`
@@ -123,7 +122,7 @@ let cfg = HierarchicalSuperKMeansConfig {
 let mut kmeans = HierarchicalSuperKMeans::with_config(d, cfg);
 let centroids = kmeans.train(&data, n);
 let assignments = kmeans.assign(&data, &centroids, n);
-assert_eq!(centroids.len(), kmeans.tree.n_leaves * d);
+assert_eq!(centroids.len(), kmeans.base.n_clusters * d);
 ```
 
 ## BLAS backends
