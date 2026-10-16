@@ -39,8 +39,7 @@ pub mod utils;
 
 pub use common::{DistanceFunction, KnnCandidate};
 pub use hierarchical::{
-    ClusterTree, HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig,
-    HierarchicalSuperKMeansIterationStats, NodeId, TreeNode,
+    HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, HierarchicalSuperKMeansIterationStats,
 };
 pub use superkmeans::{
     ClusterBalanceStats, SuperKMeans, SuperKMeansConfig, SuperKMeansIterationStats,
