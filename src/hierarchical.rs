@@ -28,7 +28,7 @@ use crate::common::{
 use crate::dataset::{Dataset, IterDataset};
 use crate::matrix::Matrix;
 use crate::superkmeans::{SuperKMeans, SuperKMeansConfig, SuperKMeansIterationStats};
-use crate::utils::squared_norms;
+use crate::utils::{normalize_rows_l2_sequential, squared_norms};
 
 /// Config for hierarchical training: [`SuperKMeansConfig`] plus the split knobs.
 #[derive(Clone, Debug)]
@@ -394,7 +394,7 @@ impl HierarchicalSuperKMeans {
         };
         let meso = Child {
             range: 0..n,
-            centroid: mean_rows(rows.data, n, d),
+            centroid: self.leaf_centroid(rows.data, n),
         };
 
         let mut scratch = PartitionScratch::new(n, d);
@@ -465,7 +465,7 @@ impl HierarchicalSuperKMeans {
         if k_meso < 2 {
             return vec![Child {
                 range: 0..n,
-                centroid: mean_rows(rows.data, n, self.base.d),
+                centroid: self.leaf_centroid(rows.data, n),
             }];
         }
         self.split_node(rows, 0..n, k_meso, self.config.iters_meso, scratch, stats)
@@ -534,7 +534,7 @@ impl HierarchicalSuperKMeans {
             .map(|(cluster, bounds)| {
                 let (start, end) = (bounds[0], bounds[1]);
                 let centroid = if repaired {
-                    mean_rows(&node.data[start * d..end * d], end - start, d)
+                    self.leaf_centroid(&node.data[start * d..end * d], end - start)
                 } else {
                     split_centroids[cluster * d..(cluster + 1) * d].to_vec()
                 };
@@ -658,6 +658,20 @@ impl HierarchicalSuperKMeans {
 
         stats.append(&mut skm.iteration_stats);
         (skm.horizontal_centroids, skm.assignments)
+    }
+
+    /// Mean of `data`, on the unit sphere when angular distance is on.
+    ///
+    /// A split that actually runs k-means normalizes in `consolidate_centroids`.
+    /// A group that already fits in one leaf, or a bisect after a collapsed
+    /// split, never gets there, so the mean has to be normalized here.
+    fn leaf_centroid(&self, data: &[f32], n: usize) -> Vec<f32> {
+        let d = self.base.d;
+        let mut centroid = mean_rows(data, n, d);
+        if self.config.base.angular {
+            normalize_rows_l2_sequential(&mut centroid, 1, d);
+        }
+        centroid
     }
 }
 
@@ -872,6 +886,13 @@ mod tests {
     use crate::common::N_CLUSTERS_THRESHOLD_FOR_PRUNING;
     use crate::utils::make_blobs;
 
+    fn assert_close(got: &[f32], expected: &[f32]) {
+        assert_eq!(got.len(), expected.len());
+        for (i, (&g, &e)) in got.iter().zip(expected).enumerate() {
+            assert!((g - e).abs() < 1e-4, "index {i}: {g} vs {e}");
+        }
+    }
+
     /// Default config with only the size cap overridden.
     fn config(max_leaf_size: usize) -> HierarchicalSuperKMeansConfig {
         HierarchicalSuperKMeansConfig {
@@ -945,6 +966,50 @@ mod tests {
             }
         }
         assert_eq!(from_meso, skm.assignments);
+    }
+
+    /// A group that never runs k-means still has to land on the unit sphere.
+    /// In-memory training normalizes inside `consolidate_centroids`; the
+    /// streaming fine step used to emit the raw mean.
+    #[test]
+    fn angular_leaf_centroids_are_unit_vectors() {
+        let d = 2usize;
+        let n = 300usize;
+        let mut data = vec![0.0_f32; n * d];
+        for i in 0..150 {
+            data[i * d] = 10.0;
+        }
+        for i in 150..n {
+            data[i * d + 1] = 1.0;
+        }
+
+        let mut cfg = config(200);
+        cfg.base.angular = true;
+        let kmeans = HierarchicalSuperKMeans::with_config(d, cfg.clone());
+
+        let left = kmeans.train_meso_cluster(&data[..150 * d], 150);
+        let right = kmeans.train_meso_cluster(&data[150 * d..], 150);
+        assert_eq!(left.n_fine(), 1);
+        assert_eq!(right.n_fine(), 1);
+        assert_close(&left.centroids, &[1.0, 0.0]);
+        assert_close(&right.centroids, &[0.0, 1.0]);
+
+        // The whole sample fits in one leaf, so this mean never sees k-means.
+        let mut one_leaf = cfg.clone();
+        one_leaf.max_leaf_size = n;
+        let mut trained = HierarchicalSuperKMeans::with_config(d, one_leaf);
+        let centroid = trained.train(&data, n);
+        assert_eq!(trained.base.n_clusters, 1);
+        let scale = (5.0_f32 * 5.0 + 0.5 * 0.5).sqrt();
+        assert_close(&centroid, &[5.0 / scale, 0.5 / scale]);
+
+        let mut trained = HierarchicalSuperKMeans::with_config(d, cfg);
+        let centroids = trained.train(&data, n);
+        assert_eq!(centroids.len(), 2 * d);
+        let mut rows: Vec<[f32; 2]> = centroids.chunks_exact(d).map(|c| [c[0], c[1]]).collect();
+        rows.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap());
+        assert_close(&rows[0], &[0.0, 1.0]);
+        assert_close(&rows[1], &[1.0, 0.0]);
     }
 
     #[test]
