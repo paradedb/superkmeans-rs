@@ -21,7 +21,10 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::adsampling::ADSamplingPruner;
-use crate::common::HIERARCHICAL_PRUNER_INITIAL_THRESHOLD;
+use crate::common::{
+    DIMENSION_THRESHOLD_FOR_PRUNING, HIERARCHICAL_PRUNER_INITIAL_THRESHOLD,
+    N_CLUSTERS_THRESHOLD_FOR_PRUNING,
+};
 use crate::dataset::{Dataset, IterDataset};
 use crate::matrix::Matrix;
 use crate::superkmeans::{SuperKMeans, SuperKMeansConfig, SuperKMeansIterationStats};
@@ -319,6 +322,7 @@ impl HierarchicalSuperKMeans {
             k_meso,
             LocalSkmMode::Meso {
                 iters: self.config.iters_meso,
+                can_prune: self.meso_can_prune(k_meso),
             },
         );
         skm.train_dataset(data)?;
@@ -542,6 +546,18 @@ impl HierarchicalSuperKMeans {
             .collect()
     }
 
+    /// Whether the streaming meso run can leave the exact GEMM path.
+    ///
+    /// Pruning needs a wide vector, more clusters than the GEMM cutoff, and
+    /// the BLAS-only switch off — the same conditions as
+    /// [`SuperKMeans`](crate::SuperKMeans)'s streaming loop. Below that, the
+    /// rotation does not change which centroid a row lands on.
+    fn meso_can_prune(&self, k_meso: usize) -> bool {
+        self.base.d >= DIMENSION_THRESHOLD_FOR_PRUNING
+            && !self.config.base.use_blas_only
+            && k_meso > N_CLUSTERS_THRESHOLD_FOR_PRUNING
+    }
+
     /// How many meso clusters a sample of `n` points should start with.
     ///
     /// \(\lceil\sqrt{K}\rceil\) with \(K = \lceil n / \texttt{max\_leaf\_size}\rceil\).
@@ -584,7 +600,17 @@ impl HierarchicalSuperKMeans {
         let mut cfg = base_config.clone();
         match mode {
             LocalSkmMode::Root => {}
-            LocalSkmMode::Meso { iters } => cfg.iters = iters,
+            LocalSkmMode::Meso { iters, can_prune } => {
+                cfg.iters = iters;
+                // Assignments are invariant under the pruner's rotation, and this
+                // run only keeps them. Each Lloyd pass otherwise rotates every
+                // batch with a d×d GEMM, so skip it unless pruning — the only
+                // consumer of the rotated basis — can engage. An already-rotated
+                // scan stays rotated either way.
+                if !can_prune {
+                    cfg.data_already_rotated = true;
+                }
+            }
             LocalSkmMode::Split { iters } => {
                 // Subsets are already in the rotated domain from the root pass.
                 cfg.data_already_rotated = true;
@@ -833,8 +859,9 @@ enum LocalSkmMode {
     /// Placeholder / final model (respects the caller's rotation flags).
     Root,
     /// Streaming meso run over the caller's scan, which is in the caller's
-    /// domain, so the rotation flags pass through.
-    Meso { iters: u32 },
+    /// domain. Rotation flags pass through, except the run skips rotation
+    /// when `can_prune` is false.
+    Meso { iters: u32, can_prune: bool },
     /// Per-split clustering over an already-rotated contiguous subset.
     Split { iters: u32 },
 }
@@ -842,6 +869,7 @@ enum LocalSkmMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::N_CLUSTERS_THRESHOLD_FOR_PRUNING;
     use crate::utils::make_blobs;
 
     /// Default config with only the size cap overridden.
@@ -868,6 +896,55 @@ mod tests {
         assert_eq!(kmeans.fine_clusters(2_000), 20);
         assert_eq!(kmeans.meso_clusters(100), 0);
         assert_eq!(kmeans.fine_clusters(100), 0);
+    }
+
+    #[test]
+    fn meso_prunes_only_above_both_cutoffs() {
+        let narrow = HierarchicalSuperKMeans::with_config(32, config(200));
+        assert!(!narrow.meso_can_prune(1_000));
+
+        let wide = HierarchicalSuperKMeans::with_config(128, config(200));
+        assert!(!wide.meso_can_prune(N_CLUSTERS_THRESHOLD_FOR_PRUNING));
+        assert!(wide.meso_can_prune(N_CLUSTERS_THRESHOLD_FOR_PRUNING + 1));
+
+        let mut blas = config(200);
+        blas.base.use_blas_only = true;
+        let blas = HierarchicalSuperKMeans::with_config(128, blas);
+        assert!(!blas.meso_can_prune(1_000));
+    }
+
+    /// Below the pruning cutoffs the meso run must match a streaming k-means
+    /// that never rotates: same seed, same iterations, assignments identical.
+    #[test]
+    fn meso_skips_rotation_when_pruning_cannot_engage() {
+        let (n, d) = (2_000usize, 64usize);
+        let data = make_blobs(n, d, 8, true, 1.0, 10.0, 7);
+        let mut cfg = config(100);
+        cfg.iters_meso = 3;
+        cfg.base.early_termination = false;
+        cfg.base.seed = 7;
+
+        let kmeans = HierarchicalSuperKMeans::with_config(d, cfg.clone());
+        let k = kmeans.meso_clusters(n);
+        assert!(k >= 2);
+        assert!(!kmeans.meso_can_prune(k));
+
+        let meso = kmeans.train_meso_iter(Matrix::new(&data, n, d).chunks(256), n);
+        assert_eq!(meso.n_meso(), k, "meso clustering collapsed");
+
+        let mut skm_cfg = cfg.base.clone();
+        skm_cfg.iters = cfg.iters_meso;
+        skm_cfg.data_already_rotated = true;
+        let mut skm = SuperKMeans::with_config(k, d, skm_cfg);
+        skm.train_iter(Matrix::new(&data, n, d).chunks(256));
+
+        let mut from_meso = vec![0_u32; n];
+        for m in 0..meso.n_meso() {
+            for &row in meso.meso_rows(m) {
+                from_meso[row as usize] = m as u32;
+            }
+        }
+        assert_eq!(from_meso, skm.assignments);
     }
 
     #[test]
