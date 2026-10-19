@@ -5,7 +5,9 @@
 
 use std::collections::HashSet;
 
-use superkmeans::{SuperKMeans, SuperKMeansConfig, make_blobs};
+use superkmeans::{
+    Matrix, SuperKMeans, SuperKMeansConfig, assign, generate_random_vectors, make_blobs,
+};
 
 fn find_nearest_centroid_brute_force(
     point: &[f32],
@@ -246,4 +248,36 @@ fn all_clusters_non_empty() {
 
     let used: HashSet<u32> = assignments.iter().copied().collect();
     assert_eq!(used.len(), n_clusters);
+}
+
+#[test]
+fn standalone_assignment_matches_brute_force() {
+    for d in [3, 64, 1024] {
+        let mut data = generate_random_vectors(1031, d, -1.0, 1.0, 42);
+        let mut centroids = generate_random_vectors(19, d, -1.0, 1.0, 17);
+        centroids.extend_from_within(..d);
+        data[..d].copy_from_slice(&centroids[..d]);
+        for n in [0, 1, 1031] {
+            let expected: Vec<_> = data[..n * d]
+                .chunks_exact(d)
+                .map(|point| find_nearest_centroid_brute_force(point, &centroids, 20, d))
+                .collect();
+            assert_eq!(
+                assign(
+                    Matrix::from_slice(&data[..n * d], d),
+                    Matrix::from_slice(&centroids, d),
+                ),
+                expected,
+                "d={d}, n={n}"
+            );
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "vectors and centroids must share d")]
+fn assign_rejects_mismatched_dimensionality() {
+    let vectors = Matrix::from_slice(&[0.0, 0.0], 2);
+    let centroids = Matrix::from_slice(&[0.0], 1);
+    let _ = assign(vectors, centroids);
 }

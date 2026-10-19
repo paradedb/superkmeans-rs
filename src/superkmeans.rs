@@ -146,6 +146,43 @@ pub struct SuperKMeans {
     gemm_buf: Vec<f32>,
 }
 
+/// Assign row-major vectors to their nearest centroids without constructing a trainer.
+///
+/// Vectors and centroids must share the same coordinate space. This uses exact,
+/// unpruned nearest-neighbor search and does not build a rotation matrix.
+///
+/// # Panics
+///
+/// Panics if the two matrices have different dimensionality.
+pub fn assign(vectors: Matrix<'_>, centroids: Matrix<'_>) -> Vec<u32> {
+    assert_eq!(
+        vectors.d(),
+        centroids.d(),
+        "vectors and centroids must share d"
+    );
+    let n_vectors = vectors.n();
+    let n_centroids = centroids.n();
+    let d = vectors.d();
+    let mut result_assignments = vec![0_u32; n_vectors];
+    let mut result_distances = vec![0.0_f32; n_vectors];
+    let vector_norms = squared_norms(vectors.as_slice(), n_vectors, d);
+    let centroid_norms = squared_norms(centroids.as_slice(), n_centroids, d);
+    let mut buf = Vec::new();
+    batch::find_nearest_neighbor(
+        vectors.as_slice(),
+        centroids.as_slice(),
+        n_vectors,
+        n_centroids,
+        d,
+        &vector_norms,
+        &centroid_norms,
+        &mut result_assignments,
+        &mut result_distances,
+        &mut buf,
+    );
+    result_assignments
+}
+
 impl SuperKMeans {
     pub fn new(n_clusters: usize, dimensionality: usize) -> Self {
         Self::with_config(n_clusters, dimensionality, SuperKMeansConfig::default())
@@ -658,27 +695,16 @@ impl SuperKMeans {
 
     /// Brute-force assignment: returns the index of the nearest centroid for
     /// each vector (data and centroids assumed to share the same domain).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `vectors.len() != n_vectors * d`, or if `centroids.len()` is
+    /// not a multiple of `d`.
     pub fn assign(&self, vectors: &[f32], centroids: &[f32], n_vectors: usize) -> Vec<u32> {
-        let d = self.d;
-        let n_centroids = centroids.len() / d;
-        let mut result_assignments = vec![0_u32; n_vectors];
-        let mut result_distances = vec![0.0_f32; n_vectors];
-        let vector_norms = squared_norms(vectors, n_vectors, d);
-        let centroid_norms = squared_norms(centroids, n_centroids, d);
-        let mut buf = Vec::new();
-        batch::find_nearest_neighbor(
-            vectors,
-            centroids,
-            n_vectors,
-            n_centroids,
-            d,
-            &vector_norms,
-            &centroid_norms,
-            &mut result_assignments,
-            &mut result_distances,
-            &mut buf,
-        );
-        result_assignments
+        assign(
+            Matrix::new(vectors, n_vectors, self.d),
+            Matrix::from_slice(centroids, self.d),
+        )
     }
 
     /// Re-assign the training set to its nearest centroid using the pruning path.
