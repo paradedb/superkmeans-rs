@@ -146,21 +146,78 @@ pub struct SuperKMeans {
     gemm_buf: Vec<f32>,
 }
 
+/// Row-major `n × d` view of `f32` values.
+///
+/// Constructing a view checks that `d` is positive and that the slice length
+/// matches the declared shape, so later kernels can trust `n` and `d`.
+#[derive(Clone, Copy, Debug)]
+pub struct Matrix<'a> {
+    data: &'a [f32],
+    n: usize,
+    d: usize,
+}
+
+impl<'a> Matrix<'a> {
+    /// View `data` as `n` rows of width `d`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `d` is zero or `data.len() != n * d`.
+    pub fn new(data: &'a [f32], n: usize, d: usize) -> Self {
+        assert!(d > 0, "dimensionality must be positive");
+        assert_eq!(data.len(), n * d, "matrix length must equal n * d");
+        Self { data, n, d }
+    }
+
+    /// View `data` as rows of width `d`, inferring the row count from its length.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `d` is zero or `data.len()` is not a multiple of `d`.
+    pub fn from_slice(data: &'a [f32], d: usize) -> Self {
+        assert!(d > 0, "dimensionality must be positive");
+        assert_eq!(data.len() % d, 0, "matrix length must be a multiple of d");
+        Self::new(data, data.len() / d, d)
+    }
+
+    pub fn n(self) -> usize {
+        self.n
+    }
+
+    pub fn d(self) -> usize {
+        self.d
+    }
+
+    pub fn as_slice(self) -> &'a [f32] {
+        self.data
+    }
+}
+
 /// Assign row-major vectors to their nearest centroids without constructing a trainer.
 ///
 /// Vectors and centroids must share the same coordinate space. This uses exact,
 /// unpruned nearest-neighbor search and does not build a rotation matrix.
-pub fn assign(vectors: &[f32], centroids: &[f32], n_vectors: usize, d: usize) -> Vec<u32> {
-    assert!(d > 0, "dimensionality must be positive");
-    let n_centroids = centroids.len() / d;
+///
+/// # Panics
+///
+/// Panics if the two matrices have different dimensionality.
+pub fn assign(vectors: Matrix<'_>, centroids: Matrix<'_>) -> Vec<u32> {
+    assert_eq!(
+        vectors.d(),
+        centroids.d(),
+        "vectors and centroids must share d"
+    );
+    let n_vectors = vectors.n();
+    let n_centroids = centroids.n();
+    let d = vectors.d();
     let mut result_assignments = vec![0_u32; n_vectors];
     let mut result_distances = vec![0.0_f32; n_vectors];
-    let vector_norms = squared_norms(vectors, n_vectors, d);
-    let centroid_norms = squared_norms(centroids, n_centroids, d);
+    let vector_norms = squared_norms(vectors.as_slice(), n_vectors, d);
+    let centroid_norms = squared_norms(centroids.as_slice(), n_centroids, d);
     let mut buf = Vec::new();
     batch::find_nearest_neighbor(
-        vectors,
-        centroids,
+        vectors.as_slice(),
+        centroids.as_slice(),
         n_vectors,
         n_centroids,
         d,
@@ -685,8 +742,16 @@ impl SuperKMeans {
 
     /// Brute-force assignment: returns the index of the nearest centroid for
     /// each vector (data and centroids assumed to share the same domain).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `vectors.len() != n_vectors * d`, or if `centroids.len()` is
+    /// not a multiple of `d`.
     pub fn assign(&self, vectors: &[f32], centroids: &[f32], n_vectors: usize) -> Vec<u32> {
-        assign(vectors, centroids, n_vectors, self.d)
+        assign(
+            Matrix::new(vectors, n_vectors, self.d),
+            Matrix::from_slice(centroids, self.d),
+        )
     }
 
     /// Re-assign the training set to its nearest centroid using the pruning path.

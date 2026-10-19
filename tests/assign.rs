@@ -5,7 +5,9 @@
 
 use std::collections::HashSet;
 
-use superkmeans::{SuperKMeans, SuperKMeansConfig, assign, generate_random_vectors, make_blobs};
+use superkmeans::{
+    Matrix, SuperKMeans, SuperKMeansConfig, assign, generate_random_vectors, make_blobs,
+};
 
 fn find_nearest_centroid_brute_force(
     point: &[f32],
@@ -260,7 +262,40 @@ fn standalone_assignment_matches_brute_force() {
                 .chunks_exact(d)
                 .map(|point| find_nearest_centroid_brute_force(point, &centroids, 20, d))
                 .collect();
-            assert_eq!(assign(&data, &centroids, n, d), expected, "d={d}, n={n}");
+            assert_eq!(
+                assign(
+                    Matrix::from_slice(&data[..n * d], d),
+                    Matrix::from_slice(&centroids, d),
+                ),
+                expected,
+                "d={d}, n={n}"
+            );
         }
     }
+}
+
+#[test]
+#[should_panic(expected = "dimensionality must be positive")]
+fn matrix_rejects_zero_dimensionality() {
+    let _ = Matrix::from_slice(&[], 0);
+}
+
+#[test]
+#[should_panic(expected = "matrix length must be a multiple of d")]
+fn matrix_rejects_ragged_rows() {
+    let _ = Matrix::from_slice(&[0.0, 0.0, 0.0], 2);
+}
+
+#[test]
+#[should_panic(expected = "matrix length must equal n * d")]
+fn matrix_new_rejects_length_mismatch() {
+    let _ = Matrix::new(&[0.0, 0.0, 0.0, 0.0], 1, 2);
+}
+
+#[test]
+#[should_panic(expected = "vectors and centroids must share d")]
+fn assign_rejects_mismatched_dimensionality() {
+    let vectors = Matrix::from_slice(&[0.0, 0.0], 2);
+    let centroids = Matrix::from_slice(&[0.0], 1);
+    let _ = assign(vectors, centroids);
 }
