@@ -258,17 +258,30 @@ fn standalone_assignment_matches_brute_force() {
         centroids.extend_from_within(..d);
         data[..d].copy_from_slice(&centroids[..d]);
         for n in [0, 1, 1031] {
-            let expected: Vec<_> = data[..n * d]
-                .chunks_exact(d)
-                .map(|point| find_nearest_centroid_brute_force(point, &centroids, 20, d))
-                .collect();
+            let assigned = assign(
+                Matrix::from_slice(&data[..n * d], d),
+                Matrix::from_slice(&centroids, d),
+            );
+            assert_eq!(assigned.len(), n, "d={d}, n={n}");
+            let mut incorrect = 0;
+            for (i, &cluster) in assigned.iter().enumerate() {
+                let point = &data[i * d..(i + 1) * d];
+                let nearest = find_nearest_centroid_brute_force(point, &centroids, 20, d) as usize;
+                let got = cluster as usize;
+                if got == nearest {
+                    continue;
+                }
+                // Centroid 19 is a copy of centroid 0, and the GEMM expansion of
+                // ||x - c||^2 can break that tie the other way by a few ulps.
+                let got_dist = l2_sq(point, &centroids[got * d..(got + 1) * d]);
+                let nearest_dist = l2_sq(point, &centroids[nearest * d..(nearest + 1) * d]);
+                if (got_dist - nearest_dist).abs() > 1e-4 * nearest_dist {
+                    incorrect += 1;
+                }
+            }
             assert_eq!(
-                assign(
-                    Matrix::from_slice(&data[..n * d], d),
-                    Matrix::from_slice(&centroids, d),
-                ),
-                expected,
-                "d={d}, n={n}"
+                incorrect, 0,
+                "{incorrect} points not assigned to their nearest centroid (d={d}, n={n})"
             );
         }
     }
