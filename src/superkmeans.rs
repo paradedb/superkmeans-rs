@@ -146,53 +146,6 @@ pub struct SuperKMeans {
     gemm_buf: Vec<f32>,
 }
 
-/// Row-major `n × d` view of `f32` values.
-///
-/// Constructing a view checks that `d` is positive and that the slice length
-/// matches the declared shape, so later kernels can trust `n` and `d`.
-#[derive(Clone, Copy, Debug)]
-pub struct Matrix<'a> {
-    data: &'a [f32],
-    n: usize,
-    d: usize,
-}
-
-impl<'a> Matrix<'a> {
-    /// View `data` as `n` rows of width `d`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `d` is zero or `data.len() != n * d`.
-    pub fn new(data: &'a [f32], n: usize, d: usize) -> Self {
-        assert!(d > 0, "dimensionality must be positive");
-        assert_eq!(data.len(), n * d, "matrix length must equal n * d");
-        Self { data, n, d }
-    }
-
-    /// View `data` as rows of width `d`, inferring the row count from its length.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `d` is zero or `data.len()` is not a multiple of `d`.
-    pub fn from_slice(data: &'a [f32], d: usize) -> Self {
-        assert!(d > 0, "dimensionality must be positive");
-        assert_eq!(data.len() % d, 0, "matrix length must be a multiple of d");
-        Self::new(data, data.len() / d, d)
-    }
-
-    pub fn n(self) -> usize {
-        self.n
-    }
-
-    pub fn d(self) -> usize {
-        self.d
-    }
-
-    pub fn as_slice(self) -> &'a [f32] {
-        self.data
-    }
-}
-
 /// Assign row-major vectors to their nearest centroids without constructing a trainer.
 ///
 /// Vectors and centroids must share the same coordinate space. This uses exact,

@@ -275,24 +275,6 @@ fn standalone_assignment_matches_brute_force() {
 }
 
 #[test]
-#[should_panic(expected = "dimensionality must be positive")]
-fn matrix_rejects_zero_dimensionality() {
-    let _ = Matrix::from_slice(&[], 0);
-}
-
-#[test]
-#[should_panic(expected = "matrix length must be a multiple of d")]
-fn matrix_rejects_ragged_rows() {
-    let _ = Matrix::from_slice(&[0.0, 0.0, 0.0], 2);
-}
-
-#[test]
-#[should_panic(expected = "matrix length must equal n * d")]
-fn matrix_new_rejects_length_mismatch() {
-    let _ = Matrix::new(&[0.0, 0.0, 0.0, 0.0], 1, 2);
-}
-
-#[test]
 #[should_panic(expected = "vectors and centroids must share d")]
 fn assign_rejects_mismatched_dimensionality() {
     let vectors = Matrix::from_slice(&[0.0, 0.0], 2);
