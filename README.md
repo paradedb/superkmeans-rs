@@ -6,224 +6,67 @@
 [![Documentation](https://docs.rs/superkmeans-rs/badge.svg)](https://docs.rs/superkmeans-rs)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-A Rust port of SuperKMeans for fast k-means clustering of high-dimensional
-vector embeddings.
+A Rust port of SuperKMeans for k-means clustering of high-dimensional vector
+embeddings. Training and assignment run in parallel using Rayon, with
+[ADSampling](https://github.com/gaoj0017/ADSampling)-style distance pruning.
+The default backend is pure Rust and needs no system BLAS.
 
-## Overview
+[API documentation](https://docs.rs/superkmeans-rs) | [Examples](examples)
 
-`superkmeans-rs` implements the SuperKMeans C++ library in pure Rust, with no
-FFI required. It clusters large collections of high-dimensional embeddings,
-such as those produced by text and image models. It uses
-[ADSampling](https://github.com/gaoj0017/ADSampling)-style distance pruning and
-a cache-friendly matrix layout to keep assignment fast as dimensionality grows.
+## Usage
 
-- The SGEMM inner loop uses
-  [`matrixmultiply`](https://crates.io/crates/matrixmultiply) by default, so no
-  system BLAS is required to build or run.
-- You can use OpenBLAS or Apple Accelerate for SGEMM calls. See
-  [BLAS backends](#blas-backends) for setup.
-- Training and assignment run in parallel with
-  [`rayon`](https://crates.io/crates/rayon).
-- **Hierarchical clustering** — `HierarchicalSuperKMeans` splits into √K meso
-  clusters, then re-clusters any group still over a size cap.
-
-> **Note:** the crate is published as `superkmeans-rs` but the library target
-> is named `superkmeans`, so you import it as `use superkmeans::...`.
-
-## Installation
+Add the crate to your `Cargo.toml` (requires Rust 1.89 or later):
 
 ```toml
 [dependencies]
 superkmeans-rs = "0.3"
 ```
 
-The minimum supported Rust version (MSRV) is 1.89, which is required by the
-AVX512 intrinsics used in the pruning kernels.
-
-## Quick Start
-
-Vectors are passed as a single row-major `&[f32]` slice of length `n * d`
-(`n` vectors of dimensionality `d`):
+The crate is published as `superkmeans-rs` and imported as `superkmeans`.
+Vectors are stored in a flat, row-major slice of `n * d` floats:
 
 ```rust
-use superkmeans::{SuperKMeans, SuperKMeansConfig, make_blobs};
-
-// 10,000 vectors of dimensionality 128, drawn from 100 blobs (seed = 42).
-let n = 10_000;
-let d = 128;
-let data = make_blobs(n, d, 100, true, 1.0, 10.0, 42);
-
-// Cluster into 100 centroids.
-let k = 100;
-let mut kmeans = SuperKMeans::with_config(k, d, SuperKMeansConfig::default());
-
-// `train` returns the `k * d` centroids as a flat row-major slice.
-let centroids = kmeans.train(&data, n);
-
-// Assign every vector to its nearest centroid.
-let assignments: Vec<u32> = kmeans.assign(&data, &centroids, n);
-assert_eq!(assignments.len(), n);
-```
-
-### Tuning
-
-`SuperKMeansConfig` provides the settings from the original C++ library,
-including the number of iterations, RNG seed, early-termination tolerances,
-and ADSampling pruning bounds. Start with the defaults and change what you need:
-
-```rust
-use superkmeans::{SuperKMeans, SuperKMeansConfig};
-
-let mut cfg = SuperKMeansConfig::default();
-cfg.iters = 20;          // more refinement passes
-cfg.seed = 7;            // deterministic runs
-cfg.verbose = true;      // log per-iteration statistics
-
-let mut kmeans = SuperKMeans::with_config(1000, 768, cfg);
-```
-
-Training uses the current rayon thread pool. Set the thread count with
-`RAYON_NUM_THREADS`, or call `train` inside `ThreadPool::install` to use your
-own pool.
-
-`train` clusters all the rows you pass to it. To train on a sample, select a
-subset before calling `train`, then pass the full set to `assign`. On 200,000
-Cohere vectors, training on a 25% sample halved build time with a loss of less
-than one point of recall@100.
-
-### Streaming training
-
-When the data doesn't fit in memory, train from a replayable stream of
-`Matrix` batches instead of one slice. Each Lloyd iteration is one pass over
-the stream, plus one pass up front to pick the starting centroids; the only
-per-vector state kept between passes is one assignment (4 bytes).
-
-```rust
-use superkmeans::{Matrix, SuperKMeans, make_blobs};
+use superkmeans::{SuperKMeans, make_blobs};
 
 let (n, d, k) = (10_000, 128, 100);
 let data = make_blobs(n, d, k, true, 1.0, 10.0, 42);
 
-// Any `Clone` iterator of batches works, as long as every clone yields the
-// same vectors in the same order. Single vectors (`Matrix::vector`) are fine;
-// they get packed into GEMM-sized batches.
 let mut kmeans = SuperKMeans::new(k, d);
-let centroids = kmeans.train_iter(Matrix::new(&data, n, d).chunks(1_024));
-```
-
-Sources that can't be cloned or can fail (a file or index re-read on every
-pass) implement `Dataset` and call `train_dataset`, which returns the scan's
-error if one occurs.
-
-### Hierarchical clustering
-
-`HierarchicalSuperKMeans` splits the sample into `ceil(sqrt(K))` meso clusters
-with `K = ceil(n / max_leaf_size)` (3 iterations), then re-clusters every group
-still larger than `max_leaf_size` into `ceil(n_i / max_leaf_size)` clusters
-(5 iterations) and repeats that until every cluster fits. `train` returns the
-fine centroids. The cluster count is emergent and lands near
-`n / max_leaf_size`; read it from `kmeans.base.n_clusters`.
-
-Clusters come out evenly sized without an explicit balance penalty: each split
-rebalances its own undersized clusters.
-
-Splits reorder the training set in place rather than copying each child out.
-With `train_owned`, peak memory is one copy of the training set. `train`
-duplicates the caller's slice before rotating it.
-
-```rust
-use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, make_blobs};
-
-let n = 100_000;
-let d = 256;
-let data = make_blobs(n, d, 100, true, 1.0, 10.0, 42);
-
-let cfg = HierarchicalSuperKMeansConfig {
-    max_leaf_size: 256,
-    ..Default::default()
-};
-
-let mut kmeans = HierarchicalSuperKMeans::with_config(d, cfg);
 let centroids = kmeans.train(&data, n);
 let assignments = kmeans.assign(&data, &centroids, n);
-assert_eq!(centroids.len(), kmeans.base.n_clusters * d);
+assert_eq!(assignments.len(), n);
 ```
 
-#### Streaming hierarchical clustering
+Use [`SuperKMeansConfig`](https://docs.rs/superkmeans-rs/latest/superkmeans/struct.SuperKMeansConfig.html)
+to set iterations, seed, and pruning parameters. Set `RAYON_NUM_THREADS` to
+control parallelism, or run training in your own Rayon thread pool.
 
-Only the meso step needs every vector, and it streams: `train_meso` runs
-Lloyd's over a `Dataset` (or `train_meso_iter` over an iterator) and returns
-the scan positions grouped by meso cluster. Each meso cluster is about
-`sqrt(n * max_leaf_size)` vectors, small enough to load on its own, so the
-caller fetches one cluster at a time and hands it to `train_meso_cluster`,
-which runs the in-memory splits. Peak memory is one meso cluster plus a few
-bytes per vector, and the data is read `iters_meso + 1` times for the meso
-step plus once more to load the clusters.
-
-```rust
-use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, Matrix, make_blobs};
-
-let (n, d) = (100_000, 256);
-let data = make_blobs(n, d, 100, true, 1.0, 10.0, 42);
-let kmeans = HierarchicalSuperKMeans::with_config(d, HierarchicalSuperKMeansConfig::default());
-
-let meso = kmeans.train_meso_iter(Matrix::new(&data, n, d).chunks(4_096), n);
-for m in 0..meso.n_meso() {
-    let rows = meso.meso_rows(m); // ascending scan positions
-    let vectors: Vec<f32> = rows
-        .iter()
-        .flat_map(|&r| data[r as usize * d..(r as usize + 1) * d].iter().copied())
-        .collect();
-    let fine = kmeans.train_meso_cluster(&vectors, rows.len());
-    for c in 0..fine.n_fine() {
-        let centroid = &fine.centroids[c * d..(c + 1) * d];
-        let members = fine.members(c); // positions into `rows`
-        // ... write out this fine cluster
-    }
-}
-```
-
-Fine clusters come out grouped by meso cluster, so writing them in the order
-they are produced gives a cluster-ordered layout.
+For data that does not fit in memory, `train_iter` accepts replayable batches;
+`train_dataset` supports fallible data sources. Both scan the data on each pass.
+[`HierarchicalSuperKMeans`](https://docs.rs/superkmeans-rs/latest/superkmeans/struct.HierarchicalSuperKMeans.html)
+splits clusters until they fit a size cap and also supports streaming the
+initial partition. See the API docs and [examples](examples) for these workflows.
 
 ## BLAS backends
 
-The default backend is pure Rust and needs no system libraries. Two optional
-features route SGEMM calls through a vendor BLAS using
-`cblas_sgemm`:
+The default backend uses `matrixmultiply`. To use a system BLAS, enable one of
+these mutually exclusive Cargo features:
 
-| Feature       | Platform              | Requirement                                                   |
-|---------------|-----------------------|--------------------------------------------------------------|
-| (default)     | Any                   | Uses `matrixmultiply`, with no system dependencies            |
-| `openblas`    | Linux / Windows / macOS | A system OpenBLAS installation, such as `libopenblas-dev` or Homebrew `openblas` |
-| `accelerate`  | macOS                 | Uses the system Accelerate framework                         |
+| Feature | Platform | Requirement |
+| --- | --- | --- |
+| `openblas` | Linux, Windows, macOS | System OpenBLAS, found via `pkg-config` or `OPENBLAS_LIB_DIR` |
+| `accelerate` | macOS | System Accelerate framework |
+
+For example, on macOS:
 
 ```toml
-# Linux / Windows: link a system OpenBLAS
-superkmeans-rs = { version = "0.3", features = ["openblas"] }
-
-# macOS: use Apple Accelerate (AMX-backed on Apple Silicon)
 superkmeans-rs = { version = "0.3", features = ["accelerate"] }
-```
-
-Enable at most one backend. `openblas` and `accelerate` are mutually exclusive.
-When building with `openblas`, `build.rs` finds the library through `pkg-config`.
-For a custom installation, set the `OPENBLAS_LIB_DIR` environment variable.
-
-## Examples
-
-Runnable examples live in [`examples/`](examples):
-
-```bash
-cargo run --release --example simple_clustering
-cargo run --release --example hierarchical_clustering
 ```
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and the checks CI
-enforces.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and checks.
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+[MIT](LICENSE).
