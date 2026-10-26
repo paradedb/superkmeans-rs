@@ -166,7 +166,8 @@ pub fn find_k_nearest_neighbors(
         *v = u32::MAX;
     }
 
-    let mut buf = vec![0.0_f32; X_BATCH_SIZE * Y_BATCH_SIZE];
+    let mut buf = Vec::new();
+    ensure_buf(&mut buf, n_x, n_y);
 
     let mut i = 0;
     while i < n_x {
@@ -221,8 +222,12 @@ pub fn find_k_nearest_neighbors(
                         candidates.push((row[c], (j_base + c) as u32));
                     }
                     let actual_k = k.min(candidates.len());
-                    candidates
-                        .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                    let order =
+                        |a: &(f32, u32), b: &(f32, u32)| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1));
+                    if actual_k > 0 && actual_k < candidates.len() {
+                        candidates.select_nth_unstable_by(actual_k - 1, order);
+                    }
+                    candidates[..actual_k].sort_unstable_by(order);
                     for ki in 0..actual_k {
                         dist_row[ki] = candidates[ki].0.max(0.0);
                         knn_row[ki] = candidates[ki].1;

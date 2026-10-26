@@ -294,3 +294,45 @@ fn assign_rejects_mismatched_dimensionality() {
     let centroids = Matrix::from_slice(&[0.0], 1);
     let _ = assign(vectors, centroids);
 }
+
+#[test]
+fn batched_top_k_matches_brute_force_across_centroid_tiles() {
+    let n_centroids = 2051;
+    let mut centroids: Vec<f32> = (0..n_centroids)
+        .flat_map(|i| [i as f32 + 10.0, 0.0])
+        .collect();
+    centroids[(n_centroids - 2) * 2..].fill(0.0);
+    let vectors = [1.0, 0.0, 2059.0, 0.0];
+    let nx = superkmeans::utils::squared_norms(&vectors, 2, 2);
+    let ny = superkmeans::utils::squared_norms(&centroids, n_centroids, 2);
+    for k in [1, 2, 5] {
+        let mut ids = vec![0; 2 * k];
+        let mut distances = vec![0.0; 2 * k];
+        superkmeans::batch::find_k_nearest_neighbors(
+            &vectors,
+            &centroids,
+            2,
+            n_centroids,
+            2,
+            &nx,
+            &ny,
+            k,
+            &mut ids,
+            &mut distances,
+        );
+        for (row, query) in vectors.chunks_exact(2).enumerate() {
+            let mut oracle: Vec<_> = centroids
+                .chunks_exact(2)
+                .enumerate()
+                .map(|(id, center)| (l2_sq(query, center), id as u32))
+                .collect();
+            oracle.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            for rank in 0..k {
+                assert_eq!(
+                    (distances[row * k + rank], ids[row * k + rank]),
+                    oracle[rank]
+                );
+            }
+        }
+    }
+}
