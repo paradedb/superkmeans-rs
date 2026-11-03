@@ -1,7 +1,9 @@
 //! ADSampling-style random rotation + per-dimension pruning thresholds.
 //!
 //! The original C++ uses Eigen's HouseholderQR. We re-implement Householder QR
-//! directly in pure Rust (it runs once at construction).
+//! directly in pure Rust (it runs once, on the first rotation).
+
+use std::sync::OnceLock;
 
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -15,20 +17,26 @@ pub struct ADSamplingPruner {
     pub ratios: Vec<f32>,
     pub epsilon0: f32,
     /// Random orthonormal d × d rotation matrix, row-major.
-    matrix: Vec<f32>,
+    matrix: OnceLock<Vec<f32>>,
+    seed: u64,
 }
 
 impl ADSamplingPruner {
     pub fn new(num_dimensions: usize, epsilon0: f32, seed: u64) -> Self {
-        let matrix = random_orthonormal_matrix(num_dimensions, seed);
         let mut me = Self {
             num_dimensions,
             ratios: Vec::new(),
             epsilon0,
-            matrix,
+            matrix: OnceLock::new(),
+            seed,
         };
         me.initialize_ratios();
         me
+    }
+
+    fn matrix(&self) -> &[f32] {
+        self.matrix
+            .get_or_init(|| random_orthonormal_matrix(self.num_dimensions, self.seed))
     }
 
     pub fn set_epsilon0(&mut self, eps0: f32) {
@@ -56,7 +64,7 @@ impl ADSamplingPruner {
         let d = self.num_dimensions;
         debug_assert!(vectors.len() >= n * d);
         debug_assert!(out.len() >= n * d);
-        gemm::sgemm_ld(false, true, n, d, d, vectors, d, &self.matrix, d, out, d);
+        gemm::sgemm_ld(false, true, n, d, d, vectors, d, self.matrix(), d, out, d);
     }
 
     /// In-place `rotate`: rewrites `data` block-by-block through a bounded
@@ -80,7 +88,7 @@ impl ADSamplingPruner {
                 d,
                 chunk,
                 d,
-                &self.matrix,
+                self.matrix(),
                 d,
                 &mut scratch[..rows * d],
                 d,
@@ -92,7 +100,7 @@ impl ADSamplingPruner {
     /// out = rotated * matrix   (inverse of `rotate` for orthonormal matrix).
     pub fn unrotate(&self, rotated: &[f32], out: &mut [f32], n: usize) {
         let d = self.num_dimensions;
-        gemm::sgemm_row_major(n, d, d, rotated, &self.matrix, out);
+        gemm::sgemm_row_major(n, d, d, rotated, self.matrix(), out);
     }
 }
 
@@ -189,6 +197,94 @@ fn random_orthonormal_matrix(d: usize, seed: u64) -> Vec<f32> {
 mod tests {
     use super::*;
     use crate::utils::generate_random_vectors;
+    use crate::{
+        HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, SuperKMeans, SuperKMeansConfig,
+    };
+
+    #[test]
+    fn rotation_initializes_on_first_use() {
+        let (n, d, seed) = (4, 16, 42);
+        let input = generate_random_vectors(n, d, -1.0, 1.0, 7);
+        for operation in 0..3 {
+            let mut lazy = ADSamplingPruner::new(d, 2.1, seed);
+            lazy.set_epsilon0(1.5);
+            assert_eq!(
+                lazy.pruning_threshold(&KnnCandidate::new(0, 4.0), 8),
+                4.0 * lazy.ratios[8]
+            );
+            assert!(lazy.matrix.get().is_none());
+
+            let eager = ADSamplingPruner::new(d, 1.5, seed);
+            eager
+                .matrix
+                .set(random_orthonormal_matrix(d, seed))
+                .unwrap();
+            let transform = |pruner: &ADSamplingPruner| {
+                let mut output = input.clone();
+                match operation {
+                    0 => pruner.rotate(&input, &mut output, n),
+                    1 => pruner.unrotate(&input, &mut output, n),
+                    _ => pruner.rotate_in_place(&mut output, n),
+                }
+                output
+            };
+            assert_eq!(transform(&lazy), transform(&eager));
+            let matrix = lazy.matrix.get().unwrap().as_ptr();
+            assert_eq!(transform(&lazy), transform(&eager));
+            assert_eq!(lazy.matrix.get().unwrap().as_ptr(), matrix);
+        }
+    }
+
+    #[test]
+    fn training_preserves_results_with_lazy_rotation() {
+        let (n, d, k) = (128, 16, 8);
+        let data = generate_random_vectors(n, d, -1.0, 1.0, 7);
+        for data_already_rotated in [false, true] {
+            for angular in [false, true] {
+                let config = SuperKMeansConfig {
+                    n_threads: 1,
+                    iters: 3,
+                    angular,
+                    use_blas_only: true,
+                    data_already_rotated,
+                    suppress_warnings: true,
+                    ..Default::default()
+                };
+                let mut lazy = SuperKMeans::with_config(k, d, config.clone());
+                let mut eager = SuperKMeans::with_config(k, d, config.clone());
+                eager.pruner.matrix();
+                assert!(lazy.pruner.matrix.get().is_none());
+                let centroids = lazy.train_owned(data.clone(), n);
+                assert_eq!(centroids, eager.train_owned(data.clone(), n));
+                assert_eq!(
+                    lazy.assign(&data, &centroids, n),
+                    eager.assign(&data, &centroids, n)
+                );
+                assert_eq!(lazy.pruner.matrix.get().is_some(), !data_already_rotated);
+
+                let config = HierarchicalSuperKMeansConfig {
+                    base: config,
+                    max_leaf_size: n / k,
+                    iters_meso: 3,
+                    iters_fine: 3,
+                };
+                let mut lazy = HierarchicalSuperKMeans::with_config(d, config.clone());
+                let mut eager = HierarchicalSuperKMeans::with_config(d, config);
+                eager.base.pruner.matrix();
+                assert!(lazy.base.pruner.matrix.get().is_none());
+                let centroids = lazy.train_owned(data.clone(), n);
+                assert_eq!(centroids, eager.train_owned(data.clone(), n));
+                assert_eq!(
+                    lazy.assign(&data, &centroids, n),
+                    eager.assign(&data, &centroids, n)
+                );
+                assert_eq!(
+                    lazy.base.pruner.matrix.get().is_some(),
+                    !data_already_rotated
+                );
+            }
+        }
+    }
 
     fn norm(v: &[f32]) -> f32 {
         v.iter().map(|x| x * x).sum::<f32>().sqrt()
@@ -221,11 +317,12 @@ mod tests {
     fn rotation_matrix_is_orthonormal() {
         let d = 16;
         let pruner = ADSamplingPruner::new(d, 1.5, 42);
+        let matrix = pruner.matrix();
         for r in 0..d {
             for c in 0..d {
                 let mut s = 0.0_f32;
                 for k in 0..d {
-                    s += pruner.matrix[r * d + k] * pruner.matrix[c * d + k];
+                    s += matrix[r * d + k] * matrix[c * d + k];
                 }
                 let expected = if r == c { 1.0 } else { 0.0 };
                 assert!(
