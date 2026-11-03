@@ -1321,9 +1321,7 @@ mod tests {
         }
     }
 
-    /// Building an `ADSamplingPruner` is an O(d³) Householder QR, so every
-    /// model created during training must adopt the shared rotation matrix
-    /// rather than computing its own.
+    /// Models share the pruner so its first-use Householder QR runs only once.
     #[test]
     fn training_reuses_one_rotation_matrix() {
         let mut cfg = config(16);

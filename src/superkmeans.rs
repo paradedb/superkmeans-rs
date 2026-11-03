@@ -106,8 +106,7 @@ pub struct SuperKMeans {
     pub config: SuperKMeansConfig,
     pub n_threads: usize,
 
-    /// Shared because building one runs an O(d³) Householder QR; callers that
-    /// need many instances at the same `d` reuse a single rotation matrix.
+    /// Shared so models at the same `d` reuse a single lazily initialized rotation matrix.
     pub pruner: Arc<ADSamplingPruner>,
 
     // Row-major centroids (this iteration & previous iteration).
@@ -202,11 +201,10 @@ impl SuperKMeans {
         Self::with_shared_pruner(n_clusters, dimensionality, config, pruner)
     }
 
-    /// Like [`Self::with_config`], but adopts an existing rotation matrix.
+    /// Like [`Self::with_config`], but shares a pruner and its lazy rotation matrix.
     ///
-    /// [`ADSamplingPruner::new`] runs an O(d³) Householder QR, which dominates
-    /// construction at large `d`. Callers that build many instances for the
-    /// same dimensionality should build the pruner once and share it.
+    /// The first rotation runs an O(d³) Householder QR. Sharing the pruner avoids
+    /// repeating that work across models with the same dimensionality.
     pub fn with_shared_pruner(
         n_clusters: usize,
         dimensionality: usize,
