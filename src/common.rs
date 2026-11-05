@@ -12,13 +12,13 @@ pub const N_CLUSTERS_THRESHOLD_FOR_PRUNING: usize = 256;
 pub const X_BATCH_SIZE: usize = 40960;
 #[cfg(target_os = "macos")]
 pub const Y_BATCH_SIZE: usize = 2048;
-#[cfg(target_os = "macos")]
-pub const MINI_BATCH_SIZE: usize = 256;
 
 #[cfg(not(target_os = "macos"))]
 pub const X_BATCH_SIZE: usize = 4096;
 #[cfg(not(target_os = "macos"))]
 pub const Y_BATCH_SIZE: usize = 1024;
+
+pub const MINI_BATCH_SIZE: usize = 256;
 
 pub const VECTOR_CHUNK_SIZE: usize = Y_BATCH_SIZE;
 

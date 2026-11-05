@@ -30,6 +30,25 @@ mod blas_backend {
             ldc: i32,
         );
     }
+
+    #[cfg(feature = "openblas")]
+    unsafe extern "C" {
+        fn openblas_set_num_threads(num_threads: i32);
+    }
+
+    /// Keep OpenBLAS single-threaded so its internal pthread pool never
+    /// competes with Rayon (or host worker processes) via spin barriers.
+    /// See: <https://github.com/OpenMathLib/OpenBLAS/wiki/Faq/a15b786986841d2e4e4e84e3f2ecff9c3b263b32#how-can-i-use-openblas-in-multi-threaded-applications>
+    #[inline]
+    pub fn ensure_single_threaded() {
+        #[cfg(feature = "openblas")]
+        {
+            static INIT: std::sync::Once = std::sync::Once::new();
+            INIT.call_once(|| unsafe {
+                openblas_set_num_threads(1);
+            });
+        }
+    }
 }
 
 /// General SGEMM: `c = op(a) * op(b)`, row-major, with explicit leading
@@ -53,6 +72,7 @@ pub fn sgemm_ld(
 ) {
     #[cfg(feature = "blas")]
     unsafe {
+        blas_backend::ensure_single_threaded();
         blas_backend::cblas_sgemm(
             101,
             if trans_a { 112 } else { 111 },

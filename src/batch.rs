@@ -3,11 +3,7 @@
 use rayon::prelude::*;
 
 use crate::adsampling::ADSamplingPruner;
-use crate::common::{X_BATCH_SIZE, Y_BATCH_SIZE};
-// MINI_BATCH_SIZE only exists (and is only used) on macOS, where the partial
-// GEMM is mini-batched across threads for the AMX units.
-#[cfg(target_os = "macos")]
-use crate::common::MINI_BATCH_SIZE;
+use crate::common::{MINI_BATCH_SIZE, X_BATCH_SIZE, Y_BATCH_SIZE};
 use crate::distance::l2_squared;
 use crate::pdxearch::top1_partial_search;
 
@@ -41,11 +37,8 @@ fn blas_dot_products(
         );
     };
 
-    // On Apple Silicon each thread drives its own AMX unit, so dispatching the
-    // (thin-K) partial GEMM as mini-batches across threads beats one big
-    // `cblas_sgemm` — matching the C++ pruning kernel's Apple strategy. On other
-    // targets a single BLAS call (internally threaded) is best.
-    #[cfg(target_os = "macos")]
+    // Dispatch mini-batches across Rayon threads and keep each `sgemm_ld` call
+    // single-threaded so BLAS and Rayon never run competing thread pools.
     out.par_chunks_mut(MINI_BATCH_SIZE * batch_n_y)
         .enumerate()
         .for_each(|(mb, chunk)| {
@@ -53,9 +46,6 @@ fn blas_dot_products(
             let rows = MINI_BATCH_SIZE.min(batch_n_x - r);
             gemm(rows, &x_batch[r * d..(r + rows) * d], chunk);
         });
-
-    #[cfg(not(target_os = "macos"))]
-    gemm(batch_n_x, x_batch, out);
 }
 
 /// Grow `buf` so one SGEMM batch (up to `X_BATCH_SIZE × Y_BATCH_SIZE`, clamped
