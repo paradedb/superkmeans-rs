@@ -24,7 +24,7 @@ accelerate = ["blas"]    # Apple Accelerate (macOS, AMX)
 openblas = ["blas"]      # OpenBLAS (Linux/Windows/macOS); linked via build.rs
 
 [dependencies]
-matrixmultiply = { version = "0.3", features = ["threading"] }
+matrixmultiply = "0.3"
 rayon = "1.10"
 rand = "0.8"
 rand_chacha = "0.3"
