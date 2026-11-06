@@ -284,6 +284,18 @@ impl HierarchicalSuperKMeans {
         self.base.assign(vectors, centroids, n_vectors)
     }
 
+    /// Assign each of `n_vectors` vectors to its nearest centroid and to a SOAR secondary,
+    /// as [`SuperKMeans::assign_soar`].
+    pub fn assign_soar(
+        &self,
+        vectors: &[f32],
+        centroids: &[f32],
+        n_vectors: usize,
+        lambda: f32,
+    ) -> (Vec<u32>, Vec<u32>) {
+        self.base.assign_soar(vectors, centroids, n_vectors, lambda)
+    }
+
     /// Streaming meso step: cluster the `n` rows `data` scans into
     /// \(\lceil\sqrt{K}\rceil\) meso clusters without holding them in memory,
     /// and group their scan positions by meso cluster.
