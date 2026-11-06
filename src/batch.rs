@@ -7,7 +7,8 @@ use crate::common::{MINI_BATCH_SIZE, X_BATCH_SIZE, Y_BATCH_SIZE};
 use crate::distance::l2_squared;
 use crate::pdxearch::top1_partial_search;
 
-/// Compute `out[i, j] = dot(x[i, :effective_d], y[j, :effective_d])`.
+/// Compute `out[i * ldc + j] = dot(x[i, :effective_d], y[j, :effective_d])`; `ldc` is the
+/// row stride of `out`, at least `batch_n_y`.
 fn blas_dot_products(
     x_batch: &[f32], // batch_n_x × d row-major
     y_batch: &[f32], // batch_n_y × d row-major
@@ -15,11 +16,13 @@ fn blas_dot_products(
     batch_n_y: usize,
     d: usize,
     effective_d: usize,
-    out: &mut [f32], // batch_n_x × batch_n_y row-major
+    out: &mut [f32], // batch_n_x rows of batch_n_y values, ldc apart
+    ldc: usize,
 ) {
     debug_assert!(x_batch.len() >= batch_n_x * d);
     debug_assert!(y_batch.len() >= batch_n_y * d);
-    debug_assert!(out.len() >= batch_n_x * batch_n_y);
+    debug_assert!(ldc >= batch_n_y);
+    debug_assert!(out.len() >= (batch_n_x - 1) * ldc + batch_n_y);
     // out = x[:, :effective_d] * y[:, :effective_d]^T ; both rows are d-wide.
     let gemm = |rows: usize, x: &[f32], c: &mut [f32]| {
         crate::gemm::sgemm_ld(
@@ -33,19 +36,207 @@ fn blas_dot_products(
             y_batch,
             d,
             c,
-            batch_n_y,
+            ldc,
         );
     };
 
-    // Dispatch mini-batches across Rayon threads and keep each `sgemm_ld` call
-    // single-threaded so BLAS and Rayon never run competing thread pools.
-    out.par_chunks_mut(MINI_BATCH_SIZE * batch_n_y)
+    // Keep Rayon parallelism and the strided output used by SOAR tiles.
+    out.par_chunks_mut(MINI_BATCH_SIZE * ldc)
         .enumerate()
         .for_each(|(mb, chunk)| {
             let r = mb * MINI_BATCH_SIZE;
             let rows = MINI_BATCH_SIZE.min(batch_n_x - r);
             gemm(rows, &x_batch[r * d..(r + rows) * d], chunk);
         });
+}
+
+/// Bytes of distances one x-tile of the SOAR assignment keeps: `tile × n_y` f32.
+const SOAR_TILE_BYTES: usize = 64 << 20;
+
+/// Rows per x-tile of the SOAR assignment: the x batch, capped so the kept distances stay
+/// within [`SOAR_TILE_BYTES`].
+fn soar_tile_rows(n_x: usize, n_y: usize) -> usize {
+    (SOAR_TILE_BYTES / (4 * n_y.max(1)))
+        .clamp(1, X_BATCH_SIZE)
+        .min(n_x.max(1))
+}
+
+/// Primary and SOAR secondary centroid per vector, from two SGEMM passes.
+///
+/// Pass 1 computes every distance `D[r][c] = ‖x‖² + ‖c‖² − 2⟨x_r, c⟩` of an x-tile and keeps
+/// it; the primary `c1` is its argmin, chosen exactly as [`find_nearest_neighbor`] chooses it.
+/// With `r̂1 = (x − C[c1]) / ‖x − C[c1]‖` (zero when the vector sits on its centroid, which
+/// reduces the choice to the second nearest) and `a = ⟨x, r̂1⟩`, pass 2 computes
+/// `P[r][c] = ⟨r̂1, c⟩` and the secondary minimizes `D[r][c] + lambda · (a − P[r][c])²` over
+/// `c ≠ c1`. With a single centroid the secondary is `u32::MAX`. `buf` is caller-owned scratch,
+/// grown as needed and reused across calls.
+pub fn find_soar_assignments(
+    x: &[f32],
+    y: &[f32],
+    n_x: usize,
+    n_y: usize,
+    d: usize,
+    norms_x: &[f32],
+    norms_y: &[f32],
+    lambda: f32,
+    out_primary: &mut [u32],
+    out_secondary: &mut [u32],
+    buf: &mut Vec<f32>,
+) {
+    debug_assert!(x.len() >= n_x * d);
+    debug_assert!(y.len() >= n_y * d);
+    debug_assert!(norms_x.len() >= n_x && norms_y.len() >= n_y);
+    for v in out_primary.iter_mut().take(n_x) {
+        *v = 0;
+    }
+    for v in out_secondary.iter_mut().take(n_x) {
+        *v = u32::MAX;
+    }
+    if n_x == 0 || n_y == 0 {
+        return;
+    }
+
+    let tile = soar_tile_rows(n_x, n_y);
+    let y_tile = Y_BATCH_SIZE.min(n_y);
+    // Buffer layout: distances (tile × n_y), unit residuals (tile × d), residual products
+    // (tile × y_tile), then per row the best distance, the projection and the best cost.
+    let (dist_len, res_len, prod_len) = (tile * n_y, tile * d, tile * y_tile);
+    let required = dist_len + res_len + prod_len + 3 * tile;
+    if buf.len() < required {
+        buf.resize(required, 0.0);
+    }
+    let (dist, rest) = buf.split_at_mut(dist_len);
+    let (residuals, rest) = rest.split_at_mut(res_len);
+    let (prod, rest) = rest.split_at_mut(prod_len);
+    let (best_dist, rest) = rest.split_at_mut(tile);
+    let (along, rest) = rest.split_at_mut(tile);
+    let (best_cost, _) = rest.split_at_mut(tile);
+
+    let mut i = 0;
+    while i < n_x {
+        let t = tile.min(n_x - i);
+        let x_tile = &x[i * d..(i + t) * d];
+        let primary = &mut out_primary[i..i + t];
+        let secondary = &mut out_secondary[i..i + t];
+        best_dist[..t].fill(f32::MAX);
+
+        // Pass 1: every distance, kept; the primary as `find_nearest_neighbor` picks it.
+        let mut j = 0;
+        while j < n_y {
+            let batch_n_y = Y_BATCH_SIZE.min(n_y - j);
+            blas_dot_products(
+                x_tile,
+                &y[j * d..(j + batch_n_y) * d],
+                t,
+                batch_n_y,
+                d,
+                d,
+                &mut dist[j..t * n_y],
+                n_y,
+            );
+            dist[..t * n_y]
+                .par_chunks_mut(n_y)
+                .zip(best_dist[..t].par_iter_mut())
+                .zip(primary.par_iter_mut())
+                .enumerate()
+                .for_each(|(r, ((row, best), idx))| {
+                    let norm_x = norms_x[i + r];
+                    let mut min_v = f32::MAX;
+                    let mut min_c: u32 = 0;
+                    for c in 0..batch_n_y {
+                        let v = -2.0 * row[j + c] + norm_x + norms_y[j + c];
+                        row[j + c] = v;
+                        if v < min_v {
+                            min_v = v;
+                            min_c = c as u32;
+                        }
+                    }
+                    if min_v < *best {
+                        *best = min_v.max(0.0);
+                        *idx = j as u32 + min_c;
+                    }
+                });
+            j += batch_n_y;
+        }
+        if n_y == 1 {
+            i += t;
+            continue;
+        }
+
+        // Unit residuals to the primary, and each vector's projection on its own.
+        let chosen: &[u32] = primary;
+        residuals[..t * d]
+            .par_chunks_mut(d)
+            .zip(along[..t].par_iter_mut())
+            .enumerate()
+            .for_each(|(r, (residual, a))| {
+                let xr = &x_tile[r * d..(r + 1) * d];
+                let centroid = &y[chosen[r] as usize * d..][..d];
+                let mut norm = 0.0_f32;
+                for k in 0..d {
+                    let v = xr[k] - centroid[k];
+                    residual[k] = v;
+                    norm += v * v;
+                }
+                let norm = norm.sqrt();
+                if norm > 0.0 && norm.is_finite() {
+                    let inv = 1.0 / norm;
+                    for v in residual.iter_mut() {
+                        *v *= inv;
+                    }
+                } else {
+                    residual.fill(0.0);
+                }
+                *a = xr.iter().zip(residual.iter()).map(|(p, q)| p * q).sum();
+            });
+
+        // Pass 2: residual products; the secondary minimizes the SOAR objective off the primary.
+        best_cost[..t].fill(f32::MAX);
+        let mut j = 0;
+        while j < n_y {
+            let batch_n_y = Y_BATCH_SIZE.min(n_y - j);
+            blas_dot_products(
+                &residuals[..t * d],
+                &y[j * d..(j + batch_n_y) * d],
+                t,
+                batch_n_y,
+                d,
+                d,
+                &mut prod[..t * batch_n_y],
+                batch_n_y,
+            );
+            prod[..t * batch_n_y]
+                .par_chunks(batch_n_y)
+                .zip(dist[..t * n_y].par_chunks(n_y))
+                .zip(best_cost[..t].par_iter_mut())
+                .zip(secondary.par_iter_mut())
+                .enumerate()
+                .for_each(|(r, (((projections, row), best), idx))| {
+                    let c1 = chosen[r];
+                    let a = along[r];
+                    let mut min_v = f32::MAX;
+                    let mut min_c = u32::MAX;
+                    for c in 0..batch_n_y {
+                        let centroid = (j + c) as u32;
+                        if centroid == c1 {
+                            continue;
+                        }
+                        let gap = a - projections[c];
+                        let v = row[j + c] + lambda * gap * gap;
+                        if v < min_v {
+                            min_v = v;
+                            min_c = centroid;
+                        }
+                    }
+                    if min_v < *best {
+                        *best = min_v;
+                        *idx = min_c;
+                    }
+                });
+            j += batch_n_y;
+        }
+        i += t;
+    }
 }
 
 /// Grow `buf` so one SGEMM batch (up to `X_BATCH_SIZE × Y_BATCH_SIZE`, clamped
@@ -99,6 +290,7 @@ pub fn find_nearest_neighbor(
                 d,
                 d,
                 &mut buf[..batch_n_x * batch_n_y],
+                batch_n_y,
             );
 
             let dist_window = &mut out_distances[i..i + batch_n_x];
@@ -176,6 +368,7 @@ pub fn find_k_nearest_neighbors(
                 d,
                 d,
                 &mut buf[..batch_n_x * batch_n_y],
+                batch_n_y,
             );
 
             // Per row: convert dot to L2 then merge into the current top-k for that query.
@@ -270,6 +463,7 @@ pub fn find_nearest_neighbor_with_pruning(
                 d,
                 partial_d,
                 &mut buf[..batch_n_x * batch_n_y],
+                batch_n_y,
             );
 
             let i_base = i;

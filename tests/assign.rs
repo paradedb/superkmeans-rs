@@ -5,8 +5,10 @@
 
 use std::collections::HashSet;
 
+use superkmeans::batch::{find_nearest_neighbor, find_soar_assignments};
 use superkmeans::{
-    Matrix, SuperKMeans, SuperKMeansConfig, assign, generate_random_vectors, make_blobs,
+    Matrix, SuperKMeans, SuperKMeansConfig, assign, assign_soar, generate_random_vectors,
+    make_blobs, squared_norms,
 };
 
 fn find_nearest_centroid_brute_force(
@@ -293,4 +295,255 @@ fn assign_rejects_mismatched_dimensionality() {
     let vectors = Matrix::from_slice(&[0.0, 0.0], 2);
     let centroids = Matrix::from_slice(&[0.0], 1);
     let _ = assign(vectors, centroids);
+}
+
+// --- SOAR secondaries ---
+
+/// The SOAR pair by brute force: the nearest centroid, then the argmin of
+/// `‖x − c‖² + lambda · ⟨x − c, r̂1⟩²` over the other centroids, `r̂1` the unit residual to
+/// the nearest (zero on the centroid itself). `u32::MAX` with one centroid.
+fn soar_brute_force(
+    point: &[f32],
+    centroids: &[f32],
+    k: usize,
+    d: usize,
+    lambda: f32,
+) -> (u32, u32) {
+    let primary = find_nearest_centroid_brute_force(point, centroids, k, d);
+    if k == 1 {
+        return (primary, u32::MAX);
+    }
+    let nearest = &centroids[primary as usize * d..(primary as usize + 1) * d];
+    let mut residual: Vec<f32> = point.iter().zip(nearest).map(|(a, b)| a - b).collect();
+    let norm = residual.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for v in &mut residual {
+            *v /= norm;
+        }
+    } else {
+        residual.fill(0.0);
+    }
+    let along: f32 = point.iter().zip(&residual).map(|(a, b)| a * b).sum();
+    let mut best = (f32::MAX, u32::MAX);
+    for c in 0..k {
+        if c as u32 == primary {
+            continue;
+        }
+        let row = &centroids[c * d..(c + 1) * d];
+        let projection: f32 = residual.iter().zip(row).map(|(a, b)| a * b).sum();
+        let gap = along - projection;
+        let cost = l2_sq(point, row) + lambda * gap * gap;
+        if cost < best.0 {
+            best = (cost, c as u32);
+        }
+    }
+    (primary, best.1)
+}
+
+/// The SOAR objective of `c` for `point` whose nearest centroid is `primary`.
+fn soar_cost(point: &[f32], centroids: &[f32], d: usize, primary: u32, c: u32, lambda: f32) -> f32 {
+    let nearest = &centroids[primary as usize * d..(primary as usize + 1) * d];
+    let mut residual: Vec<f32> = point.iter().zip(nearest).map(|(a, b)| a - b).collect();
+    let norm = residual.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for v in &mut residual {
+            *v /= norm;
+        }
+    } else {
+        residual.fill(0.0);
+    }
+    let row = &centroids[c as usize * d..(c as usize + 1) * d];
+    let gap: f32 = residual
+        .iter()
+        .zip(point.iter().zip(row))
+        .map(|(r, (a, b))| r * (a - b))
+        .sum();
+    l2_sq(point, row) + lambda * gap * gap
+}
+
+/// Every secondary is off its primary and within rounding of the brute-force optimum, which may
+/// differ in index on near ties between the GEMM and the direct distance.
+fn assert_soar_optimal(
+    data: &[f32],
+    centroids: &[f32],
+    n: usize,
+    k: usize,
+    d: usize,
+    lambda: f32,
+    primary: &[u32],
+    secondary: &[u32],
+) {
+    assert_eq!(primary.len(), n);
+    assert_eq!(secondary.len(), n);
+    for i in 0..n {
+        let point = &data[i * d..(i + 1) * d];
+        let (expected_primary, expected_secondary) =
+            soar_brute_force(point, centroids, k, d, lambda);
+        assert_eq!(primary[i], expected_primary, "row {i}: primary");
+        assert_ne!(
+            secondary[i], primary[i],
+            "row {i}: secondary equals primary"
+        );
+        assert!(
+            (secondary[i] as usize) < k,
+            "row {i}: secondary {} out of range",
+            secondary[i]
+        );
+        let got = soar_cost(point, centroids, d, primary[i], secondary[i], lambda);
+        let best = soar_cost(point, centroids, d, primary[i], expected_secondary, lambda);
+        assert!(
+            got <= best * (1.0 + 1e-4) + 1e-4,
+            "row {i}: secondary {} costs {got}, brute force {} costs {best}",
+            secondary[i],
+            expected_secondary
+        );
+    }
+}
+
+#[test]
+fn soar_primaries_equal_find_nearest_neighbor() {
+    let (n, d, k) = (5_000, 32, 300);
+    let data = generate_random_vectors(n, d, -1.0, 1.0, 7);
+    let centroids = generate_random_vectors(k, d, -1.0, 1.0, 11);
+    let norms_x = squared_norms(&data, n, d);
+    let norms_y = squared_norms(&centroids, k, d);
+    let mut nearest = vec![0_u32; n];
+    let mut distances = vec![0.0_f32; n];
+    let mut buf = Vec::new();
+    find_nearest_neighbor(
+        &data,
+        &centroids,
+        n,
+        k,
+        d,
+        &norms_x,
+        &norms_y,
+        &mut nearest,
+        &mut distances,
+        &mut buf,
+    );
+    let mut primary = vec![0_u32; n];
+    let mut secondary = vec![0_u32; n];
+    find_soar_assignments(
+        &data,
+        &centroids,
+        n,
+        k,
+        d,
+        &norms_x,
+        &norms_y,
+        2.0,
+        &mut primary,
+        &mut secondary,
+        &mut buf,
+    );
+    assert_eq!(primary, nearest);
+}
+
+#[test]
+fn soar_secondaries_minimize_the_objective() {
+    let (n, d, k) = (3_000, 24, 200);
+    let data = make_blobs(n, d, k, false, 1.0, 10.0, 5);
+    let centroids = generate_random_vectors(k, d, -10.0, 10.0, 9);
+    let kmeans = SuperKMeans::new(k, d);
+    for lambda in [0.0_f32, 2.0] {
+        let (primary, secondary) = kmeans.assign_soar(&data, &centroids, n, lambda);
+        assert_soar_optimal(&data, &centroids, n, k, d, lambda, &primary, &secondary);
+        let (free_primary, free_secondary) = assign_soar(
+            Matrix::new(&data, n, d),
+            Matrix::from_slice(&centroids, d),
+            lambda,
+        );
+        assert_eq!(free_primary, primary);
+        assert_eq!(free_secondary, secondary);
+    }
+}
+
+#[test]
+fn soar_with_lambda_zero_picks_the_second_nearest() {
+    let (n, d, k) = (2_000, 16, 150);
+    let data = generate_random_vectors(n, d, -1.0, 1.0, 21);
+    let centroids = generate_random_vectors(k, d, -1.0, 1.0, 23);
+    let (primary, secondary) = assign_soar(
+        Matrix::new(&data, n, d),
+        Matrix::from_slice(&centroids, d),
+        0.0,
+    );
+    for i in 0..n {
+        let point = &data[i * d..(i + 1) * d];
+        let mut distances: Vec<(f32, u32)> = (0..k)
+            .map(|c| (l2_sq(point, &centroids[c * d..(c + 1) * d]), c as u32))
+            .collect();
+        distances.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        assert_eq!(primary[i], distances[0].1, "row {i}: primary");
+        assert_ne!(secondary[i], primary[i], "row {i}");
+        let got = l2_sq(
+            point,
+            &centroids[secondary[i] as usize * d..(secondary[i] as usize + 1) * d],
+        );
+        assert!(
+            got <= distances[1].0 * (1.0 + 1e-5) + 1e-5,
+            "row {i}: secondary {} at {got}, second nearest {} at {}",
+            secondary[i],
+            distances[1].1,
+            distances[1].0
+        );
+    }
+}
+
+#[test]
+fn soar_with_one_centroid_has_no_secondary() {
+    let (n, d) = (500, 12);
+    let data = generate_random_vectors(n, d, -1.0, 1.0, 31);
+    let centroid = generate_random_vectors(1, d, -1.0, 1.0, 37);
+    let (primary, secondary) = assign_soar(
+        Matrix::new(&data, n, d),
+        Matrix::from_slice(&centroid, d),
+        2.0,
+    );
+    assert!(primary.iter().all(|&c| c == 0));
+    assert!(secondary.iter().all(|&c| c == u32::MAX));
+}
+
+#[test]
+fn soar_crosses_tile_boundaries() {
+    // 2,100 centroids exceed one y-tile on every target, and the kept distances cap the x-tile at
+    // 64 MiB / (4 · 2,100) = 7,990 rows, so 9,000 vectors take two x-tiles.
+    let (n, d, k) = (9_000, 8, 2_100);
+    let data = generate_random_vectors(n, d, -1.0, 1.0, 41);
+    let centroids = generate_random_vectors(k, d, -1.0, 1.0, 43);
+    let norms_x = squared_norms(&data, n, d);
+    let norms_y = squared_norms(&centroids, k, d);
+    let mut nearest = vec![0_u32; n];
+    let mut distances = vec![0.0_f32; n];
+    let mut buf = Vec::new();
+    find_nearest_neighbor(
+        &data,
+        &centroids,
+        n,
+        k,
+        d,
+        &norms_x,
+        &norms_y,
+        &mut nearest,
+        &mut distances,
+        &mut buf,
+    );
+    let mut primary = vec![0_u32; n];
+    let mut secondary = vec![0_u32; n];
+    find_soar_assignments(
+        &data,
+        &centroids,
+        n,
+        k,
+        d,
+        &norms_x,
+        &norms_y,
+        2.0,
+        &mut primary,
+        &mut secondary,
+        &mut buf,
+    );
+    assert_eq!(primary, nearest);
+    assert_soar_optimal(&data, &centroids, n, k, d, 2.0, &primary, &secondary);
 }
