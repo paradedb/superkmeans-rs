@@ -548,3 +548,40 @@ fn soar_crosses_tile_boundaries() {
     assert_eq!(primary, nearest);
     assert_soar_optimal(&data, &centroids, n, k, d, 2.0, &primary, &secondary);
 }
+
+#[test]
+fn soar_large_centroid_set_is_deterministic_across_threads() {
+    let (n, d, k) = (521, 8, 39_801);
+    let data = generate_random_vectors(n, d, -1.0, 1.0, 59);
+    let centroids = generate_random_vectors(k, d, -1.0, 1.0, 61);
+    let vectors = Matrix::new(&data, n, d);
+    let centers = Matrix::new(&centroids, k, d);
+    let mut expected = None;
+    for threads in [1, 2, 8] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        let pair = pool.install(|| assign_soar(vectors, centers, 2.0));
+        if let Some(expected) = &expected {
+            assert_eq!(&pair, expected);
+        } else {
+            assert_soar_optimal(&data, &centroids, n, k, d, 2.0, &pair.0, &pair.1);
+            expected = Some(pair);
+        }
+    }
+}
+
+#[test]
+fn soar_ties_across_centroid_tiles_keep_the_first_centroid() {
+    let k = superkmeans::common::Y_BATCH_SIZE + 3;
+    let centroids = vec![0.0; k * 4];
+    let data = vec![1.0; 257 * 4];
+    let (primary, secondary) = assign_soar(
+        Matrix::from_slice(&data, 4),
+        Matrix::from_slice(&centroids, 4),
+        2.0,
+    );
+    assert!(primary.iter().all(|&c| c == 0));
+    assert!(secondary.iter().all(|&c| c == 1));
+}
