@@ -84,13 +84,50 @@ pub fn find_soar_assignments(
     out_secondary: &mut [u32],
     buf: &mut Vec<f32>,
 ) {
+    find_soar_replica_assignments(
+        x,
+        y,
+        n_x,
+        n_y,
+        d,
+        norms_x,
+        norms_y,
+        lambda,
+        2,
+        out_primary,
+        out_secondary,
+        buf,
+    );
+}
+
+/// SOAR assignments with a cumulative alignment penalty from all preceding residuals.
+/// Secondary assignments are row-major, with `replicas - 1` slots per vector;
+/// unavailable centroids are `u32::MAX`.
+pub fn find_soar_replica_assignments(
+    x: &[f32],
+    y: &[f32],
+    n_x: usize,
+    n_y: usize,
+    d: usize,
+    norms_x: &[f32],
+    norms_y: &[f32],
+    lambda: f32,
+    replicas: usize,
+    out_primary: &mut [u32],
+    out_secondary: &mut [u32],
+    buf: &mut Vec<f32>,
+) {
+    assert!(replicas > 0);
+    let secondaries = replicas - 1;
+    assert!(out_primary.len() >= n_x);
+    assert!(out_secondary.len() >= n_x * secondaries);
     debug_assert!(x.len() >= n_x * d);
     debug_assert!(y.len() >= n_y * d);
     debug_assert!(norms_x.len() >= n_x && norms_y.len() >= n_y);
     for v in out_primary.iter_mut().take(n_x) {
         *v = 0;
     }
-    for v in out_secondary.iter_mut().take(n_x) {
+    for v in out_secondary.iter_mut().take(n_x * secondaries) {
         *v = u32::MAX;
     }
     if n_x == 0 || n_y == 0 {
@@ -117,7 +154,7 @@ pub fn find_soar_assignments(
         let t = tile.min(n_x - i);
         let x_tile = &x[i * d..(i + t) * d];
         let primary = &mut out_primary[i..i + t];
-        let secondary = &mut out_secondary[i..i + t];
+        let secondary = &mut out_secondary[i * secondaries..(i + t) * secondaries];
         let block_len = t * y_tile;
 
         dist[..t * n_y]
@@ -162,82 +199,95 @@ pub fn find_soar_assignments(
                 }
             }
         });
-        if n_y == 1 {
+        if n_y == 1 || secondaries == 0 {
             i += t;
             continue;
         }
 
-        // Unit residuals to the primary, and each vector's projection on its own.
-        let chosen: &[u32] = primary;
-        residuals[..t * d]
-            .par_chunks_mut(d)
-            .zip(along[..t].par_iter_mut())
-            .enumerate()
-            .for_each(|(r, (residual, a))| {
-                let xr = &x_tile[r * d..(r + 1) * d];
-                let centroid = &y[chosen[r] as usize * d..][..d];
-                let mut norm = 0.0_f32;
-                for k in 0..d {
-                    let v = xr[k] - centroid[k];
-                    residual[k] = v;
-                    norm += v * v;
-                }
-                let norm = norm.sqrt();
-                if norm > 0.0 && norm.is_finite() {
-                    let inv = 1.0 / norm;
-                    for v in residual.iter_mut() {
-                        *v *= inv;
+        for replica in 0..secondaries.min(n_y - 1) {
+            residuals[..t * d]
+                .par_chunks_mut(d)
+                .zip(along[..t].par_iter_mut())
+                .enumerate()
+                .for_each(|(r, (residual, a))| {
+                    let xr = &x_tile[r * d..(r + 1) * d];
+                    let chosen = if replica == 0 {
+                        primary[r]
+                    } else {
+                        secondary[r * secondaries + replica - 1]
+                    };
+                    let centroid = &y[chosen as usize * d..][..d];
+                    let mut norm = 0.0_f32;
+                    for k in 0..d {
+                        let v = xr[k] - centroid[k];
+                        residual[k] = v;
+                        norm += v * v;
                     }
-                } else {
-                    residual.fill(0.0);
-                }
-                *a = xr.iter().zip(residual.iter()).map(|(p, q)| p * q).sum();
-            });
+                    let norm = norm.sqrt();
+                    if norm > 0.0 && norm.is_finite() {
+                        let inv = 1.0 / norm;
+                        for v in residual.iter_mut() {
+                            *v *= inv;
+                        }
+                    } else {
+                        residual.fill(0.0);
+                    }
+                    *a = xr.iter().zip(residual.iter()).map(|(p, q)| p * q).sum();
+                });
 
-        prod[..t * n_y]
-            .par_chunks_mut(block_len)
-            .zip(dist[..t * n_y].par_chunks(block_len))
-            .enumerate()
-            .for_each(|(block, (costs, distances))| {
-                let j = block * y_tile;
-                let cols = costs.len() / t;
-                blas_dot_products(
-                    &residuals[..t * d],
-                    &y[j * d..(j + cols) * d],
-                    t,
-                    cols,
-                    d,
-                    d,
-                    costs,
-                    cols,
-                );
-                for (r, (row, distances)) in costs
-                    .chunks_mut(cols)
-                    .zip(distances.chunks(cols))
-                    .enumerate()
-                {
-                    for (c, (value, distance)) in row.iter_mut().zip(distances).enumerate() {
-                        let gap = along[r] - *value;
-                        *value = if (j + c) as u32 == chosen[r] {
-                            f32::MAX
-                        } else {
-                            distance + lambda * gap * gap
-                        };
+            prod[..t * n_y]
+                .par_chunks_mut(block_len)
+                .zip(dist[..t * n_y].par_chunks_mut(block_len))
+                .enumerate()
+                .for_each(|(block, (costs, distances))| {
+                    let j = block * y_tile;
+                    let cols = costs.len() / t;
+                    blas_dot_products(
+                        &residuals[..t * d],
+                        &y[j * d..(j + cols) * d],
+                        t,
+                        cols,
+                        d,
+                        d,
+                        costs,
+                        cols,
+                    );
+                    for (r, (row, distances)) in costs
+                        .chunks_mut(cols)
+                        .zip(distances.chunks_mut(cols))
+                        .enumerate()
+                    {
+                        for (c, (value, distance)) in row.iter_mut().zip(distances).enumerate() {
+                            let gap = along[r] - *value;
+                            *distance += lambda * gap * gap;
+                            let centroid = (j + c) as u32;
+                            *value = if centroid == primary[r]
+                                || secondary[r * secondaries..r * secondaries + replica]
+                                    .contains(&centroid)
+                            {
+                                f32::MAX
+                            } else {
+                                *distance
+                            };
+                        }
                     }
-                }
-            });
-        secondary.par_iter_mut().enumerate().for_each(|(r, idx)| {
-            let mut best = f32::MAX;
-            for (block, costs) in prod[..t * n_y].chunks(block_len).enumerate() {
-                let cols = costs.len() / t;
-                for (c, &value) in costs[r * cols..(r + 1) * cols].iter().enumerate() {
-                    if value < best {
-                        best = value;
-                        *idx = (block * y_tile + c) as u32;
+                });
+            secondary
+                .par_chunks_mut(secondaries)
+                .enumerate()
+                .for_each(|(r, assignments)| {
+                    let mut best = f32::MAX;
+                    for (block, costs) in prod[..t * n_y].chunks(block_len).enumerate() {
+                        let cols = costs.len() / t;
+                        for (c, &value) in costs[r * cols..(r + 1) * cols].iter().enumerate() {
+                            if value < best {
+                                best = value;
+                                assignments[replica] = (block * y_tile + c) as u32;
+                            }
+                        }
                     }
-                }
-            }
-        });
+                });
+        }
         i += t;
     }
 }

@@ -7,8 +7,8 @@ use std::collections::HashSet;
 
 use superkmeans::batch::{find_nearest_neighbor, find_soar_assignments};
 use superkmeans::{
-    Matrix, SuperKMeans, SuperKMeansConfig, assign, assign_soar, generate_random_vectors,
-    make_blobs, squared_norms,
+    Matrix, SuperKMeans, SuperKMeansConfig, assign, assign_soar, assign_soar_replicas,
+    generate_random_vectors, make_blobs, squared_norms,
 };
 
 fn find_nearest_centroid_brute_force(
@@ -584,4 +584,106 @@ fn soar_ties_across_centroid_tiles_keep_the_first_centroid() {
     );
     assert!(primary.iter().all(|&c| c == 0));
     assert!(secondary.iter().all(|&c| c == 1));
+}
+
+#[test]
+fn soar_four_replicas_minimize_cumulative_residual_loss() {
+    let (n, d, k) = (257, 16, 79);
+    let data = generate_random_vectors(n, d, -1.0, 1.0, 71);
+    let centroids = generate_random_vectors(k, d, -1.0, 1.0, 73);
+    let vectors = Matrix::new(&data, n, d);
+    let centers = Matrix::new(&centroids, k, d);
+    for lambda in [0.0, 2.0, 50.0] {
+        let pair = assign_soar(vectors, centers, lambda);
+        let (primary, secondary) = assign_soar_replicas(vectors, centers, lambda, 4);
+        assert_eq!(primary, pair.0);
+        assert_eq!(secondary.len(), n * 3);
+        for row in 0..n {
+            let point = &data[row * d..(row + 1) * d];
+            let mut chosen = vec![primary[row]];
+            assert_eq!(secondary[row * 3], pair.1[row]);
+            for &actual in &secondary[row * 3..(row + 1) * 3] {
+                assert!(!chosen.contains(&actual));
+                let cost = |candidate: u32| {
+                    let distance = l2_sq(point, &centroids[candidate as usize * d..][..d]);
+                    distance
+                        + chosen
+                            .iter()
+                            .map(|&previous| {
+                                soar_cost(point, &centroids, d, previous, candidate, lambda)
+                                    - distance
+                            })
+                            .sum::<f32>()
+                };
+                let best = (0..k as u32)
+                    .filter(|c| !chosen.contains(c))
+                    .map(cost)
+                    .fold(f32::MAX, f32::min);
+                assert!(cost(actual) <= best * (1.0 + 1e-4) + 1e-4);
+                chosen.push(actual);
+            }
+        }
+    }
+}
+
+#[test]
+fn soar_replica_counts_handle_missing_centroids_and_zero_residuals() {
+    for k in 1..=5 {
+        let centroids = vec![0.0; k * 4];
+        let data = vec![0.0; 7 * 4];
+        for replicas in [1, 2, 4, 8] {
+            let (primary, secondary) = assign_soar_replicas(
+                Matrix::from_slice(&data, 4),
+                Matrix::from_slice(&centroids, 4),
+                2.0,
+                replicas,
+            );
+            assert_eq!(primary, vec![0; 7]);
+            assert_eq!(secondary.len(), 7 * (replicas - 1));
+            if replicas > 1 {
+                for row in secondary.chunks(replicas - 1) {
+                    let expected: Vec<_> = (1..replicas)
+                        .map(|c| if c < k { c as u32 } else { u32::MAX })
+                        .collect();
+                    assert_eq!(row, expected);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn soar_four_replicas_are_deterministic_across_tiles_and_threads() {
+    let (n, d, k) = (521, 8, 39_801);
+    let data = generate_random_vectors(n, d, -1.0, 1.0, 79);
+    let centroids = generate_random_vectors(k, d, -1.0, 1.0, 83);
+    let mut expected = None;
+    for threads in [1, 2, 8] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        let assignments = pool.install(|| {
+            assign_soar_replicas(
+                Matrix::new(&data, n, d),
+                Matrix::new(&centroids, k, d),
+                2.0,
+                4,
+            )
+        });
+        if let Some(expected) = &expected {
+            assert_eq!(&assignments, expected);
+        } else {
+            expected = Some(assignments);
+        }
+    }
+    let centroids = vec![0.0; k * d];
+    let (primary, secondary) = assign_soar_replicas(
+        Matrix::new(&data, n, d),
+        Matrix::new(&centroids, k, d),
+        2.0,
+        4,
+    );
+    assert_eq!(primary, vec![0; n]);
+    assert!(secondary.chunks(3).all(|row| row == [1, 2, 3]));
 }
