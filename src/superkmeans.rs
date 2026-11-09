@@ -964,78 +964,68 @@ impl SuperKMeans {
         self.n_split = 0;
         let d = self.d;
         let mut rng = ChaCha8Rng::seed_from_u64(self.config.seed);
-        let uniform = Uniform::new(0.0_f32, 1.0_f32);
 
-        // Empty-cluster handling: find a donor and copy + symmetric-perturb.
+        let threshold = if self.config.use_aggressive_split {
+            const UNUSED_THRESHOLD: f32 = 0.25;
+            let average_size = n_samples as f32 / n_clusters.max(1) as f32;
+            (average_size * UNUSED_THRESHOLD) as u32
+        } else {
+            0
+        };
+
+        let mut targets = Vec::new();
+        let mut donors = Vec::new();
         for ci in 0..n_clusters {
-            if self.cluster_sizes[ci] != 0 {
-                continue;
+            let size = self.cluster_sizes[ci];
+            if size == 0 || (self.config.use_aggressive_split && size < threshold) {
+                targets.push(ci);
+            } else if size > 1 {
+                donors.push(ci);
             }
-            let mut cj = 0usize;
-            loop {
-                let size_j = self.cluster_sizes[cj] as f32;
-                let denom = (n_samples as f32 - n_clusters as f32).max(1.0);
-                let p = (size_j - 1.0) / denom;
-                let r = uniform.sample(&mut rng);
-                if r < p {
-                    break;
-                }
-                cj = (cj + 1) % n_clusters;
-            }
-            let (left, right) = split_two_rows_mut(&mut self.horizontal_centroids, ci, cj, d);
-            left.copy_from_slice(right);
-            for j in 0..d {
-                if j % 2 == 0 {
-                    left[j] *= 1.0 + CENTROID_PERTURBATION_EPS;
-                    right[j] *= 1.0 - CENTROID_PERTURBATION_EPS;
-                } else {
-                    left[j] *= 1.0 - CENTROID_PERTURBATION_EPS;
-                    right[j] *= 1.0 + CENTROID_PERTURBATION_EPS;
-                }
-            }
-            let half = self.cluster_sizes[cj] / 2;
-            self.cluster_sizes[ci] = half;
-            self.cluster_sizes[cj] -= half;
-            self.n_split += 1;
         }
 
-        // Optional aggressive cuVS-style balancing: pull small clusters towards
-        // points from large ones.
-        if !self.config.use_aggressive_split {
+        let n_split = targets.len().min(donors.len());
+        if n_split == 0 {
             return;
         }
-        const CENTER_ADJUSTMENT_WEIGHT: f32 = 7.0;
-        const BALANCING_THRESHOLD: f32 = 0.25;
-        let average_size = (n_samples / n_clusters.max(1)) as f32;
-        let threshold_size = (average_size * BALANCING_THRESHOLD) as u32;
-        for ci in 0..n_clusters {
-            let csize = self.cluster_sizes[ci];
-            if csize == 0 || csize as f32 > threshold_size as f32 {
-                continue;
-            }
-            let mut large_idx = 0usize;
-            loop {
-                let large_size = self.cluster_sizes[large_idx];
-                if (large_size as f32) < average_size {
-                    large_idx = (large_idx + 1) % n_clusters;
-                    continue;
-                }
-                let p = (large_size as f32 - average_size + 1.0)
-                    / ((n_samples as f32) - average_size * (n_clusters as f32) + n_clusters as f32);
-                let r = uniform.sample(&mut rng);
-                if r < p {
-                    break;
-                }
-                large_idx = (large_idx + 1) % n_clusters;
-            }
-            let (small_row, large_row) =
-                split_two_rows_mut(&mut self.horizontal_centroids, ci, large_idx, d);
-            let wc = (csize as f32).min(CENTER_ADJUSTMENT_WEIGHT);
-            let wd = 1.0_f32;
+
+        // Efraimidis-Spirakis / Gumbel-max sampling without replacement in
+        // proportion to donor cluster size (`log(size) - log(-log(U))`).
+        let uniform = Uniform::new(f64::MIN_POSITIVE, 1.0_f64);
+        let mut keyed_donors: Vec<(f64, usize)> = donors
+            .into_iter()
+            .map(|ci| {
+                let u = uniform.sample(&mut rng);
+                let key = (self.cluster_sizes[ci] as f64).ln() - (-u.ln()).ln();
+                (key, ci)
+            })
+            .collect();
+        keyed_donors.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+
+        for (&target, &(_, source)) in targets[..n_split].iter().zip(&keyed_donors[..n_split]) {
+            let (child, donor) =
+                split_two_rows_mut(&mut self.horizontal_centroids, target, source, d);
+            child.copy_from_slice(donor);
             for j in 0..d {
-                let v = (wc * small_row[j] + wd * large_row[j]) / (wc + wd);
-                small_row[j] = v;
+                if j % 2 == 0 {
+                    donor[j] *= 1.0 - CENTROID_PERTURBATION_EPS;
+                    child[j] *= 1.0 + CENTROID_PERTURBATION_EPS;
+                } else {
+                    donor[j] *= 1.0 + CENTROID_PERTURBATION_EPS;
+                    child[j] *= 1.0 - CENTROID_PERTURBATION_EPS;
+                }
             }
+            if donor == child && d > 0 {
+                let next = f32::from_bits(child[0].to_bits().wrapping_add(1));
+                child[0] = if next.is_finite() {
+                    next
+                } else {
+                    f32::from_bits(child[0].to_bits().wrapping_sub(1))
+                };
+            }
+            let half = self.cluster_sizes[source] / 2;
+            self.cluster_sizes[target] = half;
+            self.cluster_sizes[source] -= half;
             self.n_split += 1;
         }
     }
