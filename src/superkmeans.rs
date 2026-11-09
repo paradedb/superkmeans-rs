@@ -185,7 +185,9 @@ pub fn assign(vectors: Matrix<'_>, centroids: Matrix<'_>) -> Vec<u32> {
 /// Assign row-major vectors to their nearest centroid and to a SOAR secondary without
 /// constructing a trainer: the secondary minimizes `‖x − c‖² + lambda · ⟨x − c, r̂1⟩²` over the
 /// other centroids, `r̂1` being the unit residual to the nearest, so the two cells miss
-/// different queries. The secondary is `u32::MAX` with a single centroid.
+/// different queries. `candidates` bounds the search for the secondary to that many nearest
+/// centroids; `candidates ≥ n_y` is the exhaustive rule. The secondary is `u32::MAX` with a
+/// single centroid.
 ///
 /// # Panics
 ///
@@ -194,13 +196,16 @@ pub fn assign_soar(
     vectors: Matrix<'_>,
     centroids: Matrix<'_>,
     lambda: f32,
+    candidates: usize,
 ) -> (Vec<u32>, Vec<u32>) {
-    assign_soar_replicas(vectors, centroids, lambda, 2)
+    assign_soar_replicas(vectors, centroids, lambda, 2, candidates)
 }
 
 /// Assign to a primary and up to `replicas - 1` distinct SOAR secondaries per vector.
 /// Each secondary minimizes distance plus `lambda` times the sum of squared projections
-/// onto all preceding unit residuals. Secondaries are row-major; missing slots are `u32::MAX`.
+/// onto all preceding unit residuals. `candidates` bounds the search for each secondary to
+/// that many nearest centroids; `candidates ≥ n_y` is the exhaustive rule. Secondaries are
+/// row-major; missing slots are `u32::MAX`.
 ///
 /// # Panics
 /// Panics if `replicas` is zero or the matrices have different dimensionality.
@@ -209,6 +214,7 @@ pub fn assign_soar_replicas(
     centroids: Matrix<'_>,
     lambda: f32,
     replicas: usize,
+    candidates: usize,
 ) -> (Vec<u32>, Vec<u32>) {
     assert!(replicas > 0);
     assert_eq!(
@@ -224,6 +230,7 @@ pub fn assign_soar_replicas(
     let vector_norms = squared_norms(vectors.as_slice(), n_vectors, d);
     let centroid_norms = squared_norms(centroids.as_slice(), n_centroids, d);
     let mut buf = Vec::new();
+    let mut ids = Vec::new();
     batch::find_soar_replica_assignments(
         vectors.as_slice(),
         centroids.as_slice(),
@@ -234,9 +241,11 @@ pub fn assign_soar_replicas(
         &centroid_norms,
         lambda,
         replicas,
+        candidates,
         &mut primary,
         &mut secondary,
         &mut buf,
+        &mut ids,
     );
     (primary, secondary)
 }
@@ -764,9 +773,9 @@ impl SuperKMeans {
         )
     }
 
-    /// Brute-force assignment to the nearest centroid and a SOAR secondary, as
-    /// [`assign_soar`]: one index pair per vector, the secondary `u32::MAX` with a
-    /// single centroid.
+    /// Brute-force assignment to the nearest centroid and a SOAR secondary among the
+    /// `candidates` nearest, as [`assign_soar`]: one index pair per vector, the secondary
+    /// `u32::MAX` with a single centroid.
     ///
     /// # Panics
     ///
@@ -778,11 +787,13 @@ impl SuperKMeans {
         centroids: &[f32],
         n_vectors: usize,
         lambda: f32,
+        candidates: usize,
     ) -> (Vec<u32>, Vec<u32>) {
         assign_soar(
             Matrix::new(vectors, n_vectors, self.d),
             Matrix::from_slice(centroids, self.d),
             lambda,
+            candidates,
         )
     }
 

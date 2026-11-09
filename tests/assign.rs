@@ -5,7 +5,9 @@
 
 use std::collections::HashSet;
 
-use superkmeans::batch::{find_nearest_neighbor, find_soar_assignments};
+use superkmeans::batch::{
+    find_nearest_neighbor, find_soar_assignments, find_soar_replica_assignments,
+};
 use superkmeans::{
     Matrix, SuperKMeans, SuperKMeansConfig, assign, assign_soar, assign_soar_replicas,
     generate_random_vectors, make_blobs, squared_norms,
@@ -423,22 +425,27 @@ fn soar_primaries_equal_find_nearest_neighbor() {
         &mut distances,
         &mut buf,
     );
-    let mut primary = vec![0_u32; n];
-    let mut secondary = vec![0_u32; n];
-    find_soar_assignments(
-        &data,
-        &centroids,
-        n,
-        k,
-        d,
-        &norms_x,
-        &norms_y,
-        2.0,
-        &mut primary,
-        &mut secondary,
-        &mut buf,
-    );
-    assert_eq!(primary, nearest);
+    let mut ids = Vec::new();
+    for candidates in [0, 1, 8, 64, k] {
+        let mut primary = vec![0_u32; n];
+        let mut secondary = vec![0_u32; n];
+        find_soar_assignments(
+            &data,
+            &centroids,
+            n,
+            k,
+            d,
+            &norms_x,
+            &norms_y,
+            2.0,
+            candidates,
+            &mut primary,
+            &mut secondary,
+            &mut buf,
+            &mut ids,
+        );
+        assert_eq!(primary, nearest, "candidates {candidates}");
+    }
 }
 
 #[test]
@@ -448,12 +455,13 @@ fn soar_secondaries_minimize_the_objective() {
     let centroids = generate_random_vectors(k, d, -10.0, 10.0, 9);
     let kmeans = SuperKMeans::new(k, d);
     for lambda in [0.0_f32, 2.0] {
-        let (primary, secondary) = kmeans.assign_soar(&data, &centroids, n, lambda);
+        let (primary, secondary) = kmeans.assign_soar(&data, &centroids, n, lambda, k);
         assert_soar_optimal(&data, &centroids, n, k, d, lambda, &primary, &secondary);
         let (free_primary, free_secondary) = assign_soar(
             Matrix::new(&data, n, d),
             Matrix::from_slice(&centroids, d),
             lambda,
+            k,
         );
         assert_eq!(free_primary, primary);
         assert_eq!(free_secondary, secondary);
@@ -465,10 +473,12 @@ fn soar_with_lambda_zero_picks_the_second_nearest() {
     let (n, d, k) = (2_000, 16, 150);
     let data = generate_random_vectors(n, d, -1.0, 1.0, 21);
     let centroids = generate_random_vectors(k, d, -1.0, 1.0, 23);
+    // Without the alignment term the second nearest wins, so two candidates are enough.
     let (primary, secondary) = assign_soar(
         Matrix::new(&data, n, d),
         Matrix::from_slice(&centroids, d),
         0.0,
+        2,
     );
     for i in 0..n {
         let point = &data[i * d..(i + 1) * d];
@@ -501,6 +511,7 @@ fn soar_with_one_centroid_has_no_secondary() {
         Matrix::new(&data, n, d),
         Matrix::from_slice(&centroid, d),
         2.0,
+        64,
     );
     assert!(primary.iter().all(|&c| c == 0));
     assert!(secondary.iter().all(|&c| c == u32::MAX));
@@ -508,9 +519,8 @@ fn soar_with_one_centroid_has_no_secondary() {
 
 #[test]
 fn soar_crosses_tile_boundaries() {
-    // 8,400 centroids exceed one y-tile on every target, and the kept distances cap the x-tile at
-    // 256 MiB / (4 · 8,400) = 7,989 rows, so 9,000 vectors take two x-tiles.
-    let (n, d, k) = (9_000, 8, 8_400);
+    // 2,100 centroids exceed one y-batch on every target.
+    let (n, d, k) = (2_000, 8, 2_100);
     let data = generate_random_vectors(n, d, -1.0, 1.0, 41);
     let centroids = generate_random_vectors(k, d, -1.0, 1.0, 43);
     let norms_x = squared_norms(&data, n, d);
@@ -530,6 +540,7 @@ fn soar_crosses_tile_boundaries() {
         &mut distances,
         &mut buf,
     );
+    let mut ids = Vec::new();
     let mut primary = vec![0_u32; n];
     let mut secondary = vec![0_u32; n];
     find_soar_assignments(
@@ -541,12 +552,44 @@ fn soar_crosses_tile_boundaries() {
         &norms_x,
         &norms_y,
         2.0,
+        k,
         &mut primary,
         &mut secondary,
         &mut buf,
+        &mut ids,
     );
     assert_eq!(primary, nearest);
     assert_soar_optimal(&data, &centroids, n, k, d, 2.0, &primary, &secondary);
+
+    // More vectors than one x-batch: a shortlist's choice is per row, so splitting the rows at
+    // the x-batch boundary changes nothing.
+    let n = superkmeans::common::X_BATCH_SIZE + 40;
+    let data = generate_random_vectors(n, d, -1.0, 1.0, 47);
+    let norms_x = squared_norms(&data, n, d);
+    let soar = |rows: std::ops::Range<usize>| {
+        let mut out = (vec![0_u32; rows.len()], vec![0_u32; rows.len()]);
+        find_soar_assignments(
+            &data[rows.start * d..rows.end * d],
+            &centroids,
+            rows.len(),
+            k,
+            d,
+            &norms_x[rows.clone()],
+            &norms_y,
+            2.0,
+            64,
+            &mut out.0,
+            &mut out.1,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        out
+    };
+    let whole = soar(0..n);
+    let split = superkmeans::common::X_BATCH_SIZE / 2;
+    let (head, tail) = (soar(0..split), soar(split..n));
+    assert_eq!(whole.0, [head.0, tail.0].concat());
+    assert_eq!(whole.1, [head.1, tail.1].concat());
 }
 
 #[test]
@@ -562,11 +605,17 @@ fn soar_large_centroid_set_is_deterministic_across_threads() {
             .num_threads(threads)
             .build()
             .unwrap();
-        let pair = pool.install(|| assign_soar(vectors, centers, 2.0));
+        let pair = pool.install(|| assign_soar(vectors, centers, 2.0, 64));
         if let Some(expected) = &expected {
             assert_eq!(&pair, expected);
         } else {
-            assert_soar_optimal(&data, &centroids, n, k, d, 2.0, &pair.0, &pair.1);
+            assert_eq!(pair.0, assign(vectors, centers));
+            assert!(
+                pair.0
+                    .iter()
+                    .zip(&pair.1)
+                    .all(|(a, b)| a != b && (*b as usize) < k)
+            );
             expected = Some(pair);
         }
     }
@@ -577,13 +626,16 @@ fn soar_ties_across_centroid_tiles_keep_the_first_centroid() {
     let k = superkmeans::common::Y_BATCH_SIZE + 3;
     let centroids = vec![0.0; k * 4];
     let data = vec![1.0; 257 * 4];
-    let (primary, secondary) = assign_soar(
-        Matrix::from_slice(&data, 4),
-        Matrix::from_slice(&centroids, 4),
-        2.0,
-    );
-    assert!(primary.iter().all(|&c| c == 0));
-    assert!(secondary.iter().all(|&c| c == 1));
+    for candidates in [2, 64, k] {
+        let (primary, secondary) = assign_soar(
+            Matrix::from_slice(&data, 4),
+            Matrix::from_slice(&centroids, 4),
+            2.0,
+            candidates,
+        );
+        assert!(primary.iter().all(|&c| c == 0));
+        assert!(secondary.iter().all(|&c| c == 1), "candidates {candidates}");
+    }
 }
 
 #[test]
@@ -594,8 +646,8 @@ fn soar_four_replicas_minimize_cumulative_residual_loss() {
     let vectors = Matrix::new(&data, n, d);
     let centers = Matrix::new(&centroids, k, d);
     for lambda in [0.0, 2.0, 50.0] {
-        let pair = assign_soar(vectors, centers, lambda);
-        let (primary, secondary) = assign_soar_replicas(vectors, centers, lambda, 4);
+        let pair = assign_soar(vectors, centers, lambda, k);
+        let (primary, secondary) = assign_soar_replicas(vectors, centers, lambda, 4, k);
         assert_eq!(primary, pair.0);
         assert_eq!(secondary.len(), n * 3);
         for row in 0..n {
@@ -628,24 +680,30 @@ fn soar_four_replicas_minimize_cumulative_residual_loss() {
 
 #[test]
 fn soar_replica_counts_handle_missing_centroids_and_zero_residuals() {
+    // Every centroid ties at distance zero, so the shortlist is the lowest `candidates` indices
+    // (at least one, at most k) and the secondaries fill it in index order.
     for k in 1..=5 {
         let centroids = vec![0.0; k * 4];
         let data = vec![0.0; 7 * 4];
-        for replicas in [1, 2, 4, 8] {
-            let (primary, secondary) = assign_soar_replicas(
-                Matrix::from_slice(&data, 4),
-                Matrix::from_slice(&centroids, 4),
-                2.0,
-                replicas,
-            );
-            assert_eq!(primary, vec![0; 7]);
-            assert_eq!(secondary.len(), 7 * (replicas - 1));
-            if replicas > 1 {
-                for row in secondary.chunks(replicas - 1) {
-                    let expected: Vec<_> = (1..replicas)
-                        .map(|c| if c < k { c as u32 } else { u32::MAX })
-                        .collect();
-                    assert_eq!(row, expected);
+        for candidates in [0, 1, 3, k, 64] {
+            let shortlist = candidates.clamp(1, k);
+            for replicas in [1, 2, 4, 8] {
+                let (primary, secondary) = assign_soar_replicas(
+                    Matrix::from_slice(&data, 4),
+                    Matrix::from_slice(&centroids, 4),
+                    2.0,
+                    replicas,
+                    candidates,
+                );
+                assert_eq!(primary, vec![0; 7]);
+                assert_eq!(secondary.len(), 7 * (replicas - 1));
+                if replicas > 1 {
+                    for row in secondary.chunks(replicas - 1) {
+                        let expected: Vec<_> = (1..replicas)
+                            .map(|c| if c < shortlist { c as u32 } else { u32::MAX })
+                            .collect();
+                        assert_eq!(row, expected, "k {k}, candidates {candidates}");
+                    }
                 }
             }
         }
@@ -669,6 +727,7 @@ fn soar_four_replicas_are_deterministic_across_tiles_and_threads() {
                 Matrix::new(&centroids, k, d),
                 2.0,
                 4,
+                64,
             )
         });
         if let Some(expected) = &expected {
@@ -683,7 +742,109 @@ fn soar_four_replicas_are_deterministic_across_tiles_and_threads() {
         Matrix::new(&centroids, k, d),
         2.0,
         4,
+        64,
     );
     assert_eq!(primary, vec![0; n]);
     assert!(secondary.chunks(3).all(|row| row == [1, 2, 3]));
+}
+
+#[test]
+fn shortlisted_secondaries_stay_among_the_nearest() {
+    let (n, d, k, candidates) = (2_000, 16, 200, 8);
+    let data = generate_random_vectors(n, d, -1.0, 1.0, 89);
+    let centroids = generate_random_vectors(k, d, -1.0, 1.0, 97);
+    let lambda = 50.0;
+    let (primary, secondary) = assign_soar_replicas(
+        Matrix::new(&data, n, d),
+        Matrix::new(&centroids, k, d),
+        lambda,
+        4,
+        candidates,
+    );
+    let (exhaustive, _) = assign_soar_replicas(
+        Matrix::new(&data, n, d),
+        Matrix::new(&centroids, k, d),
+        lambda,
+        4,
+        k,
+    );
+    assert_eq!(primary, exhaustive);
+    for row in 0..n {
+        let point = &data[row * d..(row + 1) * d];
+        let mut nearest: Vec<(f32, u32)> = (0..k as u32)
+            .map(|c| (l2_sq(point, &centroids[c as usize * d..][..d]), c))
+            .collect();
+        nearest.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        let bound = nearest[candidates - 1].0;
+        let chosen = &secondary[row * 3..(row + 1) * 3];
+        let mut all = vec![primary[row]];
+        all.extend_from_slice(chosen);
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(
+            all.len(),
+            4,
+            "row {row}: {chosen:?} repeats or includes the primary"
+        );
+        for &c in chosen {
+            let distance = l2_sq(point, &centroids[c as usize * d..][..d]);
+            assert!(
+                distance <= bound * (1.0 + 1e-5) + 1e-5,
+                "row {row}: secondary {c} at {distance} lies outside the {candidates} nearest"
+            );
+        }
+        // The first secondary is the objective's argmin over the shortlist.
+        let best = nearest[..candidates]
+            .iter()
+            .filter(|&&(_, c)| c != primary[row])
+            .map(|&(_, c)| soar_cost(point, &centroids, d, primary[row], c, lambda))
+            .fold(f32::MAX, f32::min);
+        let got = soar_cost(point, &centroids, d, primary[row], chosen[0], lambda);
+        assert!(
+            got <= best * (1.0 + 1e-4) + 1e-4,
+            "row {row}: {got} vs {best}"
+        );
+    }
+}
+
+#[test]
+fn candidates_beyond_the_centroid_count_are_exhaustive() {
+    let (n, d, k) = (1_000, 16, 120);
+    let data = generate_random_vectors(n, d, -1.0, 1.0, 101);
+    let centroids = generate_random_vectors(k, d, -1.0, 1.0, 103);
+    let soar = |candidates| {
+        assign_soar_replicas(
+            Matrix::new(&data, n, d),
+            Matrix::new(&centroids, k, d),
+            2.0,
+            4,
+            candidates,
+        )
+    };
+    assert_eq!(soar(k + 100), soar(k));
+    assert_eq!(soar(usize::MAX), soar(k));
+}
+
+#[test]
+fn soar_scratch_is_reused_across_shapes() {
+    let d = 16;
+    let shapes = [(1_000, 300, 64), (3_000, 50, 16), (500, 300, 300)];
+    let (mut buf, mut ids) = (Vec::new(), Vec::new());
+    for (i, &(n, k, candidates)) in shapes.iter().enumerate() {
+        let data = generate_random_vectors(n, d, -1.0, 1.0, 107 + i as u64);
+        let centroids = generate_random_vectors(k, d, -1.0, 1.0, 109 + i as u64);
+        let norms_x = squared_norms(&data, n, d);
+        let norms_y = squared_norms(&centroids, k, d);
+        let run = |buf: &mut Vec<f32>, ids: &mut Vec<u32>| {
+            let mut out = (vec![0_u32; n], vec![0_u32; n * 3]);
+            find_soar_replica_assignments(
+                &data, &centroids, n, k, d, &norms_x, &norms_y, 2.0, 4, candidates, &mut out.0,
+                &mut out.1, buf, ids,
+            );
+            out
+        };
+        let reused = run(&mut buf, &mut ids);
+        let fresh = run(&mut Vec::new(), &mut Vec::new());
+        assert_eq!(reused, fresh, "shape {i}");
+    }
 }
