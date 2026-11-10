@@ -228,18 +228,20 @@ fn bench_full_sample_baseline(base: &[f32], n: usize, full_leaf_size: usize) {
         print_baseline_row("flat-assigned", target_k, &assign_summary, train_ms);
         let empty_revived: usize = skm.iteration_stats.iter().map(|s| s.empty_revived).sum();
         let small_revived: usize = skm.iteration_stats.iter().map(|s| s.small_revived).sum();
-        let last_split = skm.iteration_stats.last().map_or(0, |s| s.split);
+        let last_split = skm.iteration_stats.last().map_or(0, |s| s.revived());
+        let last_mse = skm.iteration_stats.last().map_or(0.0, |s| s.mse);
         let per_iter: Vec<String> = skm
             .iteration_stats
             .iter()
             .map(|s| format!("i{}:{}+{}", s.iteration, s.empty_revived, s.small_revived))
             .collect();
         println!(
-            "  [flat revival] total_revived={} (empty={}, small<0.25x={}), final_iter_splits={} | per_iter(empty+small): {}",
+            "  [flat revival] total_revived={} (empty={}, small<0.25x={}), final_iter_splits={}, final_loop_mse={:.4} | per_iter(empty+small): {}",
             empty_revived + small_revived,
             empty_revived,
             small_revived,
             last_split,
+            last_mse,
             per_iter.join(" ")
         );
         println!("{}", "-".repeat(160));
@@ -487,7 +489,7 @@ fn bench_iterations_sweep(base: &[f32], n: usize, full_leaf_size: usize) {
             .iteration_stats
             .local_runs
             .iter()
-            .map(|s| s.split)
+            .map(|s| s.revived())
             .sum();
         let label = format!("{iters_meso}/{iters_fine}");
 
@@ -532,8 +534,10 @@ fn bench_iterations_sweep(base: &[f32], n: usize, full_leaf_size: usize) {
         let train_summary = summarize(&skm.cluster_sizes);
         let assignments = skm.assign(&base[..n * COHERE_D], &centroids, n);
         let assign_summary = summarize_assignments(&assignments, target_k);
-        let mse = mean_squared_error(&base[..n * COHERE_D], n, COHERE_D, &centroids, &assignments);
-        let revived: usize = skm.iteration_stats.iter().map(|s| s.split).sum();
+        let train_mse = skm.iteration_stats.last().map_or(0.0, |s| s.mse);
+        let assign_mse =
+            mean_squared_error(&base[..n * COHERE_D], n, COHERE_D, &centroids, &assignments);
+        let revived: usize = skm.iteration_stats.iter().map(|s| s.revived()).sum();
         let label = iters.to_string();
 
         print_iter_row(
@@ -541,7 +545,7 @@ fn bench_iterations_sweep(base: &[f32], n: usize, full_leaf_size: usize) {
             &label,
             target_k,
             &train_summary,
-            0.0,
+            train_mse,
             revived,
             train_ms,
         );
@@ -550,7 +554,7 @@ fn bench_iterations_sweep(base: &[f32], n: usize, full_leaf_size: usize) {
             &label,
             target_k,
             &assign_summary,
-            mse,
+            assign_mse,
             revived,
             train_ms,
         );
