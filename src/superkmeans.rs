@@ -83,6 +83,8 @@ pub struct SuperKMeansIterationStats {
     pub objective: f32,
     pub shift: f32,
     pub split: usize,
+    pub empty_revived: usize,
+    pub small_revived: usize,
     pub recall: f32,
     pub not_pruned_pct: f32,
     pub partial_d: u32,
@@ -132,6 +134,8 @@ pub struct SuperKMeans {
     pub trained: bool,
     pub iteration: u32,
     pub n_split: usize,
+    pub n_empty_revived: usize,
+    pub n_small_revived: usize,
     pub n_samples: usize,
     pub centroids_to_explore: usize,
     pub prev_cost: f32,
@@ -248,6 +252,8 @@ impl SuperKMeans {
             trained: false,
             iteration: 0,
             n_split: 0,
+            n_empty_revived: 0,
+            n_small_revived: 0,
             n_samples: 0,
             centroids_to_explore: 0,
             prev_cost: 0.0,
@@ -890,6 +896,8 @@ impl SuperKMeans {
             objective: self.cost,
             shift: self.shift,
             split: self.n_split,
+            empty_revived: self.n_empty_revived,
+            small_revived: self.n_small_revived,
             recall: self.recall,
             not_pruned_pct: if gemm_only { -1.0 } else { avg_not_pruned_pct },
             partial_d: if gemm_only { 0 } else { old_partial_d },
@@ -947,6 +955,8 @@ impl SuperKMeans {
 
     pub(crate) fn split_clusters(&mut self, n_samples: usize, n_clusters: usize) {
         self.n_split = 0;
+        self.n_empty_revived = 0;
+        self.n_small_revived = 0;
         let d = self.d;
         let mut rng = ChaCha8Rng::seed_from_u64(self.config.seed);
 
@@ -968,7 +978,7 @@ impl SuperKMeans {
         for ci in 0..n_clusters {
             let size = self.cluster_sizes[ci];
             if size == 0 || (revive_small && size < threshold) {
-                targets.push(ci);
+                targets.push((ci, size == 0));
             } else if size > 1 {
                 donors.push(ci);
             }
@@ -992,7 +1002,9 @@ impl SuperKMeans {
             .collect();
         keyed_donors.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
 
-        for (&target, &(_, source)) in targets[..n_split].iter().zip(&keyed_donors[..n_split]) {
+        for (&(target, was_empty), &(_, source)) in
+            targets[..n_split].iter().zip(&keyed_donors[..n_split])
+        {
             let (child, donor) =
                 split_two_rows_mut(&mut self.horizontal_centroids, target, source, d);
             child.copy_from_slice(donor);
@@ -1017,6 +1029,11 @@ impl SuperKMeans {
             self.cluster_sizes[target] = half;
             self.cluster_sizes[source] -= half;
             self.n_split += 1;
+            if was_empty {
+                self.n_empty_revived += 1;
+            } else {
+                self.n_small_revived += 1;
+            }
         }
     }
 

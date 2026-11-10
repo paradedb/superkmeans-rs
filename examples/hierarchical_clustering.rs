@@ -1,7 +1,7 @@
 //! Hierarchical SuperKMeans example.
 //!
 //! Splits into ceil(sqrt(K)) meso clusters, then re-clusters any group still
-//! larger than `max_leaf_size`.
+//! larger than the split threshold for `target_leaf_size`.
 
 use std::env;
 use std::process::ExitCode;
@@ -12,10 +12,10 @@ use superkmeans::{
 
 fn print_usage(program: &str) {
     println!(
-        "Usage: {} [n] [d] [max_leaf_size]\n  \
+        "Usage: {} [n] [d] [target_leaf_size]\n  \
          n: Number of vectors (default: 100000)\n  \
          d: Dimensionality (default: 128)\n  \
-         max_leaf_size: Stop splitting below this size (default: 256)\n\n\
+         target_leaf_size: Target leaf cluster size (default: 256)\n\n\
          Example:\n  {} 50000 64 128",
         program, program
     );
@@ -26,7 +26,7 @@ fn main() -> ExitCode {
 
     let mut n: usize = 100_000;
     let mut d: usize = 128;
-    let mut max_leaf_size: usize = 256;
+    let mut target_leaf_size: usize = 256;
 
     if args.len() > 1 {
         if args[1] == "-h" || args[1] == "--help" {
@@ -39,15 +39,15 @@ fn main() -> ExitCode {
         d = args[2].parse().unwrap_or(d);
     }
     if args.len() > 3 {
-        max_leaf_size = args[3].parse().unwrap_or(max_leaf_size);
+        target_leaf_size = args[3].parse().unwrap_or(target_leaf_size);
     }
 
-    println!("Parameters: n={n}, d={d}, max_leaf_size={max_leaf_size}");
+    println!("Parameters: n={n}, d={d}, target_leaf_size={target_leaf_size}");
     println!("Generating {n} vectors with d={d}");
     let data = make_blobs(n, d, 100, true, 1.0, 10.0, 42);
 
     let mut cfg = HierarchicalSuperKMeansConfig {
-        max_leaf_size,
+        target_leaf_size,
         ..Default::default()
     };
     cfg.base.verbose = env::var("SUPERKMEANS_VERBOSE").is_ok();

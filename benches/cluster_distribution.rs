@@ -6,15 +6,21 @@
 //!    intrinsic cluster size distribution without sampling variance.
 //! 2. **Training Sample Sweep:**
 //!    Sweeps `train_fraction` from `5%` to `100%` for a fixed `full_leaf_size`.
+//! 3. **Iteration Count Sweep:**
+//!    Sweeps iteration counts for both flat `SuperKMeans` and
+//!    `HierarchicalSuperKMeans` (`iters_meso`, `iters_fine`) at `sample = 100%`
+//!    to measure training time vs. cluster balance and MSE distortion.
 //!
 //! Usage:
-//!   cargo bench --bench cluster_distribution -- [n] [full_leaf_size]
+//!   cargo bench --bench cluster_distribution -- [baseline|sample|iters|all] [n] [full_leaf_size]
 
 use std::env;
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
 
+use rayon::prelude::*;
+use superkmeans::distance::l2_squared;
 use superkmeans::{
     ClusterBalanceStats, HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, SuperKMeans,
     SuperKMeansConfig, TicToc,
@@ -220,6 +226,22 @@ fn bench_full_sample_baseline(base: &[f32], n: usize, full_leaf_size: usize) {
 
         print_baseline_row("flat-train", target_k, &train_summary, train_ms);
         print_baseline_row("flat-assigned", target_k, &assign_summary, train_ms);
+        let empty_revived: usize = skm.iteration_stats.iter().map(|s| s.empty_revived).sum();
+        let small_revived: usize = skm.iteration_stats.iter().map(|s| s.small_revived).sum();
+        let last_split = skm.iteration_stats.last().map_or(0, |s| s.split);
+        let per_iter: Vec<String> = skm
+            .iteration_stats
+            .iter()
+            .map(|s| format!("i{}:{}+{}", s.iteration, s.empty_revived, s.small_revived))
+            .collect();
+        println!(
+            "  [flat revival] total_revived={} (empty={}, small<0.25x={}), final_iter_splits={} | per_iter(empty+small): {}",
+            empty_revived + small_revived,
+            empty_revived,
+            small_revived,
+            last_split,
+            per_iter.join(" ")
+        );
         println!("{}", "-".repeat(160));
     }
 
@@ -227,7 +249,7 @@ fn bench_full_sample_baseline(base: &[f32], n: usize, full_leaf_size: usize) {
     {
         let mut timer = TicToc::new();
         let mut cfg = HierarchicalSuperKMeansConfig {
-            max_leaf_size: full_leaf_size,
+            target_leaf_size: full_leaf_size,
             ..Default::default()
         };
         cfg.base.angular = true;
@@ -245,6 +267,27 @@ fn bench_full_sample_baseline(base: &[f32], n: usize, full_leaf_size: usize) {
 
         print_baseline_row("hier-train", actual_k, &tree_summary, train_ms);
         print_baseline_row("hier-assigned", actual_k, &assign_summary, train_ms);
+        let hs = &hskm.iteration_stats;
+        let empty_revived: usize = hs.local_runs.iter().map(|s| s.empty_revived).sum();
+        let small_revived: usize = hs.local_runs.iter().map(|s| s.small_revived).sum();
+        println!(
+            "  [hier splits]  meso_clusters={}, first_fine_requested={} (stayed_leaf={}, resplit_oversized={}), resplit_nodes={} -> resplit_children={}, bisected_collapsed={}",
+            hs.meso_clusters,
+            hs.first_fine_clusters_requested,
+            hs.first_fine_leaves,
+            hs.first_fine_clusters_requested
+                .saturating_sub(hs.first_fine_leaves),
+            hs.resplit_nodes,
+            hs.resplit_children,
+            hs.bisected_nodes,
+        );
+        println!(
+            "  [hier revival] local_kmeans_iters={}, total_revived={} (empty={}, small<0.25x={})",
+            hs.local_runs.len(),
+            empty_revived + small_revived,
+            empty_revived,
+            small_revived,
+        );
         println!("{}", "-".repeat(160));
     }
 }
@@ -284,7 +327,7 @@ fn bench_sample_sweep(base: &[f32], n: usize, full_leaf_size: usize) {
 
         let mut timer = TicToc::new();
         let mut cfg = HierarchicalSuperKMeansConfig {
-            max_leaf_size: sample_leaf_size,
+            target_leaf_size: sample_leaf_size,
             ..Default::default()
         };
         cfg.base.angular = true;
@@ -333,6 +376,188 @@ fn bench_sample_sweep(base: &[f32], n: usize, full_leaf_size: usize) {
     }
 }
 
+fn mean_squared_error(
+    base: &[f32],
+    n: usize,
+    d: usize,
+    centroids: &[f32],
+    assignments: &[u32],
+) -> f64 {
+    let total: f64 = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let c = assignments[i] as usize;
+            let row = &base[i * d..(i + 1) * d];
+            let centroid = &centroids[c * d..(c + 1) * d];
+            l2_squared(row, centroid) as f64
+        })
+        .sum();
+    total / n as f64
+}
+
+fn bench_iterations_sweep(base: &[f32], n: usize, full_leaf_size: usize) {
+    let target_k = n.div_ceil(full_leaf_size);
+    println!(
+        "\n=== 3. Iteration Count Sweep (sample = 100%, n = {n}, target_leaf_size = {full_leaf_size}, target_k = {target_k}) ==="
+    );
+    println!(
+        "{:<14} {:>9} {:>8} {:>8} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>7} {:>6} {:>8} {:>8} {:>8}",
+        "stage",
+        "iters",
+        "act_k",
+        "mean",
+        "min",
+        "p01",
+        "p10",
+        "p50",
+        "p90",
+        "p99",
+        "max",
+        "p90/p10",
+        "cv",
+        "mse",
+        "revived",
+        "train_ms"
+    );
+    println!("{}", "-".repeat(156));
+
+    let print_iter_row = |stage: &str,
+                          iters_label: &str,
+                          act_k: usize,
+                          s: &DistributionSummary,
+                          mse: f64,
+                          revived: usize,
+                          train_ms: f64| {
+        let p90_p10 = if s.p10 > 0 {
+            format!("{:.2}x", s.p90 as f64 / s.p10 as f64)
+        } else {
+            "inf".to_string()
+        };
+        let mse_str = if mse > 0.0 {
+            format!("{mse:.4}")
+        } else {
+            "   -  ".to_string()
+        };
+        println!(
+            "{:<14} {:>9} {:>8} {:>8.1} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>7} {:>6.3} {:>8} {:>8} {:>8.1}",
+            stage,
+            iters_label,
+            act_k,
+            s.balance.mean,
+            s.balance.min,
+            s.p01,
+            s.p10,
+            s.p50,
+            s.p90,
+            s.p99,
+            s.balance.max,
+            p90_p10,
+            s.balance.cv,
+            mse_str,
+            revived,
+            train_ms,
+        );
+    };
+
+    // 1. HierarchicalSuperKMeans across (iters_meso, iters_fine)
+    for (iters_meso, iters_fine) in [(1u32, 2u32), (2, 3), (3, 5), (4, 8), (5, 12), (8, 16)] {
+        let mut timer = TicToc::new();
+        let mut cfg = HierarchicalSuperKMeansConfig {
+            target_leaf_size: full_leaf_size,
+            iters_meso,
+            iters_fine,
+            ..Default::default()
+        };
+        cfg.base.angular = true;
+        cfg.base.early_termination = false;
+        cfg.base.suppress_warnings = true;
+
+        let mut hskm = HierarchicalSuperKMeans::with_config(COHERE_D, cfg);
+        timer.tic();
+        let centroids = hskm.train(&base[..n * COHERE_D], n);
+        timer.toc();
+        let train_ms = timer.milliseconds();
+
+        let actual_k = hskm.base.n_clusters;
+        let train_summary = summarize(&hskm.base.cluster_sizes);
+        let assignments = hskm.assign(&base[..n * COHERE_D], &centroids, n);
+        let assign_summary = summarize_assignments(&assignments, actual_k);
+        let mse = mean_squared_error(&base[..n * COHERE_D], n, COHERE_D, &centroids, &assignments);
+        let revived: usize = hskm
+            .iteration_stats
+            .local_runs
+            .iter()
+            .map(|s| s.split)
+            .sum();
+        let label = format!("{iters_meso}/{iters_fine}");
+
+        print_iter_row(
+            "hier-train",
+            &label,
+            actual_k,
+            &train_summary,
+            0.0,
+            revived,
+            train_ms,
+        );
+        print_iter_row(
+            "hier-assigned",
+            &label,
+            actual_k,
+            &assign_summary,
+            mse,
+            revived,
+            train_ms,
+        );
+        println!("{}", "-".repeat(156));
+    }
+
+    // 2. Flat SuperKMeans across iters
+    for iters in [3u32, 5, 10, 15, 25] {
+        let mut timer = TicToc::new();
+        let cfg = SuperKMeansConfig {
+            iters,
+            angular: true,
+            early_termination: false,
+            suppress_warnings: true,
+            use_aggressive_split: true,
+            ..Default::default()
+        };
+        let mut skm = SuperKMeans::with_config(target_k, COHERE_D, cfg);
+        timer.tic();
+        let centroids = skm.train(&base[..n * COHERE_D], n);
+        timer.toc();
+        let train_ms = timer.milliseconds();
+
+        let train_summary = summarize(&skm.cluster_sizes);
+        let assignments = skm.assign(&base[..n * COHERE_D], &centroids, n);
+        let assign_summary = summarize_assignments(&assignments, target_k);
+        let mse = mean_squared_error(&base[..n * COHERE_D], n, COHERE_D, &centroids, &assignments);
+        let revived: usize = skm.iteration_stats.iter().map(|s| s.split).sum();
+        let label = iters.to_string();
+
+        print_iter_row(
+            "flat-train",
+            &label,
+            target_k,
+            &train_summary,
+            0.0,
+            revived,
+            train_ms,
+        );
+        print_iter_row(
+            "flat-assigned",
+            &label,
+            target_k,
+            &assign_summary,
+            mse,
+            revived,
+            train_ms,
+        );
+        println!("{}", "-".repeat(156));
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).filter(|arg| arg != "--bench").collect();
     let mode = args.first().map(String::as_str).unwrap_or("baseline");
@@ -348,10 +573,14 @@ fn main() {
     match mode {
         "baseline" => bench_full_sample_baseline(&base, n, full_leaf_size),
         "sample" => bench_sample_sweep(&base, n, full_leaf_size),
+        "iters" => bench_iterations_sweep(&base, n, full_leaf_size),
         "all" => {
             bench_full_sample_baseline(&base, n, full_leaf_size);
             bench_sample_sweep(&base, n, full_leaf_size);
+            bench_iterations_sweep(&base, n, full_leaf_size);
         }
-        other => panic!("unknown mode '{other}'; expected 'baseline', 'sample', or 'all'"),
+        other => {
+            panic!("unknown mode '{other}'; expected 'baseline', 'sample', 'iters', or 'all'")
+        }
     }
 }
