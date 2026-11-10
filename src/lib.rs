@@ -47,7 +47,8 @@ pub use hierarchical::{
 };
 pub use matrix::{Matrix, MatrixChunks};
 pub use superkmeans::{
-    ClusterBalanceStats, SuperKMeans, SuperKMeansConfig, SuperKMeansIterationStats, assign,
+    ClusterBalanceStats, PruningStats, SuperKMeans, SuperKMeansConfig, SuperKMeansIterationStats,
+    assign,
 };
 pub use utils::{
     TicToc, centroid_shift, compute_l2_squared, find_nearest_neighbor_brute_force,

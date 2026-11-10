@@ -11,8 +11,7 @@ use crate::adsampling::ADSamplingPruner;
 use crate::batch;
 use crate::common::{
     CENTROID_PERTURBATION_EPS, DIMENSION_THRESHOLD_FOR_PRUNING, MIN_PARTIAL_D,
-    N_CLUSTERS_THRESHOLD_FOR_PRUNING, PRUNER_INITIAL_THRESHOLD, RECALL_CONVERGENCE_PATIENCE,
-    X_BATCH_SIZE, Y_BATCH_SIZE,
+    N_CLUSTERS_THRESHOLD_FOR_PRUNING, PRUNER_INITIAL_THRESHOLD, X_BATCH_SIZE, Y_BATCH_SIZE,
 };
 use crate::dataset::{self, Dataset, IterDataset};
 use crate::layout;
@@ -33,11 +32,8 @@ pub struct SuperKMeansConfig {
     pub seed: u64,
     pub use_blas_only: bool,
     pub tol: f32,
-    pub recall_tol: f32,
     pub early_termination: bool,
     pub sample_queries: bool,
-    pub objective_k: usize,
-    pub ann_explore_fraction: f32,
     pub min_not_pruned_pct: f32,
     pub max_not_pruned_pct: f32,
     pub adjustment_factor_for_partial_d: f32,
@@ -59,11 +55,8 @@ impl Default for SuperKMeansConfig {
             seed: 42,
             use_blas_only: false,
             tol: 1.0e-4,
-            recall_tol: 0.005,
             early_termination: true,
             sample_queries: false,
-            objective_k: 100,
-            ann_explore_fraction: 0.01,
             min_not_pruned_pct: 0.03,
             max_not_pruned_pct: 0.05,
             adjustment_factor_for_partial_d: 0.20,
@@ -77,18 +70,45 @@ impl Default for SuperKMeansConfig {
     }
 }
 
+/// ADSampling pruning statistics for an iteration that took the pruned path.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct PruningStats {
+    /// Active ADSampling prefix dimensionality used during the E-step.
+    pub partial_d: u32,
+    /// Fraction of candidate centroid evaluations that survived pruning.
+    pub not_pruned_pct: f32,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SuperKMeansIterationStats {
     pub iteration: usize,
-    pub objective: f32,
+    pub n_samples: usize,
+    pub n_clusters: usize,
+    /// Sum of squared distances from each sample to the centroid it was assigned
+    /// to in this pass's E-step (the previous pass's centroids).
+    pub sse: f64,
+    /// Mean squared distance (`sse / n_samples`).
+    pub mse: f64,
+    /// Total squared displacement of centroids from the previous iteration.
     pub shift: f32,
-    pub split: usize,
+    /// Number of strictly empty clusters (`size == 0`) revived by splitting a donor.
     pub empty_revived: usize,
+    /// Number of small clusters (`0 < size < threshold`) revived by splitting a donor.
     pub small_revived: usize,
-    pub recall: f32,
-    pub not_pruned_pct: f32,
-    pub partial_d: u32,
-    pub is_gemm_only: bool,
+    /// ADSampling pruning statistics (`None` on exact GEMM passes).
+    pub pruning: Option<PruningStats>,
+}
+
+impl SuperKMeansIterationStats {
+    /// Total number of clusters revived by splitting a donor this iteration.
+    pub fn revived(&self) -> usize {
+        self.empty_revived + self.small_revived
+    }
+
+    /// Whether this iteration used the exact unpruned GEMM path.
+    pub fn is_gemm_only(&self) -> bool {
+        self.pruning.is_none()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -133,16 +153,7 @@ pub struct SuperKMeans {
     // Iteration state.
     pub trained: bool,
     pub iteration: u32,
-    pub n_split: usize,
-    pub n_empty_revived: usize,
-    pub n_small_revived: usize,
     pub n_samples: usize,
-    pub centroids_to_explore: usize,
-    pub prev_cost: f32,
-    pub cost: f32,
-    pub shift: f32,
-    pub recall: f32,
-
     pub iteration_stats: Vec<SuperKMeansIterationStats>,
 
     /// Reusable SGEMM output scratch, grown once and reused across iterations
@@ -251,15 +262,7 @@ impl SuperKMeans {
             partial_d: 0,
             trained: false,
             iteration: 0,
-            n_split: 0,
-            n_empty_revived: 0,
-            n_small_revived: 0,
             n_samples: 0,
-            centroids_to_explore: 0,
-            prev_cost: 0.0,
-            cost: 0.0,
-            shift: 0.0,
-            recall: 0.0,
             iteration_stats: Vec::new(),
             gemm_buf: Vec::new(),
         }
@@ -493,17 +496,13 @@ impl SuperKMeans {
         let always_gemm_only = self.d < DIMENSION_THRESHOLD_FOR_PRUNING
             || self.config.use_blas_only
             || self.n_clusters <= N_CLUSTERS_THRESHOLD_FOR_PRUNING;
-        let mut best_recall = 0.0_f32;
-        let mut iters_without_improvement: usize = 0;
         let mut scratch = StreamScratch::default();
 
         for iter_idx in 0..self.config.iters {
             self.iteration = iter_idx;
             let gemm_only = iter_idx == 0 || always_gemm_only;
             self.run_dataset_iteration(data, gemm_only, rotate, &mut scratch)?;
-            if self.config.early_termination
-                && self.should_stop_early(false, &mut best_recall, &mut iters_without_improvement)
-            {
+            if self.config.early_termination && self.should_stop_early() {
                 break;
             }
         }
@@ -535,9 +534,7 @@ impl SuperKMeans {
         };
 
         let mut offset = 0usize;
-        // Summed row by row in scan order, like `compute_cost` over the
-        // in-memory distances.
-        let mut cost = 0.0_f32;
+        let mut sse = 0.0_f64;
         let mut not_pruned = 0.0_f64;
         {
             let pruner = &*self.pruner;
@@ -609,9 +606,7 @@ impl SuperKMeans {
                     not_pruned += not_pruned_counts.iter().map(|&v| v as f64).sum::<f64>();
                 }
 
-                for &dist in distances.iter() {
-                    cost += dist;
-                }
+                sse += distances.iter().map(|&dist| dist as f64).sum::<f64>();
                 accumulate_rows_by_assignment(x, knn, sums, cluster_sizes, d);
                 offset += n;
             })?;
@@ -621,23 +616,24 @@ impl SuperKMeans {
             "dataset yielded {offset} rows, but {n_samples} on its first pass"
         );
 
-        let old_partial_d = self.partial_d;
-        let avg_not_pruned_pct = if gemm_only {
-            -1.0
-        } else {
-            self.adjust_partial_d((not_pruned / (n_samples as f64 * n_clusters as f64)) as f32)
-        };
+        let pruning = (!gemm_only).then(|| {
+            let partial_d = self.partial_d;
+            let not_pruned_pct =
+                self.adjust_partial_d((not_pruned / (n_samples as f64 * n_clusters as f64)) as f32);
+            PruningStats {
+                partial_d,
+                not_pruned_pct,
+            }
+        });
 
-        self.consolidate_centroids(n_samples, n_clusters);
-        self.prev_cost = self.cost;
-        self.cost = cost;
-        self.shift = centroid_shift(
+        let (empty_revived, small_revived) = self.consolidate_centroids(n_samples, n_clusters);
+        let shift = centroid_shift(
             &self.horizontal_centroids,
             &self.prev_centroids,
             n_clusters,
             d,
         );
-        self.push_iteration_stats(gemm_only, avg_not_pruned_pct, old_partial_d);
+        self.push_iteration_stats(sse, shift, empty_revived, small_revived, pruning);
         Ok(())
     }
 
@@ -661,9 +657,6 @@ impl SuperKMeans {
             || self.config.use_blas_only
             || n_clusters <= N_CLUSTERS_THRESHOLD_FOR_PRUNING;
         let mut partial_norms_computed = false;
-        let mut best_recall = 0.0_f32;
-        let mut iters_without_improvement: usize = 0;
-
         let mut not_pruned_counts = vec![0_usize; n_samples];
 
         for iter_idx in 0..self.config.iters {
@@ -676,9 +669,7 @@ impl SuperKMeans {
             }
             self.run_iteration(data, use_gemm_only, &mut not_pruned_counts);
 
-            if self.config.early_termination
-                && self.should_stop_early(false, &mut best_recall, &mut iters_without_improvement)
-            {
+            if self.config.early_termination && self.should_stop_early() {
                 break;
             }
         }
@@ -861,84 +852,94 @@ impl SuperKMeans {
             d,
         );
 
-        let mut avg_not_pruned_pct = -1.0_f32;
-        let old_partial_d = self.partial_d;
-        if !gemm_only {
-            let (avg, changed) = self.tune_partial_d(not_pruned_counts, n_samples, n_clusters);
-            avg_not_pruned_pct = avg;
+        let pruning = (!gemm_only).then(|| {
+            let partial_d = self.partial_d;
+            let (not_pruned_pct, changed) =
+                self.tune_partial_d(not_pruned_counts, n_samples, n_clusters);
             if changed {
                 self.data_norms =
                     squared_norms_partial(data, n_samples, d, self.partial_d as usize);
             }
-        }
+            PruningStats {
+                partial_d,
+                not_pruned_pct,
+            }
+        });
 
-        self.consolidate_centroids(n_samples, n_clusters);
-        self.compute_cost();
-        self.shift = centroid_shift(
+        let (empty_revived, small_revived) = self.consolidate_centroids(n_samples, n_clusters);
+        let sse: f64 = self.distances.iter().map(|&dist| dist as f64).sum();
+        let shift = centroid_shift(
             &self.horizontal_centroids,
             &self.prev_centroids,
             n_clusters,
             d,
         );
 
-        self.push_iteration_stats(gemm_only, avg_not_pruned_pct, old_partial_d);
+        self.push_iteration_stats(sse, shift, empty_revived, small_revived, pruning);
     }
 
     fn push_iteration_stats(
         &mut self,
-        gemm_only: bool,
-        avg_not_pruned_pct: f32,
-        old_partial_d: u32,
+        sse: f64,
+        shift: f32,
+        empty_revived: usize,
+        small_revived: usize,
+        pruning: Option<PruningStats>,
     ) {
         let iter_idx = self.iteration;
+        let mse = sse / self.n_samples.max(1) as f64;
         let stats = SuperKMeansIterationStats {
             iteration: (iter_idx + 1) as usize,
-            objective: self.cost,
-            shift: self.shift,
-            split: self.n_split,
-            empty_revived: self.n_empty_revived,
-            small_revived: self.n_small_revived,
-            recall: self.recall,
-            not_pruned_pct: if gemm_only { -1.0 } else { avg_not_pruned_pct },
-            partial_d: if gemm_only { 0 } else { old_partial_d },
-            is_gemm_only: gemm_only,
+            n_samples: self.n_samples,
+            n_clusters: self.n_clusters,
+            sse,
+            mse,
+            shift,
+            empty_revived,
+            small_revived,
+            pruning,
         };
         if self.config.verbose {
-            let improvement = if iter_idx > 0 {
-                1.0 - (self.cost / self.prev_cost.max(f32::EPSILON))
-            } else {
-                0.0
-            };
+            let improvement = self
+                .iteration_stats
+                .last()
+                .map_or(0.0, |prev| 1.0 - (sse / prev.sse.max(f64::EPSILON)));
             print!(
-                "Iteration {}/{} | Objective: {:.4} | Objective improvement: {:.4} | Shift: {:.4} | Split: {}",
-                iter_idx + 1,
+                "Iteration {}/{} | MSE: {:.4} (SSE: {:.2}) | Improvement: {:.4} | Shift: {:.4} | Revived: {} ({}+{})",
+                stats.iteration,
                 self.config.iters,
-                self.cost,
+                stats.mse,
+                stats.sse,
                 improvement,
-                self.shift,
-                self.n_split
+                stats.shift,
+                stats.revived(),
+                stats.empty_revived,
+                stats.small_revived,
             );
-            if gemm_only {
-                println!(" [BLAS-only]");
-            } else {
-                println!(
+            match pruning {
+                None => println!(" [BLAS-only]"),
+                Some(p) => println!(
                     " | Not Pruned %: {:.4} | d': {} -> {}",
-                    avg_not_pruned_pct * 100.0,
-                    old_partial_d,
+                    p.not_pruned_pct * 100.0,
+                    p.partial_d,
                     self.partial_d
-                );
+                ),
             }
         }
         self.iteration_stats.push(stats);
     }
 
     /// Turn the sums left by [`sum_rows_by_assignment`] into usable centroids:
-    /// take each cluster's mean, reseed the empty ones, and — for angular
+    /// take each cluster's mean, revive empty/small ones, and — for angular
     /// distance — put the result back on the unit sphere.
     ///
-    /// Normalizing last matters: [`Self::split_clusters`] perturbs and blends
-    /// rows, so those have to land on the sphere too.
-    pub(crate) fn consolidate_centroids(&mut self, n_samples: usize, n_clusters: usize) {
+    /// Normalizing last matters: [`Self::split_clusters`] perturbs rows, so
+    /// those have to land on the sphere too.
+    pub(crate) fn consolidate_centroids(
+        &mut self,
+        n_samples: usize,
+        n_clusters: usize,
+    ) -> (usize, usize) {
         let d = self.d;
         mean_rows_by_count(
             &mut self.horizontal_centroids,
@@ -946,17 +947,15 @@ impl SuperKMeans {
             d,
         );
 
-        self.split_clusters(n_samples, n_clusters);
+        let revived = self.split_clusters(n_samples, n_clusters);
 
         if self.config.angular {
             normalize_rows_l2(&mut self.horizontal_centroids, n_clusters, d);
         }
+        revived
     }
 
-    pub(crate) fn split_clusters(&mut self, n_samples: usize, n_clusters: usize) {
-        self.n_split = 0;
-        self.n_empty_revived = 0;
-        self.n_small_revived = 0;
+    pub(crate) fn split_clusters(&mut self, n_samples: usize, n_clusters: usize) -> (usize, usize) {
         let d = self.d;
         let mut rng = ChaCha8Rng::seed_from_u64(self.config.seed);
 
@@ -986,7 +985,7 @@ impl SuperKMeans {
 
         let n_split = targets.len().min(donors.len());
         if n_split == 0 {
-            return;
+            return (0, 0);
         }
 
         // Efraimidis-Spirakis / Gumbel-max sampling without replacement in
@@ -1002,6 +1001,8 @@ impl SuperKMeans {
             .collect();
         keyed_donors.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
 
+        let mut empty_revived = 0usize;
+        let mut small_revived = 0usize;
         for (&(target, was_empty), &(_, source)) in
             targets[..n_split].iter().zip(&keyed_donors[..n_split])
         {
@@ -1028,13 +1029,13 @@ impl SuperKMeans {
             let half = self.cluster_sizes[source] / 2;
             self.cluster_sizes[target] = half;
             self.cluster_sizes[source] -= half;
-            self.n_split += 1;
             if was_empty {
-                self.n_empty_revived += 1;
+                empty_revived += 1;
             } else {
-                self.n_small_revived += 1;
+                small_revived += 1;
             }
         }
+        (empty_revived, small_revived)
     }
 
     /// The starting `d'`: half the vertically-stored dimensions, floored at
@@ -1044,11 +1045,6 @@ impl SuperKMeans {
         MIN_PARTIAL_D
             .max(self.vertical_d as u32 / 2)
             .min(self.vertical_d as u32)
-    }
-
-    pub(crate) fn compute_cost(&mut self) {
-        self.prev_cost = self.cost;
-        self.cost = self.distances.iter().sum::<f32>();
     }
 
     pub(crate) fn tune_partial_d(
@@ -1083,47 +1079,39 @@ impl SuperKMeans {
         avg
     }
 
-    pub(crate) fn should_stop_early(
-        &mut self,
-        tracking_recall: bool,
-        best_recall: &mut f32,
-        iters_without_improvement: &mut usize,
-    ) -> bool {
-        let iter_idx = self.iteration;
-        if self.shift < self.config.tol {
+    pub(crate) fn should_stop_early(&self) -> bool {
+        let Some(curr) = self.iteration_stats.last() else {
+            return false;
+        };
+        // Revived centroids need one more E-step before centroids and assignments agree.
+        if curr.small_revived > 0 {
+            return false;
+        }
+        if curr.shift < self.config.tol {
             if self.config.verbose {
                 println!(
                     "Converged at iteration {} (shift {} < tol {})",
-                    iter_idx + 1,
-                    self.shift,
-                    self.config.tol
+                    curr.iteration, curr.shift, self.config.tol
                 );
             }
             return true;
         }
-        if iter_idx > 0 {
-            let cost_delta = self.cost / self.prev_cost.max(f32::EPSILON);
-            if cost_delta > 1.0 - self.config.tol {
+        if let Some(prev) = self
+            .iteration_stats
+            .len()
+            .checked_sub(2)
+            .and_then(|i| self.iteration_stats.get(i))
+        {
+            let sse_ratio = curr.sse / prev.sse.max(f64::EPSILON);
+            if sse_ratio > 1.0 - self.config.tol as f64 {
                 if self.config.verbose {
                     println!(
-                        "Converged at iteration {} (cost improved by only {})",
-                        iter_idx + 1,
-                        1.0 - cost_delta
+                        "Converged at iteration {} (SSE improved by only {})",
+                        curr.iteration,
+                        1.0 - sse_ratio
                     );
                 }
                 return true;
-            }
-        }
-        if tracking_recall {
-            let improvement = self.recall - *best_recall;
-            if improvement > self.config.recall_tol {
-                *best_recall = self.recall;
-                *iters_without_improvement = 0;
-            } else {
-                *iters_without_improvement += 1;
-                if *iters_without_improvement >= RECALL_CONVERGENCE_PATIENCE {
-                    return true;
-                }
             }
         }
         false
@@ -1277,3 +1265,41 @@ const _: () = {
     let _ = X_BATCH_SIZE;
     let _ = Y_BATCH_SIZE;
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pass(sse: f64, shift: f32, small_revived: usize) -> SuperKMeansIterationStats {
+        SuperKMeansIterationStats {
+            sse,
+            shift,
+            small_revived,
+            ..Default::default()
+        }
+    }
+
+    fn stops_early(passes: Vec<SuperKMeansIterationStats>) -> bool {
+        let mut kmeans = SuperKMeans::new(4, 8);
+        kmeans.iteration_stats = passes;
+        kmeans.should_stop_early()
+    }
+
+    /// A revived small cluster holds a copy of its donor's centroid while its
+    /// rows are still the old members, so neither convergence test may end
+    /// the run on that pass.
+    #[test]
+    fn early_stop_waits_out_a_small_cluster_revival() {
+        // SSE went up, which is what the E-step after a revival looks like.
+        assert!(stops_early(vec![pass(100.0, 1.0, 0), pass(101.0, 1.0, 0)]));
+        assert!(!stops_early(vec![pass(100.0, 1.0, 1), pass(101.0, 1.0, 1)]));
+
+        // Centroids barely moved.
+        assert!(stops_early(vec![pass(100.0, 0.0, 0)]));
+        assert!(!stops_early(vec![pass(100.0, 0.0, 1)]));
+
+        // Only the current pass matters: the E-step after a revival has
+        // already moved the rows.
+        assert!(stops_early(vec![pass(100.0, 1.0, 1), pass(101.0, 1.0, 0)]));
+    }
+}

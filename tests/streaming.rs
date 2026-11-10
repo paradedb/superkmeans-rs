@@ -89,7 +89,7 @@ fn streaming_with_pruning_matches_in_memory_quality() {
     let mut streamed = SuperKMeans::with_config(k, d, cfg.clone());
     let centroids = streamed.train_iter(Matrix::new(&data, n, d).chunks(4_096));
     assert!(
-        streamed.iteration_stats.iter().any(|s| !s.is_gemm_only),
+        streamed.iteration_stats.iter().any(|s| !s.is_gemm_only()),
         "pruning never engaged"
     );
 
