@@ -215,6 +215,48 @@ pub fn assign(vectors: Matrix<'_>, centroids: Matrix<'_>) -> Vec<u32> {
     result_assignments
 }
 
+/// Assign row-major vectors to their nearest centroid and to a SOAR secondary without
+/// constructing a trainer: the secondary minimizes `‖x − c‖² + lambda · ⟨x − c, r̂1⟩²` over the
+/// other centroids, `r̂1` being the unit residual to the nearest, so the two cells miss
+/// different queries. The secondary is `u32::MAX` with a single centroid.
+///
+/// # Panics
+///
+/// Panics if the two matrices have different dimensionality.
+pub fn assign_soar(
+    vectors: Matrix<'_>,
+    centroids: Matrix<'_>,
+    lambda: f32,
+) -> (Vec<u32>, Vec<u32>) {
+    assert_eq!(
+        vectors.d(),
+        centroids.d(),
+        "vectors and centroids must share d"
+    );
+    let n_vectors = vectors.n();
+    let n_centroids = centroids.n();
+    let d = vectors.d();
+    let mut primary = vec![0_u32; n_vectors];
+    let mut secondary = vec![u32::MAX; n_vectors];
+    let vector_norms = squared_norms(vectors.as_slice(), n_vectors, d);
+    let centroid_norms = squared_norms(centroids.as_slice(), n_centroids, d);
+    let mut buf = Vec::new();
+    batch::find_soar_assignments(
+        vectors.as_slice(),
+        centroids.as_slice(),
+        n_vectors,
+        n_centroids,
+        d,
+        &vector_norms,
+        &centroid_norms,
+        lambda,
+        &mut primary,
+        &mut secondary,
+        &mut buf,
+    );
+    (primary, secondary)
+}
+
 impl SuperKMeans {
     pub fn new(n_clusters: usize, dimensionality: usize) -> Self {
         Self::with_config(n_clusters, dimensionality, SuperKMeansConfig::default())
@@ -703,6 +745,28 @@ impl SuperKMeans {
         assign(
             Matrix::new(vectors, n_vectors, self.d),
             Matrix::from_slice(centroids, self.d),
+        )
+    }
+
+    /// Brute-force assignment to the nearest centroid and a SOAR secondary, as
+    /// [`assign_soar`]: one index pair per vector, the secondary `u32::MAX` with a
+    /// single centroid.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `vectors.len() != n_vectors * d`, or if `centroids.len()` is
+    /// not a multiple of `d`.
+    pub fn assign_soar(
+        &self,
+        vectors: &[f32],
+        centroids: &[f32],
+        n_vectors: usize,
+        lambda: f32,
+    ) -> (Vec<u32>, Vec<u32>) {
+        assign_soar(
+            Matrix::new(vectors, n_vectors, self.d),
+            Matrix::from_slice(centroids, self.d),
+            lambda,
         )
     }
 
