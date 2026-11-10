@@ -19,7 +19,7 @@ Add the crate to your `Cargo.toml` (requires Rust 1.89 or later):
 
 ```toml
 [dependencies]
-superkmeans-rs = "0.3"
+superkmeans-rs = "0.4"
 ```
 
 The crate is published as `superkmeans-rs` and imported as `superkmeans`.
@@ -44,7 +44,7 @@ control parallelism, or run training in your own Rayon thread pool.
 For data that does not fit in memory, `train_iter` accepts replayable batches;
 `train_dataset` supports fallible data sources. Both scan the data on each pass.
 [`HierarchicalSuperKMeans`](https://docs.rs/superkmeans-rs/latest/superkmeans/struct.HierarchicalSuperKMeans.html)
-splits clusters until they fit a size cap and also supports streaming the
+splits clusters until they are close to a target size and also supports streaming the
 initial partition. See the API docs and [examples](examples) for these workflows.
 
 ## BLAS backends
@@ -60,8 +60,13 @@ these mutually exclusive Cargo features:
 For example, on macOS:
 
 ```toml
-superkmeans-rs = { version = "0.3", features = ["accelerate"] }
+superkmeans-rs = { version = "0.4", features = ["accelerate"] }
 ```
+
+The crate parallelizes with Rayon on every backend: it splits the large matrix
+products into batches and runs one backend call per batch. With `openblas`, it
+also sets OpenBLAS to a single thread for the whole process on first use, which
+affects any other OpenBLAS caller in the same process.
 
 ## Contributing
 
