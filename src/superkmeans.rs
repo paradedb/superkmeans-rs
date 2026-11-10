@@ -42,8 +42,13 @@ pub struct SuperKMeansConfig {
     pub angular: bool,
     pub suppress_warnings: bool,
     pub data_already_rotated: bool,
-    /// Use the cuVS-style aggressive small-cluster rebalancing during
-    /// consolidation. Hierarchical training opts into this.
+    /// Revive undersized clusters as well as empty ones.
+    ///
+    /// An empty cluster is always revived: it takes a slightly perturbed copy
+    /// of a donor cluster's centroid, with donors drawn without replacement in
+    /// proportion to their size. With this set, clusters holding fewer than a
+    /// quarter of the mean cluster size are revived the same way on every pass
+    /// except the last. Hierarchical training opts into this.
     pub use_aggressive_split: bool,
 }
 
@@ -75,14 +80,22 @@ impl Default for SuperKMeansConfig {
 pub struct PruningStats {
     /// Active ADSampling prefix dimensionality used during the E-step.
     pub partial_d: u32,
-    /// Fraction of candidate centroid evaluations that survived pruning.
+    /// Fraction of sample-centroid pairs that survived pruning, in `[0, 1]`
+    /// (not a percentage, despite the name).
     pub not_pruned_pct: f32,
 }
 
+/// Statistics for one training pass: an assignment step followed by a
+/// centroid update.
+///
+/// [`SuperKMeans::iteration_stats`] holds one entry per pass, in order.
 #[derive(Clone, Debug, Default)]
 pub struct SuperKMeansIterationStats {
+    /// 1-based number of this pass within its training run.
     pub iteration: usize,
+    /// Number of rows the run was trained on.
     pub n_samples: usize,
+    /// Number of clusters the run was asked for.
     pub n_clusters: usize,
     /// Sum of squared distances from each sample to the centroid it was assigned
     /// to in this pass's E-step (the previous pass's centroids).
@@ -93,7 +106,10 @@ pub struct SuperKMeansIterationStats {
     pub shift: f32,
     /// Number of strictly empty clusters (`size == 0`) revived by splitting a donor.
     pub empty_revived: usize,
-    /// Number of small clusters (`0 < size < threshold`) revived by splitting a donor.
+    /// Number of non-empty clusters below a quarter of the mean cluster size
+    /// revived by splitting a donor. Always zero when
+    /// [`SuperKMeansConfig::use_aggressive_split`] is off, and on the last
+    /// configured pass.
     pub small_revived: usize,
     /// ADSampling pruning statistics (`None` on exact GEMM passes).
     pub pruning: Option<PruningStats>,
@@ -152,6 +168,7 @@ pub struct SuperKMeans {
 
     // Iteration state.
     pub trained: bool,
+    /// 0-based index of the training pass in progress, or of the last one run.
     pub iteration: u32,
     pub n_samples: usize,
     pub iteration_stats: Vec<SuperKMeansIterationStats>,
@@ -347,8 +364,8 @@ impl SuperKMeans {
         self.data_norms = squared_norms(&data_to_cluster, n_samples, d);
         self.centroid_norms = squared_norms(&self.prev_centroids, n_clusters, d);
 
-        // Optional recall tracking — skipped for the minimal port; the algorithm runs
-        // identically without queries (early-termination on shift/cost still works).
+        // Queries are unused: recall tracking is not ported, so training runs the
+        // same with or without them (early termination on shift/SSE still works).
         let _ = queries;
         let _ = n_queries;
 

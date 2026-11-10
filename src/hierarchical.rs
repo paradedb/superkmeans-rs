@@ -1,12 +1,12 @@
 //! Hierarchical SuperKMeans.
 //!
-//! The sample is split into \(\lceil\sqrt{K}\rceil\) meso clusters, with
-//! \(K = \lceil n / \texttt{target\_leaf\_size}\rceil\). Each meso cluster
-//! larger than the split threshold (\(\approx \sqrt{2} \cdot \texttt{target\_leaf\_size}\))
-//! is re-clustered into \(k\) groups chosen to keep child sizes close to
-//! `target_leaf_size`, and any group that is still too large is split the same
-//! way. Training returns those fine centroids. Balance comes from each split
-//! rebalancing its own undersized clusters (`use_aggressive_split`).
+//! The sample is split into `⌈√K⌉` meso clusters, with
+//! `K = ⌈n / target_leaf_size⌉`. Each meso cluster larger than the split
+//! threshold (`⌊√2 · target_leaf_size⌋`) is re-clustered into `k` groups chosen
+//! to keep child sizes close to `target_leaf_size`, and any group that is still
+//! too large is split the same way. Training returns those fine centroids.
+//! Balance comes from each split reviving its own undersized clusters
+//! (`use_aggressive_split`).
 //!
 //! Splits permute rows in place, so peak memory is one copy of the training set.
 //!
@@ -35,10 +35,11 @@ use crate::utils::{normalize_rows_l2_sequential, squared_norms};
 pub struct HierarchicalSuperKMeansConfig {
     /// Settings for the k-means run performed at each split.
     pub base: SuperKMeansConfig,
-    /// Target points per leaf cluster. Splits choose `k` to center child sizes
-    /// around this target, stopping once a cluster is within
-    /// \(\lfloor\sqrt{2} \cdot \texttt{target\_leaf\_size}\rfloor\). The cluster
-    /// count is emergent and lands near `n / target_leaf_size`.
+    /// Target points per leaf cluster. Each split picks the `k` that puts child
+    /// sizes closest to this target, and a cluster stops splitting once it
+    /// holds at most `⌊√2 · target_leaf_size⌋` points, so this is a target
+    /// and not a cap. The cluster count is emergent and lands near
+    /// `n / target_leaf_size`.
     pub target_leaf_size: usize,
     /// Iterations for the initial \(\lceil\sqrt{K}\rceil\) meso split.
     pub iters_meso: u32,
@@ -62,9 +63,17 @@ impl Default for HierarchicalSuperKMeansConfig {
     }
 }
 
+/// Statistics from hierarchical training: the per-pass stats of every local
+/// k-means run, plus counts describing the shape of the split tree.
+///
+/// Only [`HierarchicalSuperKMeans::train`] and
+/// [`HierarchicalSuperKMeans::train_owned`] fill this in. The two-step
+/// streaming path returns per-pass stats alone, in [`MesoPartition::stats`]
+/// and [`FineClusters::stats`].
 #[derive(Default, Clone, Debug)]
 pub struct HierarchicalSuperKMeansIterationStats {
     /// Flattened stats from every local k-means run during training.
+    /// [`SuperKMeansIterationStats::iteration`] restarts at 1 with each run.
     pub local_runs: Vec<SuperKMeansIterationStats>,
     /// Number of meso clusters produced by the root split.
     pub meso_clusters: usize,
@@ -78,7 +87,8 @@ pub struct HierarchicalSuperKMeansIterationStats {
     pub resplit_nodes: usize,
     /// Number of child clusters produced by those subsequent recursive splits.
     pub resplit_children: usize,
-    /// Number of collapsed splits that fell back to bisection (`partition_and_repair`).
+    /// Number of splits whose k-means run put every row in one cluster, so the
+    /// node was cut in half instead.
     pub bisected_nodes: usize,
 }
 
@@ -140,7 +150,7 @@ struct Child {
     depth: usize,
 }
 
-/// Hierarchical k-means: a \(\lceil\sqrt{K}\rceil\) meso split, then repeated
+/// Hierarchical k-means: a `⌈√K⌉` meso split, then repeated
 /// splits of any cluster larger than the split threshold for
 /// [`HierarchicalSuperKMeansConfig::target_leaf_size`].
 ///
@@ -164,7 +174,7 @@ pub struct HierarchicalSuperKMeans {
     /// Model holding the fine centroids once [`Self::train`] has run.
     pub base: SuperKMeans,
     pub config: HierarchicalSuperKMeansConfig,
-    /// Per-iteration statistics from every local k-means run.
+    /// Statistics from the last [`Self::train`] or [`Self::train_owned`] call.
     pub iteration_stats: HierarchicalSuperKMeansIterationStats,
     /// Shared by every per-split model to avoid repeating the O(d³)
     /// Householder QR per split.
@@ -379,8 +389,8 @@ impl HierarchicalSuperKMeans {
         }
     }
 
-    /// Fine step for one meso cluster: split its `n` row-major vectors around
-    /// `target_leaf_size`.
+    /// Fine step for one meso cluster: split its `n` row-major vectors into
+    /// fine clusters of about `target_leaf_size` rows each.
     ///
     /// `data` is borrowed so the caller keeps the original vectors, e.g. to
     /// write them out in [`FineClusters::order`]; the rotated working copy is
@@ -611,7 +621,7 @@ impl HierarchicalSuperKMeans {
 
     /// How many meso clusters a sample of `n` points should start with.
     ///
-    /// \(\lceil\sqrt{K}\rceil\) with \(K = \lceil n / \texttt{target\_leaf\_size}\rceil\).
+    /// `⌈√K⌉` with `K = ⌈n / target_leaf_size⌉`.
     /// Returns `0` when the sample already fits in one cluster.
     fn meso_clusters(&self, n: usize) -> usize {
         if self.fine_clusters(n) < 2 {
