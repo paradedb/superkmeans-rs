@@ -228,6 +228,22 @@ pub fn assign_soar(
     centroids: Matrix<'_>,
     lambda: f32,
 ) -> (Vec<u32>, Vec<u32>) {
+    assign_soar_replicas(vectors, centroids, lambda, 2)
+}
+
+/// Assign to a primary and up to `replicas - 1` distinct SOAR secondaries per vector.
+/// Each secondary minimizes distance plus `lambda` times the sum of squared projections
+/// onto all preceding unit residuals. Secondaries are row-major; missing slots are `u32::MAX`.
+///
+/// # Panics
+/// Panics if `replicas` is zero or the matrices have different dimensionality.
+pub fn assign_soar_replicas(
+    vectors: Matrix<'_>,
+    centroids: Matrix<'_>,
+    lambda: f32,
+    replicas: usize,
+) -> (Vec<u32>, Vec<u32>) {
+    assert!(replicas > 0);
     assert_eq!(
         vectors.d(),
         centroids.d(),
@@ -237,11 +253,11 @@ pub fn assign_soar(
     let n_centroids = centroids.n();
     let d = vectors.d();
     let mut primary = vec![0_u32; n_vectors];
-    let mut secondary = vec![u32::MAX; n_vectors];
+    let mut secondary = vec![u32::MAX; n_vectors * (replicas - 1)];
     let vector_norms = squared_norms(vectors.as_slice(), n_vectors, d);
     let centroid_norms = squared_norms(centroids.as_slice(), n_centroids, d);
     let mut buf = Vec::new();
-    batch::find_soar_assignments(
+    batch::find_soar_replica_assignments(
         vectors.as_slice(),
         centroids.as_slice(),
         n_vectors,
@@ -250,6 +266,7 @@ pub fn assign_soar(
         &vector_norms,
         &centroid_norms,
         lambda,
+        replicas,
         &mut primary,
         &mut secondary,
         &mut buf,
