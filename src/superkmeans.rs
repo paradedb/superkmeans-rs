@@ -130,6 +130,7 @@ pub struct SuperKMeans {
 
     // Iteration state.
     pub trained: bool,
+    pub iteration: u32,
     pub n_split: usize,
     pub n_samples: usize,
     pub centroids_to_explore: usize,
@@ -245,6 +246,7 @@ impl SuperKMeans {
             horizontal_d: split.horizontal_d,
             partial_d: 0,
             trained: false,
+            iteration: 0,
             n_split: 0,
             n_samples: 0,
             centroids_to_explore: 0,
@@ -341,7 +343,7 @@ impl SuperKMeans {
         let _ = queries;
         let _ = n_queries;
 
-        self.run_core_loop(&data_to_cluster, self.config.iters);
+        self.run_core_loop(&data_to_cluster);
 
         self.trained = true;
         self.get_output_centroids(self.config.unrotate_centroids)
@@ -490,15 +492,11 @@ impl SuperKMeans {
         let mut scratch = StreamScratch::default();
 
         for iter_idx in 0..self.config.iters {
+            self.iteration = iter_idx;
             let gemm_only = iter_idx == 0 || always_gemm_only;
-            self.run_dataset_iteration(data, iter_idx, gemm_only, rotate, &mut scratch)?;
+            self.run_dataset_iteration(data, gemm_only, rotate, &mut scratch)?;
             if self.config.early_termination
-                && self.should_stop_early(
-                    false,
-                    &mut best_recall,
-                    &mut iters_without_improvement,
-                    iter_idx,
-                )
+                && self.should_stop_early(false, &mut best_recall, &mut iters_without_improvement)
             {
                 break;
             }
@@ -510,7 +508,6 @@ impl SuperKMeans {
     fn run_dataset_iteration<D: Dataset + ?Sized>(
         &mut self,
         data: &mut D,
-        iter_idx: u32,
         gemm_only: bool,
         rotate: bool,
         scratch: &mut StreamScratch,
@@ -520,7 +517,7 @@ impl SuperKMeans {
         let n_samples = self.n_samples;
         let partial_d = self.partial_d as usize;
 
-        if iter_idx > 0 {
+        if self.iteration > 0 {
             std::mem::swap(&mut self.horizontal_centroids, &mut self.prev_centroids);
         }
         self.horizontal_centroids[..n_clusters * d].fill(0.0);
@@ -634,20 +631,20 @@ impl SuperKMeans {
             n_clusters,
             d,
         );
-        self.push_iteration_stats(iter_idx, gemm_only, avg_not_pruned_pct, old_partial_d);
+        self.push_iteration_stats(gemm_only, avg_not_pruned_pct, old_partial_d);
         Ok(())
     }
 
-    /// The Lloyd driver: alternate assignment and centroid update for `iters`
-    /// passes, widening `d'` as the pruning bound tightens and stopping early
-    /// on convergence.
+    /// The Lloyd driver: alternate assignment and centroid update for
+    /// `self.config.iters` passes, widening `d'` as the pruning bound tightens
+    /// and stopping early on convergence.
     ///
     /// Callers own the setup: per-cluster and per-sample buffers sized for
     /// `self.n_samples` / `self.n_clusters`, initial centroids in
     /// `prev_centroids` (rotated domain), and full-width norms in `data_norms`
     /// and `centroid_norms`. Both [`Self::train`] and the hierarchical
     /// splitter go through here.
-    pub(crate) fn run_core_loop(&mut self, data: &[f32], iters: u32) {
+    pub(crate) fn run_core_loop(&mut self, data: &[f32]) {
         let d = self.d;
         let n_clusters = self.n_clusters;
         let n_samples = self.n_samples;
@@ -663,28 +660,18 @@ impl SuperKMeans {
 
         let mut not_pruned_counts = vec![0_usize; n_samples];
 
-        for iter_idx in 0..iters {
+        for iter_idx in 0..self.config.iters {
+            self.iteration = iter_idx;
             let use_gemm_only = (iter_idx == 0) || always_gemm_only;
             if !use_gemm_only && !partial_norms_computed {
                 self.data_norms =
                     squared_norms_partial(data, n_samples, d, self.partial_d as usize);
                 partial_norms_computed = true;
             }
-            self.run_iteration(
-                data,
-                iter_idx,
-                iter_idx == 0,
-                use_gemm_only,
-                &mut not_pruned_counts,
-            );
+            self.run_iteration(data, use_gemm_only, &mut not_pruned_counts);
 
             if self.config.early_termination
-                && self.should_stop_early(
-                    false,
-                    &mut best_recall,
-                    &mut iters_without_improvement,
-                    iter_idx,
-                )
+                && self.should_stop_early(false, &mut best_recall, &mut iters_without_improvement)
             {
                 break;
             }
@@ -808,8 +795,6 @@ impl SuperKMeans {
     pub(crate) fn run_iteration(
         &mut self,
         data: &[f32],
-        iter_idx: u32,
-        is_first_iter: bool,
         gemm_only: bool,
         not_pruned_counts: &mut [usize],
     ) {
@@ -817,7 +802,7 @@ impl SuperKMeans {
         let n_clusters = self.n_clusters;
         let n_samples = self.n_samples;
 
-        if !is_first_iter {
+        if self.iteration > 0 {
             std::mem::swap(&mut self.horizontal_centroids, &mut self.prev_centroids);
         }
 
@@ -890,16 +875,16 @@ impl SuperKMeans {
             d,
         );
 
-        self.push_iteration_stats(iter_idx, gemm_only, avg_not_pruned_pct, old_partial_d);
+        self.push_iteration_stats(gemm_only, avg_not_pruned_pct, old_partial_d);
     }
 
     fn push_iteration_stats(
         &mut self,
-        iter_idx: u32,
         gemm_only: bool,
         avg_not_pruned_pct: f32,
         old_partial_d: u32,
     ) {
+        let iter_idx = self.iteration;
         let stats = SuperKMeansIterationStats {
             iteration: (iter_idx + 1) as usize,
             objective: self.cost,
@@ -965,7 +950,12 @@ impl SuperKMeans {
         let d = self.d;
         let mut rng = ChaCha8Rng::seed_from_u64(self.config.seed);
 
-        let threshold = if self.config.use_aggressive_split {
+        // On the final iteration no E-step follows to separate a newly split
+        // pair or update `assignments`, so only strictly empty clusters are
+        // reseeded; non-empty small clusters keep their actual member mean.
+        let is_last_iter = self.iteration + 1 >= self.config.iters;
+        let revive_small = self.config.use_aggressive_split && !is_last_iter;
+        let threshold = if revive_small {
             const UNUSED_THRESHOLD: f32 = 0.25;
             let average_size = n_samples as f32 / n_clusters.max(1) as f32;
             (average_size * UNUSED_THRESHOLD) as u32
@@ -977,7 +967,7 @@ impl SuperKMeans {
         let mut donors = Vec::new();
         for ci in 0..n_clusters {
             let size = self.cluster_sizes[ci];
-            if size == 0 || (self.config.use_aggressive_split && size < threshold) {
+            if size == 0 || (revive_small && size < threshold) {
                 targets.push(ci);
             } else if size > 1 {
                 donors.push(ci);
@@ -1081,8 +1071,8 @@ impl SuperKMeans {
         tracking_recall: bool,
         best_recall: &mut f32,
         iters_without_improvement: &mut usize,
-        iter_idx: u32,
     ) -> bool {
+        let iter_idx = self.iteration;
         if self.shift < self.config.tol {
             if self.config.verbose {
                 println!(
