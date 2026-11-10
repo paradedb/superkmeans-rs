@@ -1153,6 +1153,70 @@ mod tests {
         );
     }
 
+    /// Stats of the last pass of each local k-means run; `iteration` restarts
+    /// at 1 with every run.
+    fn final_passes(
+        runs: &[SuperKMeansIterationStats],
+    ) -> impl Iterator<Item = &SuperKMeansIterationStats> {
+        runs.iter()
+            .enumerate()
+            .filter(|&(i, _)| runs.get(i + 1).is_none_or(|next| next.iteration == 1))
+            .map(|(_, pass)| pass)
+    }
+
+    /// Reviving a small cluster overwrites its centroid with a copy of the
+    /// donor's, but its rows only move once the next E-step runs. An early
+    /// stop on that pass would emit a leaf whose centroid sits in the donor's
+    /// region instead of among its own members.
+    #[test]
+    fn early_stop_never_ends_a_run_on_a_small_cluster_revival() {
+        let (n, d, iters_fine) = (20_000usize, 32usize, 10u32);
+        let data = make_blobs(n, d, 400, true, 1.0, 10.0, 3);
+        let mut cfg = config(32);
+        cfg.iters_fine = iters_fine;
+        cfg.base.seed = 3;
+        assert!(cfg.base.early_termination && cfg.base.use_aggressive_split);
+
+        let kmeans = HierarchicalSuperKMeans::with_config(d, cfg);
+        let fine = kmeans.train_meso_cluster(&data, n);
+
+        // The fixture has to reach the case: runs revive small clusters, and
+        // runs stop before their last configured pass.
+        assert!(fine.stats.iter().any(|pass| pass.small_revived > 0));
+        assert!(final_passes(&fine.stats).any(|pass| pass.iteration < iters_fine as usize));
+        for pass in final_passes(&fine.stats) {
+            assert_eq!(
+                pass.small_revived, 0,
+                "a run of {} clusters ended on pass {} having just revived small clusters",
+                pass.n_clusters, pass.iteration
+            );
+        }
+
+        // Every leaf centroid is the mean of the rows it was emitted with.
+        // Reviving an empty cluster nudges its donor by a factor of 1 ± 1/1024
+        // per coordinate, far inside the tolerance on unit-norm data.
+        for c in 0..fine.n_fine() {
+            let members = fine.members(c);
+            let mut mean = vec![0.0_f64; d];
+            for &row in members {
+                let row = row as usize;
+                for (m, &x) in mean.iter_mut().zip(&data[row * d..(row + 1) * d]) {
+                    *m += x as f64;
+                }
+            }
+            let dist2: f64 = mean
+                .iter()
+                .zip(&fine.centroids[c * d..(c + 1) * d])
+                .map(|(m, &x)| (m / members.len() as f64 - x as f64).powi(2))
+                .sum();
+            assert!(
+                dist2 < 1e-4,
+                "leaf {c} ({} rows): centroid is {dist2:.4} (squared) from its members' mean",
+                members.len()
+            );
+        }
+    }
+
     /// One iteration per split is a valid, if crude, setting.
     #[test]
     fn one_iteration_per_split_is_allowed() {

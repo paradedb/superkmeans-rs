@@ -32,11 +32,8 @@ pub struct SuperKMeansConfig {
     pub seed: u64,
     pub use_blas_only: bool,
     pub tol: f32,
-    pub recall_tol: f32,
     pub early_termination: bool,
     pub sample_queries: bool,
-    pub objective_k: usize,
-    pub ann_explore_fraction: f32,
     pub min_not_pruned_pct: f32,
     pub max_not_pruned_pct: f32,
     pub adjustment_factor_for_partial_d: f32,
@@ -58,11 +55,8 @@ impl Default for SuperKMeansConfig {
             seed: 42,
             use_blas_only: false,
             tol: 1.0e-4,
-            recall_tol: 0.005,
             early_termination: true,
             sample_queries: false,
-            objective_k: 100,
-            ann_explore_fraction: 0.01,
             min_not_pruned_pct: 0.03,
             max_not_pruned_pct: 0.05,
             adjustment_factor_for_partial_d: 0.20,
@@ -90,7 +84,8 @@ pub struct SuperKMeansIterationStats {
     pub iteration: usize,
     pub n_samples: usize,
     pub n_clusters: usize,
-    /// Sum of squared distances from each sample to its assigned centroid.
+    /// Sum of squared distances from each sample to the centroid it was assigned
+    /// to in this pass's E-step (the previous pass's centroids).
     pub sse: f64,
     /// Mean squared distance (`sse / n_samples`).
     pub mse: f64,
@@ -1088,6 +1083,10 @@ impl SuperKMeans {
         let Some(curr) = self.iteration_stats.last() else {
             return false;
         };
+        // Revived centroids need one more E-step before centroids and assignments agree.
+        if curr.small_revived > 0 {
+            return false;
+        }
         if curr.shift < self.config.tol {
             if self.config.verbose {
                 println!(
@@ -1266,3 +1265,41 @@ const _: () = {
     let _ = X_BATCH_SIZE;
     let _ = Y_BATCH_SIZE;
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pass(sse: f64, shift: f32, small_revived: usize) -> SuperKMeansIterationStats {
+        SuperKMeansIterationStats {
+            sse,
+            shift,
+            small_revived,
+            ..Default::default()
+        }
+    }
+
+    fn stops_early(passes: Vec<SuperKMeansIterationStats>) -> bool {
+        let mut kmeans = SuperKMeans::new(4, 8);
+        kmeans.iteration_stats = passes;
+        kmeans.should_stop_early()
+    }
+
+    /// A revived small cluster holds a copy of its donor's centroid while its
+    /// rows are still the old members, so neither convergence test may end
+    /// the run on that pass.
+    #[test]
+    fn early_stop_waits_out_a_small_cluster_revival() {
+        // SSE went up, which is what the E-step after a revival looks like.
+        assert!(stops_early(vec![pass(100.0, 1.0, 0), pass(101.0, 1.0, 0)]));
+        assert!(!stops_early(vec![pass(100.0, 1.0, 1), pass(101.0, 1.0, 1)]));
+
+        // Centroids barely moved.
+        assert!(stops_early(vec![pass(100.0, 0.0, 0)]));
+        assert!(!stops_early(vec![pass(100.0, 0.0, 1)]));
+
+        // Only the current pass matters: the E-step after a revival has
+        // already moved the rows.
+        assert!(stops_early(vec![pass(100.0, 1.0, 1), pass(101.0, 1.0, 0)]));
+    }
+}
