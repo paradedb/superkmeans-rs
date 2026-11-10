@@ -654,7 +654,7 @@ impl HierarchicalSuperKMeans {
         skm.data_norms = norms.to_vec();
         skm.centroid_norms = squared_norms(&skm.prev_centroids, k, d);
 
-        skm.run_core_loop(subset, iters);
+        skm.run_core_loop(subset);
 
         stats.append(&mut skm.iteration_stats);
         (skm.horizontal_centroids, skm.assignments)
