@@ -21,7 +21,7 @@ use superkmeans::{
 const COHERE_N: usize = 1_000_000;
 const COHERE_D: usize = 1024;
 const TOP_K: usize = 10;
-const TARGET_LEAF_SIZE: usize = 100;
+const MAX_LEAF_SIZE: usize = 100;
 
 /// Read the first `rows` vectors of the Cohere dump, or `None` if it is absent.
 fn load_cohere(rows: usize) -> Option<(Vec<f32>, usize)> {
@@ -86,7 +86,7 @@ fn main() {
     let (base, queries) = all.split_at(n * d);
     println!(
         "n={n} d={d} queries={n_queries} train_fraction={train_fraction} \
-         target_leaf_size={TARGET_LEAF_SIZE} top_k={TOP_K}"
+         max_leaf_size={MAX_LEAF_SIZE} top_k={TOP_K}"
     );
 
     print!("computing exact ground truth... ");
@@ -104,11 +104,11 @@ fn main() {
     }
     let n_train = train_set.len() / d;
 
-    // target_leaf_size applies to the training sample, so scale it down to land on
+    // max_leaf_size applies to the training sample, so scale it down to land on
     // the same number of leaves the full set would have produced.
-    let leaf_size = (TARGET_LEAF_SIZE / stride).max(1);
+    let leaf_size = (MAX_LEAF_SIZE / stride).max(1);
     let mut cfg = HierarchicalSuperKMeansConfig {
-        target_leaf_size: leaf_size,
+        max_leaf_size: leaf_size,
         ..Default::default()
     };
     cfg.base.suppress_warnings = true;

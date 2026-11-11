@@ -44,7 +44,7 @@ control parallelism, or run training in your own Rayon thread pool.
 For data that does not fit in memory, `train_iter` accepts replayable batches;
 `train_dataset` supports fallible data sources. Both scan the data on each pass.
 [`HierarchicalSuperKMeans`](https://docs.rs/superkmeans-rs/latest/superkmeans/struct.HierarchicalSuperKMeans.html)
-splits clusters until they are close to a target size and also supports streaming the
+splits clusters until they fit within a maximum leaf size and also supports streaming the
 initial partition. See the API docs and [examples](examples) for these workflows.
 
 ## BLAS backends

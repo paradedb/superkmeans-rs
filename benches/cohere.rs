@@ -21,8 +21,8 @@ use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, SuperK
 const N: usize = 1_000_000;
 const D: usize = 1024;
 const K: usize = 10_000;
-/// Target roughly K leaves for the hierarchical bench (`N / target_leaf_size`).
-const HIER_TARGET_LEAF_SIZE: usize = N / K;
+/// Request at least K leaves for the hierarchical bench (`N / max_leaf_size`).
+const HIER_MAX_LEAF_SIZE: usize = N / K;
 
 fn data_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/data_cohere_1m.bin")
@@ -82,12 +82,12 @@ fn bench_train(c: &mut Criterion) {
     group.bench_function(
         BenchmarkId::new(
             "HierarchicalSuperKMeans",
-            format!("n{N}_leaf{HIER_TARGET_LEAF_SIZE}_d{D}"),
+            format!("n{N}_leaf{HIER_MAX_LEAF_SIZE}_d{D}"),
         ),
         |b| {
             b.iter(|| {
                 let cfg = HierarchicalSuperKMeansConfig {
-                    target_leaf_size: HIER_TARGET_LEAF_SIZE,
+                    max_leaf_size: HIER_MAX_LEAF_SIZE,
                     ..Default::default()
                 };
                 let mut kmeans = HierarchicalSuperKMeans::with_config(D, cfg);
@@ -110,7 +110,7 @@ fn bench_assign(c: &mut Criterion) {
     };
     let hier_centroids = {
         let cfg = HierarchicalSuperKMeansConfig {
-            target_leaf_size: HIER_TARGET_LEAF_SIZE,
+            max_leaf_size: HIER_MAX_LEAF_SIZE,
             ..Default::default()
         };
         let mut kmeans = HierarchicalSuperKMeans::with_config(D, cfg);
@@ -136,7 +136,7 @@ fn bench_assign(c: &mut Criterion) {
     group.bench_function(
         BenchmarkId::new(
             "HierarchicalSuperKMeans",
-            format!("n{N}_leaf{HIER_TARGET_LEAF_SIZE}_d{D}"),
+            format!("n{N}_leaf{HIER_MAX_LEAF_SIZE}_d{D}"),
         ),
         |b| {
             b.iter(|| {

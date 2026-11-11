@@ -24,9 +24,9 @@ fn distortion(data: &[f32], d: usize, centroids: &[f32], assignments: &[u32]) ->
     total / assignments.len() as f64
 }
 
-fn leaf_config(target_leaf_size: usize) -> HierarchicalSuperKMeansConfig {
+fn leaf_config(max_leaf_size: usize) -> HierarchicalSuperKMeansConfig {
     HierarchicalSuperKMeansConfig {
-        target_leaf_size,
+        max_leaf_size,
         ..Default::default()
     }
 }
@@ -108,9 +108,9 @@ fn streaming_with_pruning_matches_in_memory_quality() {
 /// it: stream the meso step, then load and split one meso cluster at a time.
 #[test]
 fn hierarchical_trains_from_an_iterator() {
-    let (n, d, target_leaf_size) = (20_000usize, 32usize, 100usize);
+    let (n, d, max_leaf_size) = (20_000usize, 32usize, 100usize);
     let data = make_blobs(n, d, 40, true, 1.0, 10.0, 7);
-    let cfg = leaf_config(target_leaf_size);
+    let cfg = leaf_config(max_leaf_size);
     let kmeans = HierarchicalSuperKMeans::with_config(d, cfg.clone());
 
     let meso = kmeans.train_meso_iter(Matrix::new(&data, n, d).chunks(1_000), n);
@@ -148,9 +148,8 @@ fn hierarchical_trains_from_an_iterator() {
         assignments.iter().all(|&a| a != u32::MAX),
         "rows left unassigned"
     );
-    let split_limit = ((target_leaf_size as f64) * std::f64::consts::SQRT_2).floor() as usize;
-    assert!(sizes.iter().all(|&s| s > 0 && s <= split_limit));
-    assert!(sizes.len() >= n.div_ceil(split_limit));
+    assert!(sizes.iter().all(|&s| s > 0 && s <= max_leaf_size));
+    assert!(sizes.len() >= n.div_ceil(max_leaf_size));
 
     let mut in_memory = HierarchicalSuperKMeans::with_config(d, cfg);
     let reference = in_memory.train(&data, n);
