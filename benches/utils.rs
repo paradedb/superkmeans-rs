@@ -16,6 +16,7 @@
 //!   cargo bench --bench utils
 //!   cargo bench --bench utils -- centroid_shift
 //!   cargo bench --bench utils -- d768
+//!   cargo bench --bench utils -- soar
 
 use std::hint::black_box;
 use std::time::Duration;
@@ -25,11 +26,12 @@ use criterion::{
     BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
 };
 use superkmeans::utils::{
-    centroid_shift_parallel, centroid_shift_sequential, make_blobs, mean_rows_by_count_parallel,
-    mean_rows_by_count_sequential, normalize_rows_l2_parallel, normalize_rows_l2_sequential,
-    squared_norms_partial_parallel, squared_norms_partial_sequential,
+    centroid_shift_parallel, centroid_shift_sequential, generate_random_vectors, make_blobs,
+    mean_rows_by_count_parallel, mean_rows_by_count_sequential, normalize_rows_l2_parallel,
+    normalize_rows_l2_sequential, squared_norms_partial_parallel, squared_norms_partial_sequential,
     sum_rows_by_assignment_parallel, sum_rows_by_assignment_sequential,
 };
+use superkmeans::{Matrix, SoarAssigner, assign};
 
 const DIMS: [usize; 3] = [128, 768, 1536];
 const CLUSTERS: [usize; 5] = [2, 8, 32, 128, 1024];
@@ -272,12 +274,50 @@ fn bench_normalize_rows_l2(c: &mut Criterion) {
     group.finish();
 }
 
+/// Nearest-centroid assignment against SOAR pairs (`lambda` 2), the secondary from a GEMM of unit
+/// residuals (`two_gemm_soar`, Gram budget 0) or from the first pass's dot products and the
+/// centroid Gram matrix (`gram_soar`, assigner built outside the timed loop). `gram_build` is
+/// that one-off construction.
+fn bench_soar(c: &mut Criterion) {
+    let mut group = c.benchmark_group("soar");
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(5));
+    group.sample_size(20);
+
+    let (n, d) = (16_384, 1_024);
+    let vectors = generate_random_vectors(n, d, -1.0, 1.0, 1);
+    for k in [512, 2_048] {
+        let centroids = generate_random_vectors(k, d, -1.0, 1.0, 2);
+        let centers = Matrix::new(&centroids, k, d);
+        let id = vector_id(n, d, k);
+        group.throughput(Throughput::Elements(n as u64));
+
+        group.bench_function(BenchmarkId::new("assign", &id), |b| {
+            b.iter(|| black_box(assign(Matrix::new(black_box(&vectors), n, d), centers)));
+        });
+        let two_gemm = SoarAssigner::new(centers, 2.0, 2, 0);
+        group.bench_function(BenchmarkId::new("two_gemm_soar", &id), |b| {
+            b.iter(|| black_box(two_gemm.assign(black_box(&vectors), n)));
+        });
+        let gram = SoarAssigner::new(centers, 2.0, 2, usize::MAX);
+        group.bench_function(BenchmarkId::new("gram_soar", &id), |b| {
+            b.iter(|| black_box(gram.assign(black_box(&vectors), n)));
+        });
+        group.bench_function(BenchmarkId::new("gram_build", &id), |b| {
+            b.iter(|| black_box(SoarAssigner::new(black_box(centers), 2.0, 2, usize::MAX)));
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_centroid_shift,
     bench_squared_norms,
     bench_sum_rows_by_assignment,
     bench_mean_rows_by_count,
-    bench_normalize_rows_l2
+    bench_normalize_rows_l2,
+    bench_soar
 );
 criterion_main!(benches);
