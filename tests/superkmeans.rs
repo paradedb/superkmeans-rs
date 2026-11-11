@@ -371,7 +371,7 @@ fn hierarchical_train_owned_matches_train() {
     let data = make_blobs(n, d, 200, false, 1.0, 10.0, 42);
 
     let mut cfg = HierarchicalSuperKMeansConfig {
-        max_leaf_size: 50,
+        target_leaf_size: 50,
         ..Default::default()
     };
     cfg.base.seed = 42;

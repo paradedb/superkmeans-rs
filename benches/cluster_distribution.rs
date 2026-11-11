@@ -251,7 +251,7 @@ fn bench_full_sample_baseline(base: &[f32], n: usize, full_leaf_size: usize) {
     {
         let mut timer = TicToc::new();
         let mut cfg = HierarchicalSuperKMeansConfig {
-            max_leaf_size: full_leaf_size,
+            target_leaf_size: full_leaf_size,
             ..Default::default()
         };
         cfg.base.angular = true;
@@ -329,7 +329,7 @@ fn bench_sample_sweep(base: &[f32], n: usize, full_leaf_size: usize) {
 
         let mut timer = TicToc::new();
         let mut cfg = HierarchicalSuperKMeansConfig {
-            max_leaf_size: sample_leaf_size,
+            target_leaf_size: sample_leaf_size,
             ..Default::default()
         };
         cfg.base.angular = true;
@@ -400,7 +400,7 @@ fn mean_squared_error(
 fn bench_iterations_sweep(base: &[f32], n: usize, full_leaf_size: usize) {
     let target_k = n.div_ceil(full_leaf_size);
     println!(
-        "\n=== 3. Iteration Count Sweep (sample = 100%, n = {n}, max_leaf_size = {full_leaf_size}, target_k = {target_k}) ==="
+        "\n=== 3. Iteration Count Sweep (sample = 100%, n = {n}, target_leaf_size = {full_leaf_size}, target_k = {target_k}) ==="
     );
     println!(
         "{:<14} {:>9} {:>8} {:>8} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>7} {:>6} {:>8} {:>8} {:>8}",
@@ -465,7 +465,7 @@ fn bench_iterations_sweep(base: &[f32], n: usize, full_leaf_size: usize) {
     for (iters_meso, iters_fine) in [(1u32, 2u32), (2, 3), (3, 5), (4, 8), (5, 12), (8, 16)] {
         let mut timer = TicToc::new();
         let mut cfg = HierarchicalSuperKMeansConfig {
-            max_leaf_size: full_leaf_size,
+            target_leaf_size: full_leaf_size,
             iters_meso,
             iters_fine,
             ..Default::default()

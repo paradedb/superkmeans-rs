@@ -1,8 +1,8 @@
 //! Hierarchical SuperKMeans.
 //!
 //! The sample is split into `⌈√K⌉` meso clusters, with
-//! `K = ⌈n / max_leaf_size⌉`. Each meso cluster larger than `max_leaf_size`
-//! is re-clustered into `⌈n_sub / max_leaf_size⌉` groups, and any group that
+//! `K = ⌈n / target_leaf_size⌉`. Each meso cluster larger than `target_leaf_size`
+//! is re-clustered into `⌈n_sub / target_leaf_size⌉` groups, and any group that
 //! is still too large is split the same way. Training returns those fine centroids.
 //! Balance comes from each split reviving its own undersized clusters
 //! (`use_aggressive_split`).
@@ -34,12 +34,12 @@ use crate::utils::{normalize_rows_l2_sequential, squared_norms};
 pub struct HierarchicalSuperKMeansConfig {
     /// Settings for the k-means run performed at each split.
     pub base: SuperKMeansConfig,
-    /// Maximum training points per leaf cluster. Clusters larger than this
-    /// cap are split recursively.
-    pub max_leaf_size: usize,
+    /// Target training points per leaf cluster, enforced as a hard cap.
+    /// Clusters larger than this size are split recursively.
+    pub target_leaf_size: usize,
     /// Iterations for the initial \(\lceil\sqrt{K}\rceil\) meso split.
     pub iters_meso: u32,
-    /// Iterations for every later split of a cluster larger than `max_leaf_size`.
+    /// Iterations for every later split of a cluster larger than `target_leaf_size`.
     pub iters_fine: u32,
 }
 
@@ -51,7 +51,7 @@ impl Default for HierarchicalSuperKMeansConfig {
         base.use_aggressive_split = true;
         Self {
             base,
-            max_leaf_size: 256,
+            target_leaf_size: 256,
             iters_meso: 3,
             iters_fine: 5,
         }
@@ -147,7 +147,7 @@ struct Child {
 
 /// Hierarchical k-means: a `⌈√K⌉` meso split, then repeated
 /// splits of any cluster larger than
-/// [`HierarchicalSuperKMeansConfig::max_leaf_size`].
+/// [`HierarchicalSuperKMeansConfig::target_leaf_size`].
 ///
 /// [`Self::train`] returns the fine centroids. Their count is
 /// [`SuperKMeans::n_clusters`] on [`Self::base`].
@@ -159,7 +159,7 @@ struct Child {
 /// let data = vec![0.0_f32; n * d];
 ///
 /// let mut config = HierarchicalSuperKMeansConfig::default();
-/// config.max_leaf_size = 64;
+/// config.target_leaf_size = 64;
 ///
 /// let mut kmeans = HierarchicalSuperKMeans::with_config(d, config);
 /// let centroids = kmeans.train(&data, n);
@@ -186,9 +186,12 @@ impl HierarchicalSuperKMeans {
     ///
     /// # Panics
     ///
-    /// Panics if `max_leaf_size`, `iters_meso`, or `iters_fine` is zero.
+    /// Panics if `target_leaf_size`, `iters_meso`, or `iters_fine` is zero.
     pub fn with_config(dimensionality: usize, config: HierarchicalSuperKMeansConfig) -> Self {
-        assert!(config.max_leaf_size >= 1, "max_leaf_size must be positive");
+        assert!(
+            config.target_leaf_size >= 1,
+            "target_leaf_size must be positive"
+        );
         assert!(config.iters_meso > 0, "iters_meso must be positive");
         assert!(config.iters_fine > 0, "iters_fine must be positive");
 
@@ -287,8 +290,8 @@ impl HierarchicalSuperKMeans {
 
         if base.config.verbose {
             println!(
-                "HierarchicalSuperKMeans: n_clusters={}, max_leaf_size={}",
-                n_clusters, self.config.max_leaf_size
+                "HierarchicalSuperKMeans: n_clusters={}, target_leaf_size={}",
+                n_clusters, self.config.target_leaf_size
             );
         }
 
@@ -394,7 +397,7 @@ impl HierarchicalSuperKMeans {
     }
 
     /// Fine step for one meso cluster: split its `n` row-major vectors into
-    /// fine clusters of at most `max_leaf_size` rows each.
+    /// fine clusters of at most `target_leaf_size` rows each.
     ///
     /// `data` is borrowed so the caller keeps the original vectors, e.g. to
     /// write them out in [`FineClusters::order`]; the rotated working copy is
@@ -516,7 +519,7 @@ impl HierarchicalSuperKMeans {
         )
     }
 
-    /// Split `meso` until every leaf has at most `max_leaf_size` rows, appending
+    /// Split `meso` until every leaf has at most `target_leaf_size` rows, appending
     /// each leaf's centroid and size in row order, so the sizes' running sum
     /// gives each leaf's row range.
     fn split_to_leaves(
@@ -625,10 +628,10 @@ impl HierarchicalSuperKMeans {
 
     /// How many meso clusters a sample of `n` points should start with.
     ///
-    /// `⌈√K⌉` with `K = ⌈n / max_leaf_size⌉`.
+    /// `⌈√K⌉` with `K = ⌈n / target_leaf_size⌉`.
     /// Returns `0` when the sample already fits in one cluster.
     fn meso_clusters(&self, n: usize) -> usize {
-        let target = n.div_ceil(self.config.max_leaf_size);
+        let target = n.div_ceil(self.config.target_leaf_size);
         if target < 2 {
             return 0;
         }
@@ -638,10 +641,10 @@ impl HierarchicalSuperKMeans {
 
     /// How many clusters a later split of `n_sub` points should request.
     ///
-    /// `⌈n_sub / max_leaf_size⌉`. Returns `0` when the subset already fits
+    /// `⌈n_sub / target_leaf_size⌉`. Returns `0` when the subset already fits
     /// in one cluster.
     fn fine_clusters(&self, n_sub: usize) -> usize {
-        let k = n_sub.div_ceil(self.config.max_leaf_size);
+        let k = n_sub.div_ceil(self.config.target_leaf_size);
         if k < 2 { 0 } else { k }
     }
 
@@ -795,7 +798,7 @@ fn partition_and_repair(
     let offsets = rows.partition(assignments, k, scratch);
 
     // The clustering collapsed onto one cluster; bisect so the
-    // max_leaf_size split loop keeps making progress.
+    // target_leaf_size split loop keeps making progress.
     if offsets.windows(2).filter(|b| b[1] > b[0]).count() < 2 {
         return (vec![0, (n_sub / 2).clamp(1, n_sub - 1), n_sub], true);
     }
@@ -958,10 +961,10 @@ mod tests {
         }
     }
 
-    /// Default config with only the maximum leaf size overridden.
-    fn config(max_leaf_size: usize) -> HierarchicalSuperKMeansConfig {
+    /// Default config with only the target leaf size overridden.
+    fn config(target_leaf_size: usize) -> HierarchicalSuperKMeansConfig {
         HierarchicalSuperKMeansConfig {
-            max_leaf_size,
+            target_leaf_size,
             ..Default::default()
         }
     }
@@ -1064,7 +1067,7 @@ mod tests {
 
         // The whole sample fits in one leaf, so this mean never sees k-means.
         let mut one_leaf = cfg.clone();
-        one_leaf.max_leaf_size = n;
+        one_leaf.target_leaf_size = n;
         let mut trained = HierarchicalSuperKMeans::with_config(d, one_leaf);
         let centroid = trained.train(&data, n);
         assert_eq!(trained.base.n_clusters, 1);
@@ -1106,14 +1109,14 @@ mod tests {
 
     /// The fine pass has to run: stopping after the meso split would leave
     /// clusters far above the split threshold, and the cluster count well below
-    /// `n / max_leaf_size`.
+    /// `n / target_leaf_size`.
     #[test]
     fn fine_pass_runs_on_oversized_meso_clusters() {
-        let (n, max_leaf_size) = (10_000usize, 100usize);
-        let kmeans = train(n, 16, config(max_leaf_size));
+        let (n, target_leaf_size) = (10_000usize, 100usize);
+        let kmeans = train(n, 16, config(target_leaf_size));
 
         assert!(
-            kmeans.base.n_clusters >= n.div_ceil(max_leaf_size),
+            kmeans.base.n_clusters >= n.div_ceil(target_leaf_size),
             "stopping after the meso split cannot cover {n} points with {} clusters",
             kmeans.base.n_clusters
         );
@@ -1122,7 +1125,7 @@ mod tests {
                 .base
                 .cluster_sizes
                 .iter()
-                .all(|&s| s as usize <= max_leaf_size)
+                .all(|&s| s as usize <= target_leaf_size)
         );
     }
 
@@ -1131,10 +1134,10 @@ mod tests {
     /// it: 0 is perfectly even, 1.0 means the spread is as large as the mean.
     #[test]
     fn cluster_sizes_stay_balanced() {
-        let (n, d, max_leaf_size) = (20_000usize, 32usize, 100usize);
+        let (n, d, target_leaf_size) = (20_000usize, 32usize, 100usize);
         let data = make_blobs(n, d, 40, true, 1.0, 10.0, 7);
 
-        let mut kmeans = HierarchicalSuperKMeans::with_config(d, config(max_leaf_size));
+        let mut kmeans = HierarchicalSuperKMeans::with_config(d, config(target_leaf_size));
         let _ = kmeans.train(&data, n);
 
         let sizes: Vec<f64> = kmeans
@@ -1259,19 +1262,19 @@ mod tests {
 
     #[test]
     fn cluster_count_tracks_the_requested_granularity() {
-        let (n, d, max_leaf_size) = (2_000usize, 16usize, 20usize);
+        let (n, d, target_leaf_size) = (2_000usize, 16usize, 20usize);
 
-        let kmeans = train(n, d, config(max_leaf_size));
-        let ideal = n.div_ceil(max_leaf_size);
+        let kmeans = train(n, d, config(target_leaf_size));
+        let ideal = n.div_ceil(target_leaf_size);
 
         assert!(
             kmeans.base.n_clusters >= ideal,
-            "cannot cover {n} points with {} clusters capped at {max_leaf_size}",
+            "cannot cover {n} points with {} clusters capped at {target_leaf_size}",
             kmeans.base.n_clusters
         );
         assert!(
             kmeans.base.n_clusters <= ideal * 2,
-            "cluster count {} overshoots the {ideal} implied by max_leaf_size",
+            "cluster count {} overshoots the {ideal} implied by target_leaf_size",
             kmeans.base.n_clusters
         );
     }
