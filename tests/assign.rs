@@ -7,8 +7,8 @@ use std::collections::HashSet;
 
 use superkmeans::batch::{find_nearest_neighbor, find_soar_assignments};
 use superkmeans::{
-    Matrix, SuperKMeans, SuperKMeansConfig, assign, assign_soar, assign_soar_replicas,
-    generate_random_vectors, make_blobs, squared_norms,
+    Matrix, SoarAssigner, SuperKMeans, SuperKMeansConfig, assign, assign_soar,
+    assign_soar_replicas, generate_random_vectors, make_blobs, squared_norms,
 };
 
 fn find_nearest_centroid_brute_force(
@@ -686,4 +686,192 @@ fn soar_four_replicas_are_deterministic_across_tiles_and_threads() {
     );
     assert_eq!(primary, vec![0; n]);
     assert!(secondary.chunks(3).all(|row| row == [1, 2, 3]));
+}
+
+// --- SOAR from the centroid Gram matrix ---
+
+/// The cumulative SOAR cost of `candidate` for `point` after the cells in `chosen`, in binary64:
+/// `‖x − c‖² + lambda · Σ ⟨x − c, r̂_p⟩²` over `p` in `chosen`, `r̂_p` the unit residual to `p`
+/// (zero on the centroid itself).
+fn soar_cost_f64(
+    point: &[f32],
+    centroids: &[f32],
+    d: usize,
+    chosen: &[u32],
+    candidate: u32,
+    lambda: f32,
+) -> f64 {
+    let row = &centroids[candidate as usize * d..][..d];
+    let distance: f64 = point
+        .iter()
+        .zip(row)
+        .map(|(&a, &b)| (a as f64 - b as f64).powi(2))
+        .sum();
+    let penalty: f64 = chosen
+        .iter()
+        .map(|&previous| {
+            let prev = &centroids[previous as usize * d..][..d];
+            let norm = point
+                .iter()
+                .zip(prev)
+                .map(|(&a, &b)| (a as f64 - b as f64).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            if norm == 0.0 {
+                return 0.0;
+            }
+            let gap: f64 = point
+                .iter()
+                .zip(prev.iter().zip(row))
+                .map(|(&a, (&p, &c))| (a as f64 - p as f64) / norm * (a as f64 - c as f64))
+                .sum();
+            gap * gap
+        })
+        .sum();
+    distance + lambda as f64 * penalty
+}
+
+/// The Gram path against the residual GEMM (`gram_budget_bytes` 0) on one fixture: identical
+/// primaries, and each secondary either identical or, at the first slot where the two differ, a
+/// near tie: the two candidates' costs agree within 1e-4 relative. Later slots of that row follow
+/// different histories and are not compared. Returns how many rows differ.
+fn assert_gram_matches_the_residual_gemm(
+    data: &[f32],
+    centroids: &[f32],
+    n: usize,
+    k: usize,
+    d: usize,
+    lambda: f32,
+    replicas: usize,
+) -> usize {
+    let centers = Matrix::new(centroids, k, d);
+    let (gram_primary, gram_secondary) =
+        SoarAssigner::new(centers, lambda, replicas, usize::MAX).assign(data, n);
+    let (gemm_primary, gemm_secondary) =
+        SoarAssigner::new(centers, lambda, replicas, 0).assign(data, n);
+    assert_eq!(gram_primary, gemm_primary, "primaries");
+    let slots = replicas - 1;
+    let mut differing = 0;
+    for row in 0..n {
+        let point = &data[row * d..(row + 1) * d];
+        let mut chosen = vec![gram_primary[row]];
+        for slot in 0..slots {
+            let (a, b) = (
+                gram_secondary[row * slots + slot],
+                gemm_secondary[row * slots + slot],
+            );
+            if a == b {
+                chosen.push(a);
+                continue;
+            }
+            differing += 1;
+            assert!(
+                a != u32::MAX && b != u32::MAX,
+                "row {row} slot {slot}: {a} vs {b}"
+            );
+            assert!(
+                !chosen.contains(&a),
+                "row {row} slot {slot}: {a} already chosen"
+            );
+            let cost_a = soar_cost_f64(point, centroids, d, &chosen, a, lambda);
+            let cost_b = soar_cost_f64(point, centroids, d, &chosen, b, lambda);
+            assert!(
+                (cost_a - cost_b).abs() <= 1e-4 * cost_a.max(cost_b),
+                "row {row} slot {slot}: Gram picks {a} at {cost_a}, residual GEMM {b} at {cost_b}"
+            );
+            break;
+        }
+    }
+    differing
+}
+
+#[test]
+fn soar_gram_matches_the_residual_gemm_on_the_soar_fixtures() {
+    let fixtures = [
+        // soar_primaries_equal_find_nearest_neighbor
+        (
+            generate_random_vectors(5_000, 32, -1.0, 1.0, 7),
+            generate_random_vectors(300, 32, -1.0, 1.0, 11),
+            32,
+        ),
+        // soar_secondaries_minimize_the_objective
+        (
+            make_blobs(3_000, 24, 200, false, 1.0, 10.0, 5),
+            generate_random_vectors(200, 24, -10.0, 10.0, 9),
+            24,
+        ),
+        // soar_crosses_tile_boundaries: two x-tiles and two centroid tiles
+        (
+            generate_random_vectors(9_000, 8, -1.0, 1.0, 41),
+            generate_random_vectors(2_100, 8, -1.0, 1.0, 43),
+            8,
+        ),
+        // soar_four_replicas_minimize_cumulative_residual_loss
+        (
+            generate_random_vectors(257, 16, -1.0, 1.0, 71),
+            generate_random_vectors(79, 16, -1.0, 1.0, 73),
+            16,
+        ),
+    ];
+    for (data, centroids, d) in &fixtures {
+        let (n, k) = (data.len() / d, centroids.len() / d);
+        for lambda in [0.0_f32, 2.0, 50.0] {
+            for replicas in [2, 3] {
+                let differing = assert_gram_matches_the_residual_gemm(
+                    data, centroids, n, k, *d, lambda, replicas,
+                );
+                assert!(
+                    differing * 100 <= n,
+                    "{differing} of {n} rows differ (k={k}, lambda={lambda}, replicas={replicas})"
+                );
+            }
+        }
+    }
+}
+
+/// A vector on its nearest centroid has no residual direction, so the Gram path, like the
+/// residual GEMM, adds no penalty and picks the second-nearest centroid.
+#[test]
+fn soar_gram_on_a_centroid_picks_the_second_nearest() {
+    let (d, k) = (16, 40);
+    let centroids = generate_random_vectors(k, d, -1.0, 1.0, 91);
+    let data = centroids.clone();
+    let (primary, secondary) =
+        SoarAssigner::new(Matrix::new(&centroids, k, d), 50.0, 2, usize::MAX).assign(&data, k);
+    for row in 0..k {
+        let point = &data[row * d..(row + 1) * d];
+        let mut distances: Vec<(f32, u32)> = (0..k)
+            .map(|c| (l2_sq(point, &centroids[c * d..(c + 1) * d]), c as u32))
+            .collect();
+        distances.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        assert_eq!(primary[row], row as u32);
+        assert_eq!(secondary[row], distances[1].1, "row {row}");
+    }
+}
+
+/// Three replicas on the Gram path minimize the cumulative cost slot by slot.
+#[test]
+fn soar_gram_three_replicas_minimize_cumulative_residual_loss() {
+    let (n, d, k) = (600, 16, 120);
+    let data = generate_random_vectors(n, d, -1.0, 1.0, 97);
+    let centroids = generate_random_vectors(k, d, -1.0, 1.0, 101);
+    for lambda in [0.0_f32, 2.0, 50.0] {
+        let (primary, secondary) =
+            SoarAssigner::new(Matrix::new(&centroids, k, d), lambda, 3, usize::MAX)
+                .assign(&data, n);
+        for row in 0..n {
+            let point = &data[row * d..(row + 1) * d];
+            let mut chosen = vec![primary[row]];
+            for &actual in &secondary[row * 2..(row + 1) * 2] {
+                assert!(!chosen.contains(&actual), "row {row}");
+                let cost = |c: u32| soar_cost_f64(point, &centroids, d, &chosen, c, lambda);
+                let best = (0..k as u32)
+                    .filter(|c| !chosen.contains(c))
+                    .map(cost)
+                    .fold(f64::MAX, f64::min);
+                assert!(cost(actual) <= best * (1.0 + 1e-4), "row {row}");
+                chosen.push(actual);
+            }
+        }
+    }
 }

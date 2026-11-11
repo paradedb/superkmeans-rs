@@ -292,6 +292,171 @@ pub fn find_soar_replica_assignments(
     }
 }
 
+/// Row-major `G = Y Yᵀ` over the `n_y` centroids: `G[a · n_y + b] = ⟨y_a, y_b⟩`.
+pub(crate) fn gram_matrix(y: &[f32], n_y: usize, d: usize) -> Vec<f32> {
+    let mut gram = vec![0.0_f32; n_y * n_y];
+    if n_y > 0 {
+        blas_dot_products(y, y, n_y, n_y, d, d, &mut gram, n_y);
+    }
+    gram
+}
+
+/// SOAR assignments as [`find_soar_replica_assignments`], with each secondary taken from the
+/// first pass's dot products and the centroid Gram matrix instead of a GEMM of unit residuals.
+///
+/// Pass 1 is the same GEMM over the same tiles, so the primaries are identical. For the previous
+/// choice `p` with `n = ‖x − y_p‖ = √(‖x‖² − 2⟨x, y_p⟩ + ‖y_p‖²)` and `r̂ = (x − y_p) / n`
+/// (zero when `n` is zero or not finite), `⟨x, r̂⟩ = (‖x‖² − ⟨x, y_p⟩) / n` and
+/// `⟨r̂, y_c⟩ = (⟨x, y_c⟩ − G[p][c]) / n`: both come from numbers already held, so the
+/// alignment penalty costs one pass over the row and no second GEMM. Requires `replicas ≥ 2`,
+/// `n_y ≥ 2` and `gram` from [`gram_matrix`] over `y`.
+pub(crate) fn find_soar_replica_assignments_gram(
+    x: &[f32],
+    y: &[f32],
+    n_x: usize,
+    n_y: usize,
+    d: usize,
+    norms_x: &[f32],
+    norms_y: &[f32],
+    gram: &[f32],
+    lambda: f32,
+    replicas: usize,
+    out_primary: &mut [u32],
+    out_secondary: &mut [u32],
+) {
+    assert!(replicas >= 2 && n_y >= 2);
+    let secondaries = replicas - 1;
+    assert!(out_primary.len() >= n_x);
+    assert!(out_secondary.len() >= n_x * secondaries);
+    assert_eq!(gram.len(), n_y * n_y);
+    debug_assert!(x.len() >= n_x * d);
+    debug_assert!(y.len() >= n_y * d);
+    debug_assert!(norms_x.len() >= n_x && norms_y.len() >= n_y);
+    for v in out_primary.iter_mut().take(n_x) {
+        *v = 0;
+    }
+    for v in out_secondary.iter_mut().take(n_x * secondaries) {
+        *v = u32::MAX;
+    }
+    if n_x == 0 {
+        return;
+    }
+
+    // The tiles of `find_soar_replica_assignments`, so pass 1 runs the same SGEMM calls.
+    let tile = soar_tile_rows(n_x, n_y);
+    let y_tile = Y_BATCH_SIZE.min(n_y);
+    let mut dots = vec![0.0_f32; tile * n_y];
+
+    let mut i = 0;
+    while i < n_x {
+        let t = tile.min(n_x - i);
+        let x_tile = &x[i * d..(i + t) * d];
+        let primary = &mut out_primary[i..i + t];
+        let secondary = &mut out_secondary[i * secondaries..(i + t) * secondaries];
+        let block_len = t * y_tile;
+        let dots = &mut dots[..t * n_y];
+
+        // Pass 1: centroid-major blocks of `⟨x, y_c⟩`.
+        dots.par_chunks_mut(block_len)
+            .enumerate()
+            .for_each(|(block, products)| {
+                let j = block * y_tile;
+                let cols = products.len() / t;
+                blas_dot_products(
+                    x_tile,
+                    &y[j * d..(j + cols) * d],
+                    t,
+                    cols,
+                    d,
+                    d,
+                    products,
+                    cols,
+                );
+            });
+        let dots = &*dots;
+        // Row `r`'s product with centroid `c`.
+        let dot_at = |r: usize, c: usize| {
+            let block = c / y_tile;
+            let cols = y_tile.min(n_y - block * y_tile);
+            dots[block * block_len + r * cols + c - block * y_tile]
+        };
+
+        primary
+            .par_iter_mut()
+            .zip(secondary.par_chunks_mut(secondaries))
+            .enumerate()
+            .for_each_init(
+                || vec![0.0_f32; n_y],
+                |dist, (r, (first, chosen))| {
+                    let norm_x = norms_x[i + r];
+                    // Distances and the primary, reduced block by block as pass 1 of
+                    // `find_soar_replica_assignments` reduces them, clamp included.
+                    let mut best = f32::MAX;
+                    for (block, products) in dots.chunks(block_len).enumerate() {
+                        let j = block * y_tile;
+                        let cols = products.len() / t;
+                        let row = &products[r * cols..(r + 1) * cols];
+                        let mut min_v = f32::MAX;
+                        let mut min_c = 0;
+                        for (c, (out, &dot)) in dist[j..j + cols].iter_mut().zip(row).enumerate() {
+                            let value = -2.0 * dot + norm_x + norms_y[j + c];
+                            *out = value;
+                            if value < min_v {
+                                min_v = value;
+                                min_c = c;
+                            }
+                        }
+                        if min_v < best {
+                            best = min_v.max(0.0);
+                            *first = (j + min_c) as u32;
+                        }
+                    }
+
+                    // Each secondary adds its predecessor's alignment penalty to every cost,
+                    // cumulatively, and takes the first strict minimum among the unchosen.
+                    let mut previous = *first as usize;
+                    for slot in chosen.iter_mut().take(secondaries.min(n_y - 1)) {
+                        dist[previous] = f32::INFINITY;
+                        let dot_previous = dot_at(r, previous);
+                        let squared = norm_x - 2.0 * dot_previous + norms_y[previous];
+                        let n1 = squared.max(0.0).sqrt();
+                        let inv = if n1 > 0.0 && n1.is_finite() {
+                            1.0 / n1
+                        } else {
+                            0.0
+                        };
+                        let along = (norm_x - dot_previous) * inv;
+                        let gram_row = &gram[previous * n_y..(previous + 1) * n_y];
+                        let mut best = f32::MAX;
+                        let mut pick = u32::MAX;
+                        for (block, products) in dots.chunks(block_len).enumerate() {
+                            let j = block * y_tile;
+                            let cols = products.len() / t;
+                            let row = &products[r * cols..(r + 1) * cols];
+                            let costs = dist[j..j + cols]
+                                .iter_mut()
+                                .zip(row.iter().zip(&gram_row[j..j + cols]));
+                            for (c, (cost, (&dot, &g))) in costs.enumerate() {
+                                let gap = along - (dot - g) * inv;
+                                *cost += lambda * gap * gap;
+                                if *cost < best {
+                                    best = *cost;
+                                    pick = (j + c) as u32;
+                                }
+                            }
+                        }
+                        if pick == u32::MAX {
+                            break;
+                        }
+                        *slot = pick;
+                        previous = pick as usize;
+                    }
+                },
+            );
+        i += t;
+    }
+}
+
 /// Grow `buf` so one SGEMM batch (up to `X_BATCH_SIZE × Y_BATCH_SIZE`, clamped
 /// to the problem size) fits. The buffer is caller-owned and reused across
 /// calls, so this avoids re-allocating (and page-faulting) it every iteration.
