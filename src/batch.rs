@@ -51,8 +51,9 @@ fn blas_dot_products(
         });
 }
 
-/// Maximum bytes per distance/product matrix in a SOAR x-tile.
-const SOAR_TILE_BYTES: usize = 64 << 20;
+/// Maximum bytes per distance/product matrix in a SOAR x-tile; two such matrices are live. A
+/// larger tile gives BLAS a taller M and fewer sweeps over the centroid table.
+const SOAR_TILE_BYTES: usize = 256 << 20;
 
 /// Rows per x-tile of the SOAR assignment: the x batch, capped so the kept distances stay
 /// within [`SOAR_TILE_BYTES`].

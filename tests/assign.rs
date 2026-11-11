@@ -508,9 +508,9 @@ fn soar_with_one_centroid_has_no_secondary() {
 
 #[test]
 fn soar_crosses_tile_boundaries() {
-    // 2,100 centroids exceed one y-tile on every target, and the kept distances cap the x-tile at
-    // 64 MiB / (4 · 2,100) = 7,990 rows, so 9,000 vectors take two x-tiles.
-    let (n, d, k) = (9_000, 8, 2_100);
+    // 8,400 centroids exceed one y-tile on every target, and the kept distances cap the x-tile at
+    // 256 MiB / (4 · 8,400) = 7,989 rows, so 9,000 vectors take two x-tiles.
+    let (n, d, k) = (9_000, 8, 8_400);
     let data = generate_random_vectors(n, d, -1.0, 1.0, 41);
     let centroids = generate_random_vectors(k, d, -1.0, 1.0, 43);
     let norms_x = squared_norms(&data, n, d);
