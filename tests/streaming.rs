@@ -148,9 +148,8 @@ fn hierarchical_trains_from_an_iterator() {
         assignments.iter().all(|&a| a != u32::MAX),
         "rows left unassigned"
     );
-    let split_limit = ((target_leaf_size as f64) * std::f64::consts::SQRT_2).floor() as usize;
-    assert!(sizes.iter().all(|&s| s > 0 && s <= split_limit));
-    assert!(sizes.len() >= n.div_ceil(split_limit));
+    assert!(sizes.iter().all(|&s| s > 0 && s <= target_leaf_size));
+    assert!(sizes.len() >= n.div_ceil(target_leaf_size));
 
     let mut in_memory = HierarchicalSuperKMeans::with_config(d, cfg);
     let reference = in_memory.train(&data, n);

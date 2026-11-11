@@ -1,7 +1,7 @@
 //! Hierarchical SuperKMeans example.
 //!
 //! Splits into ceil(sqrt(K)) meso clusters, then re-clusters any group still
-//! larger than the split threshold for `target_leaf_size`.
+//! larger than `target_leaf_size`.
 
 use std::env;
 use std::process::ExitCode;

@@ -21,7 +21,7 @@ use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, SuperK
 const N: usize = 1_000_000;
 const D: usize = 1024;
 const K: usize = 10_000;
-/// Target roughly K leaves for the hierarchical bench (`N / target_leaf_size`).
+/// Request at least K leaves for the hierarchical bench (`N / target_leaf_size`).
 const HIER_TARGET_LEAF_SIZE: usize = N / K;
 
 fn data_path() -> PathBuf {
