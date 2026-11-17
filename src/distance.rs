@@ -1,4 +1,4 @@
-//! Squared-L2 distance with a SIMD-friendly reduction.
+//! Squared-L2 distance and inner product with a SIMD-friendly reduction.
 //!
 //! A single-accumulator `acc += d*d` loop does NOT auto-vectorize: float
 //! addition isn't reassociated without fast-math, so LLVM must keep the
@@ -33,6 +33,28 @@ pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
     s
 }
 
+/// Inner product with the per-lane accumulators of [`l2_squared`], so it vectorizes.
+#[inline]
+pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut acc = [0.0_f32; LANES];
+    let (ca, ra) = a.as_chunks::<LANES>();
+    let (cb, rb) = b.as_chunks::<LANES>();
+    for (av, bv) in ca.iter().zip(cb) {
+        for l in 0..LANES {
+            acc[l] += av[l] * bv[l];
+        }
+    }
+    let mut s = 0.0_f32;
+    for l in 0..LANES {
+        s += acc[l];
+    }
+    for (x, y) in ra.iter().zip(rb) {
+        s += x * y;
+    }
+    s
+}
+
 /// Squared L2 over the first `len` elements of `a` and `b`.
 #[inline]
 pub fn l2_squared_range(a: &[f32], b: &[f32], len: usize) -> f32 {
@@ -41,7 +63,7 @@ pub fn l2_squared_range(a: &[f32], b: &[f32], len: usize) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{LANES, l2_squared, l2_squared_range};
+    use super::{LANES, dot, l2_squared, l2_squared_range};
 
     #[test]
     fn distance_matches_scalar_across_chunk_boundaries() {
@@ -52,6 +74,17 @@ mod tests {
             assert_eq!(l2_squared(&a, &b), expected, "length {len}");
             assert_eq!(l2_squared(&b, &a), expected, "length {len}");
             assert_eq!(l2_squared(&a, &a), 0.0, "length {len}");
+        }
+    }
+
+    #[test]
+    fn dot_matches_scalar_across_chunk_boundaries() {
+        for len in [0, 1, LANES - 1, LANES, LANES + 1, 2 * LANES, 2 * LANES + 3] {
+            let a: Vec<f32> = (0..len).map(|i| i as f32 - 5.0).collect();
+            let b: Vec<f32> = (0..len).map(|i| 2.0 * i as f32 + 1.0).collect();
+            let expected: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+            assert_eq!(dot(&a, &b), expected, "length {len}");
+            assert_eq!(dot(&b, &a), expected, "length {len}");
         }
     }
 
