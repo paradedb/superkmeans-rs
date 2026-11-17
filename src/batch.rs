@@ -1,10 +1,12 @@
 //! Batched nearest-neighbour search built on top of SGEMM and the pruning kernel.
 
+use std::collections::BinaryHeap;
+
 use rayon::prelude::*;
 
 use crate::adsampling::ADSamplingPruner;
 use crate::common::{MINI_BATCH_SIZE, X_BATCH_SIZE, Y_BATCH_SIZE};
-use crate::distance::l2_squared;
+use crate::distance::{dot, l2_squared};
 use crate::pdxearch::top1_partial_search;
 
 /// Compute `out[i * ldc + j] = dot(x[i, :effective_d], y[j, :effective_d])`; `ldc` is the
@@ -292,25 +294,138 @@ pub fn find_soar_replica_assignments(
     }
 }
 
-/// Row-major `G = Y Yᵀ` over the `n_y` centroids: `G[a · n_y + b] = ⟨y_a, y_b⟩`.
-pub(crate) fn gram_matrix(y: &[f32], n_y: usize, d: usize) -> Vec<f32> {
-    let mut gram = vec![0.0_f32; n_y * n_y];
-    if n_y > 0 {
-        blas_dot_products(y, y, n_y, n_y, d, d, &mut gram, n_y);
-    }
-    gram
+/// `(distance, centroid)` packed so that integer order is [`f32::total_cmp`] order on the distance,
+/// then index order: a ranking with no ties between distinct centroids.
+fn rank_key(distance: f32, centroid: u32) -> u64 {
+    let bits = distance.to_bits();
+    // `total_cmp`'s mapping: negatives flip every bit, the rest set the sign bit.
+    let ordered = if bits >> 31 == 1 {
+        !bits
+    } else {
+        bits | 1 << 31
+    };
+    (u64::from(ordered) << 32) | u64::from(centroid)
 }
 
-/// SOAR assignments as [`find_soar_replica_assignments`], with each secondary taken from the
-/// first pass's dot products and the centroid Gram matrix instead of a GEMM of unit residuals.
-///
-/// Pass 1 is the same GEMM over the same tiles, so the primaries are identical. For the previous
-/// choice `p` with `n = ‖x − y_p‖ = √(‖x‖² − 2⟨x, y_p⟩ + ‖y_p‖²)` and `r̂ = (x − y_p) / n`
-/// (zero when `n` is zero or not finite), `⟨x, r̂⟩ = (‖x‖² − ⟨x, y_p⟩) / n` and
-/// `⟨r̂, y_c⟩ = (⟨x, y_c⟩ − G[p][c]) / n`: both come from numbers already held, so the
-/// alignment penalty costs one pass over the row and no second GEMM. Requires `replicas ≥ 2`,
-/// `n_y ≥ 2` and `gram` from [`gram_matrix`] over `y`.
-pub(crate) fn find_soar_replica_assignments_gram(
+/// A shortlisted centroid: its index, its running SOAR cost and its pass-1 product with the row.
+#[derive(Clone, Copy)]
+struct Candidate {
+    centroid: u32,
+    cost: f32,
+    dot: f32,
+}
+
+/// One row's working set in [`find_soar_replica_assignments_shortlist`], reused across rows.
+struct ShortlistScratch {
+    /// The row's pass-1 distance to every centroid.
+    dist: Vec<f32>,
+    /// The nearest non-primary centroids seen so far, largest [`rank_key`] on top.
+    nearest: BinaryHeap<u64>,
+    /// The unchosen candidates, ascending in centroid index.
+    short: Vec<Candidate>,
+}
+
+impl ShortlistScratch {
+    fn new(n_y: usize, m: usize) -> Self {
+        Self {
+            dist: vec![0.0; n_y],
+            nearest: BinaryHeap::with_capacity(m),
+            short: Vec::with_capacity(m),
+        }
+    }
+
+    /// Fills the shortlist with the `m` centroids other than `primary` with the smallest
+    /// [`rank_key`] of `dist`, ascending in centroid index; `dot(c)` is the row's pass-1 product
+    /// with `c`.
+    fn shortlist(&mut self, primary: usize, m: usize, dot: impl Fn(usize) -> f32) {
+        let Self {
+            dist,
+            nearest,
+            short,
+        } = self;
+        let candidate = |c: usize| Candidate {
+            centroid: c as u32,
+            cost: dist[c],
+            dot: dot(c),
+        };
+        short.clear();
+        if m + 1 == dist.len() {
+            short.extend((0..dist.len()).filter(|&c| c != primary).map(candidate));
+            return;
+        }
+        nearest.clear();
+        for (c, &value) in dist.iter().enumerate() {
+            if c == primary {
+                continue;
+            }
+            let key = rank_key(value, c as u32);
+            if nearest.len() < m {
+                nearest.push(key);
+            } else if let Some(mut top) = nearest.peek_mut()
+                && key < *top
+            {
+                *top = key;
+            }
+        }
+        short.extend(nearest.drain().map(|key| candidate(key as u32 as usize)));
+        short.sort_unstable_by_key(|candidate| candidate.centroid);
+    }
+
+    /// Fills `slots` in order from the shortlist: each secondary adds its predecessor's alignment
+    /// penalty to every unchosen candidate's cost and takes the first strict minimum. Slots past
+    /// the shortlist, or past a row of non-finite costs, keep their value.
+    fn choose(
+        &mut self,
+        slots: &mut [u32],
+        primary: usize,
+        primary_dot: f32,
+        norm_x: f32,
+        norms_y: &[f32],
+        y: &[f32],
+        d: usize,
+        lambda: f32,
+    ) {
+        let short = &mut self.short;
+        let (mut previous, mut dot_previous) = (primary, primary_dot);
+        for slot in slots {
+            // With `n = ‖x − y_p‖` and `r̂ = (x − y_p) / n` (zero when `n` is zero or not finite):
+            // `⟨x, r̂⟩ = (‖x‖² − ⟨x, y_p⟩) / n` and `⟨r̂, y_c⟩ = (⟨x, y_c⟩ − ⟨y_p, y_c⟩) / n`.
+            let squared = norm_x - 2.0 * dot_previous + norms_y[previous];
+            let n1 = squared.max(0.0).sqrt();
+            let inv = if n1 > 0.0 && n1.is_finite() {
+                1.0 / n1
+            } else {
+                0.0
+            };
+            let along = (norm_x - dot_previous) * inv;
+            let y_previous = &y[previous * d..][..d];
+            let mut best = f32::MAX;
+            let mut pick = None;
+            for (s, candidate) in short.iter_mut().enumerate() {
+                let g = dot(y_previous, &y[candidate.centroid as usize * d..][..d]);
+                let gap = along - (candidate.dot - g) * inv;
+                candidate.cost += lambda * gap * gap;
+                if candidate.cost < best {
+                    best = candidate.cost;
+                    pick = Some(s);
+                }
+            }
+            let Some(pick) = pick else {
+                return;
+            };
+            let chosen = short.remove(pick);
+            *slot = chosen.centroid;
+            (previous, dot_previous) = (chosen.centroid as usize, chosen.dot);
+        }
+    }
+}
+
+/// SOAR assignments as [`find_soar_replica_assignments`], each secondary chosen among the row's
+/// `candidates` nearest non-primary centroids by pass-1 distance (all of them when
+/// `candidates ≥ n_y − 1`). Pass 1 and the primary are the reference's, tiles and clamp included;
+/// a secondary costs `min(candidates, n_y − 1) · d` multiply-adds per row and no second GEMM.
+/// Requires `replicas ≥ 2` and `n_y ≥ 2`.
+pub(crate) fn find_soar_replica_assignments_shortlist(
     x: &[f32],
     y: &[f32],
     n_x: usize,
@@ -318,9 +433,9 @@ pub(crate) fn find_soar_replica_assignments_gram(
     d: usize,
     norms_x: &[f32],
     norms_y: &[f32],
-    gram: &[f32],
     lambda: f32,
     replicas: usize,
+    candidates: usize,
     out_primary: &mut [u32],
     out_secondary: &mut [u32],
 ) {
@@ -328,7 +443,6 @@ pub(crate) fn find_soar_replica_assignments_gram(
     let secondaries = replicas - 1;
     assert!(out_primary.len() >= n_x);
     assert!(out_secondary.len() >= n_x * secondaries);
-    assert_eq!(gram.len(), n_y * n_y);
     debug_assert!(x.len() >= n_x * d);
     debug_assert!(y.len() >= n_y * d);
     debug_assert!(norms_x.len() >= n_x && norms_y.len() >= n_y);
@@ -341,6 +455,7 @@ pub(crate) fn find_soar_replica_assignments_gram(
     if n_x == 0 {
         return;
     }
+    let m = candidates.min(n_y - 1);
 
     // The tiles of `find_soar_replica_assignments`, so pass 1 runs the same SGEMM calls.
     let tile = soar_tile_rows(n_x, n_y);
@@ -386,8 +501,8 @@ pub(crate) fn find_soar_replica_assignments_gram(
             .zip(secondary.par_chunks_mut(secondaries))
             .enumerate()
             .for_each_init(
-                || vec![0.0_f32; n_y],
-                |dist, (r, (first, chosen))| {
+                || ShortlistScratch::new(n_y, m),
+                |scratch, (r, (first, slots))| {
                     let norm_x = norms_x[i + r];
                     // Distances and the primary, reduced block by block as pass 1 of
                     // `find_soar_replica_assignments` reduces them, clamp included.
@@ -398,7 +513,8 @@ pub(crate) fn find_soar_replica_assignments_gram(
                         let row = &products[r * cols..(r + 1) * cols];
                         let mut min_v = f32::MAX;
                         let mut min_c = 0;
-                        for (c, (out, &dot)) in dist[j..j + cols].iter_mut().zip(row).enumerate() {
+                        let dist = &mut scratch.dist[j..j + cols];
+                        for (c, (out, &dot)) in dist.iter_mut().zip(row).enumerate() {
                             let value = -2.0 * dot + norm_x + norms_y[j + c];
                             *out = value;
                             if value < min_v {
@@ -411,46 +527,21 @@ pub(crate) fn find_soar_replica_assignments_gram(
                             *first = (j + min_c) as u32;
                         }
                     }
-
-                    // Each secondary adds its predecessor's alignment penalty to every cost,
-                    // cumulatively, and takes the first strict minimum among the unchosen.
-                    let mut previous = *first as usize;
-                    for slot in chosen.iter_mut().take(secondaries.min(n_y - 1)) {
-                        dist[previous] = f32::INFINITY;
-                        let dot_previous = dot_at(r, previous);
-                        let squared = norm_x - 2.0 * dot_previous + norms_y[previous];
-                        let n1 = squared.max(0.0).sqrt();
-                        let inv = if n1 > 0.0 && n1.is_finite() {
-                            1.0 / n1
-                        } else {
-                            0.0
-                        };
-                        let along = (norm_x - dot_previous) * inv;
-                        let gram_row = &gram[previous * n_y..(previous + 1) * n_y];
-                        let mut best = f32::MAX;
-                        let mut pick = u32::MAX;
-                        for (block, products) in dots.chunks(block_len).enumerate() {
-                            let j = block * y_tile;
-                            let cols = products.len() / t;
-                            let row = &products[r * cols..(r + 1) * cols];
-                            let costs = dist[j..j + cols]
-                                .iter_mut()
-                                .zip(row.iter().zip(&gram_row[j..j + cols]));
-                            for (c, (cost, (&dot, &g))) in costs.enumerate() {
-                                let gap = along - (dot - g) * inv;
-                                *cost += lambda * gap * gap;
-                                if *cost < best {
-                                    best = *cost;
-                                    pick = (j + c) as u32;
-                                }
-                            }
-                        }
-                        if pick == u32::MAX {
-                            break;
-                        }
-                        *slot = pick;
-                        previous = pick as usize;
+                    if m == 0 {
+                        return;
                     }
+                    let first = *first as usize;
+                    scratch.shortlist(first, m, |c| dot_at(r, c));
+                    scratch.choose(
+                        slots,
+                        first,
+                        dot_at(r, first),
+                        norm_x,
+                        norms_y,
+                        y,
+                        d,
+                        lambda,
+                    );
                 },
             );
         i += t;

@@ -248,68 +248,68 @@ pub fn assign_soar_replicas(
         centroids.d(),
         "vectors and centroids must share d"
     );
-    SoarAssigner::new(centroids, lambda, replicas, ONE_SHOT_GRAM_BYTES)
-        .assign(vectors.as_slice(), vectors.n())
+    assert!(replicas > 0);
+    let (n_vectors, n_centroids, d) = (vectors.n(), centroids.n(), vectors.d());
+    let mut primary = vec![0_u32; n_vectors];
+    let mut secondary = vec![u32::MAX; n_vectors * (replicas - 1)];
+    batch::find_soar_replica_assignments(
+        vectors.as_slice(),
+        centroids.as_slice(),
+        n_vectors,
+        n_centroids,
+        d,
+        &squared_norms(vectors.as_slice(), n_vectors, d),
+        &squared_norms(centroids.as_slice(), n_centroids, d),
+        lambda,
+        replicas,
+        &mut primary,
+        &mut secondary,
+        &mut Vec::new(),
+    );
+    (primary, secondary)
 }
-
-/// Gram budget of [`assign_soar`] and [`assign_soar_replicas`]: the 64 MiB that bounds each
-/// distance matrix of a SOAR x-tile, so a one-shot call holds at most one more such matrix.
-const ONE_SHOT_GRAM_BYTES: usize = 64 << 20;
 
 /// Primary and SOAR secondaries for any number of vector batches against one centroid set.
 ///
-/// Built once per centroid set: holds the centroids' squared norms and, when its
-/// `n_centroids² × 4` bytes fit the Gram budget, the Gram matrix `G = C Cᵀ`. With `G`, every
-/// secondary comes from the nearest-centroid pass's dot products alone: for the previous choice
-/// `p` at distance `n` from `x`, `⟨x, r̂⟩ = (‖x‖² − ⟨x, c_p⟩) / n` and
-/// `⟨r̂, c⟩ = (⟨x, c⟩ − G[p][c]) / n`, so no second GEMM over unit residuals runs. Without it,
-/// each secondary runs that GEMM as [`batch::find_soar_replica_assignments`] does.
-///
-/// Both paths pick the same primaries. Secondaries agree except where two candidates' costs lie
-/// within float rounding of each other.
+/// The primary is the nearest centroid; each secondary minimizes the cumulative cost of
+/// [`assign_soar_replicas`] over the row's `candidates` nearest non-primary centroids, so it costs
+/// `candidates · d` multiply-adds per row whatever the centroid count. With every centroid a
+/// candidate, the output is [`assign_soar_replicas`]'s up to cost ties within float rounding.
 pub struct SoarAssigner<'a> {
     centroids: Matrix<'a>,
     norms: Vec<f32>,
-    gram: Option<Vec<f32>>,
     lambda: f32,
     replicas: usize,
+    candidates: usize,
 }
 
 impl<'a> SoarAssigner<'a> {
     /// An assigner for `centroids` with alignment weight `lambda` and `replicas` cells per
-    /// vector (the primary included). `gram_budget_bytes` bounds the Gram matrix; it is built
-    /// only when it fits and a vector can have a secondary (`replicas ≥ 2`, two or more
-    /// centroids).
+    /// vector (the primary included). `candidates` bounds the search for each secondary to that
+    /// many nearest centroids; `candidates >= centroids.n() - 1` is the exhaustive rule.
     ///
     /// # Panics
     ///
     /// Panics if `replicas` is zero.
-    pub fn new(
+    pub fn with_candidates(
         centroids: Matrix<'a>,
         lambda: f32,
         replicas: usize,
-        gram_budget_bytes: usize,
+        candidates: usize,
     ) -> Self {
         assert!(replicas > 0);
-        let (n, d) = (centroids.n(), centroids.d());
-        let norms = squared_norms(centroids.as_slice(), n, d);
-        let gram_fits = n
-            .checked_mul(n)
-            .and_then(|cells| cells.checked_mul(std::mem::size_of::<f32>()))
-            .is_some_and(|bytes| bytes <= gram_budget_bytes);
-        let gram = (gram_fits && replicas >= 2 && n >= 2)
-            .then(|| batch::gram_matrix(centroids.as_slice(), n, d));
+        let norms = squared_norms(centroids.as_slice(), centroids.n(), centroids.d());
         Self {
             centroids,
             norms,
-            gram,
             lambda,
             replicas,
+            candidates,
         }
     }
 
-    /// One primary per vector and `replicas - 1` row-major secondaries per vector, as
-    /// [`assign_soar_replicas`]: distinct, `u32::MAX` where fewer centroids remain.
+    /// One primary per vector and `replicas - 1` row-major secondaries per vector: distinct,
+    /// `u32::MAX` where fewer than `replicas - 1` candidates remain.
     ///
     /// # Panics
     ///
@@ -318,39 +318,26 @@ impl<'a> SoarAssigner<'a> {
         let d = self.centroids.d();
         let vectors = Matrix::new(vectors, n_vectors, d);
         let n_centroids = self.centroids.n();
+        if self.replicas < 2 || n_centroids < 2 {
+            // No secondary is possible: the nearest centroid alone.
+            return assign_soar_replicas(vectors, self.centroids, self.lambda, self.replicas);
+        }
         let mut primary = vec![0_u32; n_vectors];
         let mut secondary = vec![u32::MAX; n_vectors * (self.replicas - 1)];
-        let vector_norms = squared_norms(vectors.as_slice(), n_vectors, d);
-        match &self.gram {
-            Some(gram) => batch::find_soar_replica_assignments_gram(
-                vectors.as_slice(),
-                self.centroids.as_slice(),
-                n_vectors,
-                n_centroids,
-                d,
-                &vector_norms,
-                &self.norms,
-                gram,
-                self.lambda,
-                self.replicas,
-                &mut primary,
-                &mut secondary,
-            ),
-            None => batch::find_soar_replica_assignments(
-                vectors.as_slice(),
-                self.centroids.as_slice(),
-                n_vectors,
-                n_centroids,
-                d,
-                &vector_norms,
-                &self.norms,
-                self.lambda,
-                self.replicas,
-                &mut primary,
-                &mut secondary,
-                &mut Vec::new(),
-            ),
-        }
+        batch::find_soar_replica_assignments_shortlist(
+            vectors.as_slice(),
+            self.centroids.as_slice(),
+            n_vectors,
+            n_centroids,
+            d,
+            &squared_norms(vectors.as_slice(), n_vectors, d),
+            &self.norms,
+            self.lambda,
+            self.replicas,
+            self.candidates,
+            &mut primary,
+            &mut secondary,
+        );
         (primary, secondary)
     }
 }
@@ -1480,49 +1467,5 @@ mod tests {
         // Only the current pass matters: the E-step after a revival has
         // already moved the rows.
         assert!(stops_early(vec![pass(100.0, 1.0, 1), pass(101.0, 1.0, 0)]));
-    }
-
-    /// The Gram matrix is held exactly when its `n² × 4` bytes fit the budget and a vector can
-    /// have a secondary; a zero budget keeps the residual GEMM, whose output it then matches bit
-    /// for bit.
-    #[test]
-    fn soar_assigner_holds_the_gram_only_within_its_budget() {
-        let (n, d, k) = (700, 16, 50);
-        let data = crate::utils::generate_random_vectors(n, d, -1.0, 1.0, 3);
-        let centroids = crate::utils::generate_random_vectors(k, d, -1.0, 1.0, 5);
-        let centers = Matrix::new(&centroids, k, d);
-        let bytes = k * k * 4;
-        assert!(SoarAssigner::new(centers, 2.0, 2, bytes).gram.is_some());
-        assert!(SoarAssigner::new(centers, 2.0, 2, bytes - 1).gram.is_none());
-        assert!(
-            SoarAssigner::new(centers, 2.0, 1, usize::MAX)
-                .gram
-                .is_none()
-        );
-        let one = Matrix::new(&centroids[..d], 1, d);
-        assert!(SoarAssigner::new(one, 2.0, 2, usize::MAX).gram.is_none());
-
-        for replicas in [2, 3] {
-            let assigner = SoarAssigner::new(centers, 2.0, replicas, 0);
-            assert!(assigner.gram.is_none());
-            let norms_x = squared_norms(&data, n, d);
-            let mut primary = vec![0_u32; n];
-            let mut secondary = vec![0_u32; n * (replicas - 1)];
-            batch::find_soar_replica_assignments(
-                &data,
-                &centroids,
-                n,
-                k,
-                d,
-                &norms_x,
-                &assigner.norms,
-                2.0,
-                replicas,
-                &mut primary,
-                &mut secondary,
-                &mut Vec::new(),
-            );
-            assert_eq!(assigner.assign(&data, n), (primary, secondary));
-        }
     }
 }

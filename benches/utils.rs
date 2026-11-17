@@ -31,7 +31,7 @@ use superkmeans::utils::{
     normalize_rows_l2_sequential, squared_norms_partial_parallel, squared_norms_partial_sequential,
     sum_rows_by_assignment_parallel, sum_rows_by_assignment_sequential,
 };
-use superkmeans::{Matrix, SoarAssigner, assign};
+use superkmeans::{Matrix, SoarAssigner, assign, assign_soar};
 
 const DIMS: [usize; 3] = [128, 768, 1536];
 const CLUSTERS: [usize; 5] = [2, 8, 32, 128, 1024];
@@ -275,9 +275,8 @@ fn bench_normalize_rows_l2(c: &mut Criterion) {
 }
 
 /// Nearest-centroid assignment against SOAR pairs (`lambda` 2), the secondary from a GEMM of unit
-/// residuals (`two_gemm_soar`, Gram budget 0) or from the first pass's dot products and the
-/// centroid Gram matrix (`gram_soar`, assigner built outside the timed loop). `gram_build` is
-/// that one-off construction.
+/// residuals over every centroid (`two_gemm_soar`) or among the 64 nearest centroids of the first
+/// pass (`shortlist_soar`, assigner built outside the timed loop).
 fn bench_soar(c: &mut Criterion) {
     let mut group = c.benchmark_group("soar");
     group.warm_up_time(Duration::from_secs(1));
@@ -295,16 +294,18 @@ fn bench_soar(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("assign", &id), |b| {
             b.iter(|| black_box(assign(Matrix::new(black_box(&vectors), n, d), centers)));
         });
-        let two_gemm = SoarAssigner::new(centers, 2.0, 2, 0);
         group.bench_function(BenchmarkId::new("two_gemm_soar", &id), |b| {
-            b.iter(|| black_box(two_gemm.assign(black_box(&vectors), n)));
+            b.iter(|| {
+                black_box(assign_soar(
+                    Matrix::new(black_box(&vectors), n, d),
+                    centers,
+                    2.0,
+                ))
+            });
         });
-        let gram = SoarAssigner::new(centers, 2.0, 2, usize::MAX);
-        group.bench_function(BenchmarkId::new("gram_soar", &id), |b| {
-            b.iter(|| black_box(gram.assign(black_box(&vectors), n)));
-        });
-        group.bench_function(BenchmarkId::new("gram_build", &id), |b| {
-            b.iter(|| black_box(SoarAssigner::new(black_box(centers), 2.0, 2, usize::MAX)));
+        let shortlist = SoarAssigner::with_candidates(centers, 2.0, 2, 64);
+        group.bench_function(BenchmarkId::new("shortlist_soar", &id), |b| {
+            b.iter(|| black_box(shortlist.assign(black_box(&vectors), n)));
         });
     }
 
