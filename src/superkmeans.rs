@@ -271,17 +271,10 @@ pub fn assign_soar_replicas(
 
 /// Primary and SOAR secondaries for any number of vector batches against one centroid set.
 ///
-/// Built once per centroid set: holds the centroids' squared norms. The primary is the nearest
-/// centroid from one SGEMM pass, chosen as [`batch::find_nearest_neighbor`] chooses it. Each
-/// secondary minimizes the cumulative cost of [`assign_soar_replicas`] over the row's
-/// `candidates` nearest non-primary centroids by that pass's distances. For the previous choice
-/// `p` at distance `n` from `x`, `⟨x, r̂⟩ = (‖x‖² − ⟨x, c_p⟩) / n` and
-/// `⟨r̂, c⟩ = (⟨x, c⟩ − ⟨c_p, c⟩) / n`: the pass holds `⟨x, c⟩`, and `⟨c_p, c⟩` costs `d`
-/// multiply-adds per candidate, so a secondary costs `candidates · d` per row, independent of the
-/// number of centroids, and no second GEMM runs.
-///
-/// With `candidates ≥ n_centroids − 1`, primaries equal [`assign_soar_replicas`]'s and
-/// secondaries agree except where two candidates' costs lie within float rounding of each other.
+/// The primary is the nearest centroid; each secondary minimizes the cumulative cost of
+/// [`assign_soar_replicas`] over the row's `candidates` nearest non-primary centroids, so it costs
+/// `candidates · d` multiply-adds per row whatever the centroid count. With every centroid a
+/// candidate, the output is [`assign_soar_replicas`]'s up to cost ties within float rounding.
 pub struct SoarAssigner<'a> {
     centroids: Matrix<'a>,
     norms: Vec<f32>,
@@ -293,7 +286,7 @@ pub struct SoarAssigner<'a> {
 impl<'a> SoarAssigner<'a> {
     /// An assigner for `centroids` with alignment weight `lambda` and `replicas` cells per
     /// vector (the primary included). `candidates` bounds the search for each secondary to that
-    /// many nearest centroids; `candidates >= n_y - 1` is the exhaustive rule.
+    /// many nearest centroids; `candidates >= centroids.n() - 1` is the exhaustive rule.
     ///
     /// # Panics
     ///
@@ -325,41 +318,26 @@ impl<'a> SoarAssigner<'a> {
         let d = self.centroids.d();
         let vectors = Matrix::new(vectors, n_vectors, d);
         let n_centroids = self.centroids.n();
+        if self.replicas < 2 || n_centroids < 2 {
+            // No secondary is possible: the nearest centroid alone.
+            return assign_soar_replicas(vectors, self.centroids, self.lambda, self.replicas);
+        }
         let mut primary = vec![0_u32; n_vectors];
         let mut secondary = vec![u32::MAX; n_vectors * (self.replicas - 1)];
-        let vector_norms = squared_norms(vectors.as_slice(), n_vectors, d);
-        if self.replicas >= 2 && n_centroids >= 2 {
-            batch::find_soar_replica_assignments_shortlist(
-                vectors.as_slice(),
-                self.centroids.as_slice(),
-                n_vectors,
-                n_centroids,
-                d,
-                &vector_norms,
-                &self.norms,
-                self.lambda,
-                self.replicas,
-                self.candidates,
-                &mut primary,
-                &mut secondary,
-            );
-        } else {
-            // No secondary is possible: the nearest centroid alone.
-            batch::find_soar_replica_assignments(
-                vectors.as_slice(),
-                self.centroids.as_slice(),
-                n_vectors,
-                n_centroids,
-                d,
-                &vector_norms,
-                &self.norms,
-                self.lambda,
-                self.replicas,
-                &mut primary,
-                &mut secondary,
-                &mut Vec::new(),
-            );
-        }
+        batch::find_soar_replica_assignments_shortlist(
+            vectors.as_slice(),
+            self.centroids.as_slice(),
+            n_vectors,
+            n_centroids,
+            d,
+            &squared_norms(vectors.as_slice(), n_vectors, d),
+            &self.norms,
+            self.lambda,
+            self.replicas,
+            self.candidates,
+            &mut primary,
+            &mut secondary,
+        );
         (primary, secondary)
     }
 }

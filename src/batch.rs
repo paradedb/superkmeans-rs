@@ -307,8 +307,7 @@ fn rank_key(distance: f32, centroid: u32) -> u64 {
     (u64::from(ordered) << 32) | u64::from(centroid)
 }
 
-/// One shortlisted centroid of a row: its index, its running SOAR cost and its pass-1 product
-/// with the row.
+/// A shortlisted centroid: its index, its running SOAR cost and its pass-1 product with the row.
 #[derive(Clone, Copy)]
 struct Candidate {
     centroid: u32,
@@ -316,15 +315,13 @@ struct Candidate {
     dot: f32,
 }
 
-/// Per-thread scratch of [`find_soar_replica_assignments_shortlist`], reused across rows.
+/// One row's working set in [`find_soar_replica_assignments_shortlist`], reused across rows.
 struct ShortlistScratch {
-    /// One row's pass-1 distance to every centroid.
+    /// The row's pass-1 distance to every centroid.
     dist: Vec<f32>,
     /// The nearest non-primary centroids seen so far, largest [`rank_key`] on top.
     nearest: BinaryHeap<u64>,
-    /// The shortlist's centroid indices, ascending.
-    indices: Vec<u32>,
-    /// The shortlist, ascending in centroid index.
+    /// The unchosen candidates, ascending in centroid index.
     short: Vec<Candidate>,
 }
 
@@ -333,25 +330,100 @@ impl ShortlistScratch {
         Self {
             dist: vec![0.0; n_y],
             nearest: BinaryHeap::with_capacity(m),
-            indices: Vec::with_capacity(m),
             short: Vec::with_capacity(m),
+        }
+    }
+
+    /// Fills the shortlist with the `m` centroids other than `primary` with the smallest
+    /// [`rank_key`] of `dist`, ascending in centroid index; `dot(c)` is the row's pass-1 product
+    /// with `c`.
+    fn shortlist(&mut self, primary: usize, m: usize, dot: impl Fn(usize) -> f32) {
+        let Self {
+            dist,
+            nearest,
+            short,
+        } = self;
+        let candidate = |c: usize| Candidate {
+            centroid: c as u32,
+            cost: dist[c],
+            dot: dot(c),
+        };
+        short.clear();
+        if m + 1 == dist.len() {
+            short.extend((0..dist.len()).filter(|&c| c != primary).map(candidate));
+            return;
+        }
+        nearest.clear();
+        for (c, &value) in dist.iter().enumerate() {
+            if c == primary {
+                continue;
+            }
+            let key = rank_key(value, c as u32);
+            if nearest.len() < m {
+                nearest.push(key);
+            } else if let Some(mut top) = nearest.peek_mut()
+                && key < *top
+            {
+                *top = key;
+            }
+        }
+        short.extend(nearest.drain().map(|key| candidate(key as u32 as usize)));
+        short.sort_unstable_by_key(|candidate| candidate.centroid);
+    }
+
+    /// Fills `slots` in order from the shortlist: each secondary adds its predecessor's alignment
+    /// penalty to every unchosen candidate's cost and takes the first strict minimum. Slots past
+    /// the shortlist, or past a row of non-finite costs, keep their value.
+    fn choose(
+        &mut self,
+        slots: &mut [u32],
+        primary: usize,
+        primary_dot: f32,
+        norm_x: f32,
+        norms_y: &[f32],
+        y: &[f32],
+        d: usize,
+        lambda: f32,
+    ) {
+        let short = &mut self.short;
+        let (mut previous, mut dot_previous) = (primary, primary_dot);
+        for slot in slots {
+            // With `n = ‖x − y_p‖` and `r̂ = (x − y_p) / n` (zero when `n` is zero or not finite):
+            // `⟨x, r̂⟩ = (‖x‖² − ⟨x, y_p⟩) / n` and `⟨r̂, y_c⟩ = (⟨x, y_c⟩ − ⟨y_p, y_c⟩) / n`.
+            let squared = norm_x - 2.0 * dot_previous + norms_y[previous];
+            let n1 = squared.max(0.0).sqrt();
+            let inv = if n1 > 0.0 && n1.is_finite() {
+                1.0 / n1
+            } else {
+                0.0
+            };
+            let along = (norm_x - dot_previous) * inv;
+            let y_previous = &y[previous * d..][..d];
+            let mut best = f32::MAX;
+            let mut pick = None;
+            for (s, candidate) in short.iter_mut().enumerate() {
+                let g = dot(y_previous, &y[candidate.centroid as usize * d..][..d]);
+                let gap = along - (candidate.dot - g) * inv;
+                candidate.cost += lambda * gap * gap;
+                if candidate.cost < best {
+                    best = candidate.cost;
+                    pick = Some(s);
+                }
+            }
+            let Some(pick) = pick else {
+                return;
+            };
+            let chosen = short.remove(pick);
+            *slot = chosen.centroid;
+            (previous, dot_previous) = (chosen.centroid as usize, chosen.dot);
         }
     }
 }
 
-/// SOAR assignments as [`find_soar_replica_assignments`], with each secondary chosen among the
-/// row's `candidates` nearest non-primary centroids by pass-1 distance.
-///
-/// Pass 1 is the same GEMM over the same tiles and the primary the same ordered block reduction,
-/// clamp included, so the primaries are identical. The shortlist is the `m = min(candidates,
-/// n_y − 1)` smallest pass-1 distances off the primary, ties broken by centroid index, scanned in
-/// ascending centroid index. For the previous choice `p` with
-/// `n = ‖x − y_p‖ = √(‖x‖² − 2⟨x, y_p⟩ + ‖y_p‖²)` and `r̂ = (x − y_p) / n` (zero when `n` is zero
-/// or not finite), `⟨x, r̂⟩ = (‖x‖² − ⟨x, y_p⟩) / n` and `⟨r̂, y_c⟩ = (⟨x, y_c⟩ − ⟨y_p, y_c⟩) / n`:
-/// pass 1 holds `⟨x, ·⟩`, and `⟨y_p, y_c⟩` costs `d` multiply-adds per shortlisted centroid, so a
-/// secondary costs `m · d` per row and no second GEMM. Each secondary adds its predecessor's
-/// alignment penalty to the cost of every unchosen candidate, cumulatively, and takes the first
-/// strict minimum. Slots past `m` stay `u32::MAX`. `candidates ≥ n_y − 1` is the exhaustive rule.
+/// SOAR assignments as [`find_soar_replica_assignments`], each secondary chosen among the row's
+/// `candidates` nearest non-primary centroids by pass-1 distance (all of them when
+/// `candidates ≥ n_y − 1`). Pass 1 and the primary are the reference's, tiles and clamp included;
+/// a secondary costs `min(candidates, n_y − 1) · d` multiply-adds per row and no second GEMM.
 /// Requires `replicas ≥ 2` and `n_y ≥ 2`.
 pub(crate) fn find_soar_replica_assignments_shortlist(
     x: &[f32],
@@ -430,13 +502,7 @@ pub(crate) fn find_soar_replica_assignments_shortlist(
             .enumerate()
             .for_each_init(
                 || ShortlistScratch::new(n_y, m),
-                |scratch, (r, (first, chosen))| {
-                    let ShortlistScratch {
-                        dist,
-                        nearest,
-                        indices,
-                        short,
-                    } = scratch;
+                |scratch, (r, (first, slots))| {
                     let norm_x = norms_x[i + r];
                     // Distances and the primary, reduced block by block as pass 1 of
                     // `find_soar_replica_assignments` reduces them, clamp included.
@@ -447,7 +513,8 @@ pub(crate) fn find_soar_replica_assignments_shortlist(
                         let row = &products[r * cols..(r + 1) * cols];
                         let mut min_v = f32::MAX;
                         let mut min_c = 0;
-                        for (c, (out, &dot)) in dist[j..j + cols].iter_mut().zip(row).enumerate() {
+                        let dist = &mut scratch.dist[j..j + cols];
+                        for (c, (out, &dot)) in dist.iter_mut().zip(row).enumerate() {
                             let value = -2.0 * dot + norm_x + norms_y[j + c];
                             *out = value;
                             if value < min_v {
@@ -463,74 +530,18 @@ pub(crate) fn find_soar_replica_assignments_shortlist(
                     if m == 0 {
                         return;
                     }
-
-                    // The shortlist: every other centroid when `m` covers them, else the `m`
-                    // smallest rank keys through a bounded max-heap.
-                    let first_index = *first as usize;
-                    indices.clear();
-                    if m == n_y - 1 {
-                        indices.extend((0..n_y as u32).filter(|&c| c as usize != first_index));
-                    } else {
-                        nearest.clear();
-                        for (c, &value) in dist.iter().enumerate() {
-                            if c == first_index {
-                                continue;
-                            }
-                            let key = rank_key(value, c as u32);
-                            if nearest.len() < m {
-                                nearest.push(key);
-                            } else if let Some(mut top) = nearest.peek_mut()
-                                && key < *top
-                            {
-                                *top = key;
-                            }
-                        }
-                        indices.extend(nearest.drain().map(|key| key as u32));
-                        indices.sort_unstable();
-                    }
-                    short.clear();
-                    short.extend(indices.iter().map(|&c| Candidate {
-                        centroid: c,
-                        cost: dist[c as usize],
-                        dot: dot_at(r, c as usize),
-                    }));
-
-                    // Each secondary adds its predecessor's alignment penalty to every unchosen
-                    // candidate's cost, cumulatively, and takes the first strict minimum. Chosen
-                    // candidates hold an infinite cost, which no penalty lowers.
-                    let mut previous = first_index;
-                    for slot in chosen.iter_mut().take(secondaries.min(m)) {
-                        let dot_previous = dot_at(r, previous);
-                        let squared = norm_x - 2.0 * dot_previous + norms_y[previous];
-                        let n1 = squared.max(0.0).sqrt();
-                        let inv = if n1 > 0.0 && n1.is_finite() {
-                            1.0 / n1
-                        } else {
-                            0.0
-                        };
-                        let along = (norm_x - dot_previous) * inv;
-                        let y_previous = &y[previous * d..][..d];
-                        let mut best = f32::MAX;
-                        let mut pick = None;
-                        for (s, candidate) in short.iter_mut().enumerate() {
-                            if candidate.cost == f32::INFINITY {
-                                continue;
-                            }
-                            let g = dot(y_previous, &y[candidate.centroid as usize * d..][..d]);
-                            let gap = along - (candidate.dot - g) * inv;
-                            candidate.cost += lambda * gap * gap;
-                            if candidate.cost < best {
-                                best = candidate.cost;
-                                pick = Some(s);
-                            }
-                        }
-                        let Some(pick) = pick else {
-                            break;
-                        };
-                        *slot = short[pick].centroid;
-                        previous = short[pick].centroid as usize;
-                        short[pick].cost = f32::INFINITY;
-                    }
+                    let first = *first as usize;
+                    scratch.shortlist(first, m, |c| dot_at(r, c));
+                    scratch.choose(
+                        slots,
+                        first,
+                        dot_at(r, first),
+                        norm_x,
+                        norms_y,
+                        y,
+                        d,
+                        lambda,
+                    );
                 },
             );
         i += t;
