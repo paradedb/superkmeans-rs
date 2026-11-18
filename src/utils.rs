@@ -201,8 +201,7 @@ fn squared_norm(v: &[f32]) -> f32 {
     let mut acc = [[0.0_f32; LANES]; ACCS];
 
     // Main loop: 64 floats per step, each accumulator gets its own 8.
-    let blocks = v.chunks_exact(LANES * ACCS);
-    let rest = blocks.remainder();
+    let (blocks, rest) = v.as_chunks::<{ LANES * ACCS }>();
     for block in blocks {
         for a in 0..ACCS {
             for l in 0..LANES {
@@ -221,8 +220,7 @@ fn squared_norm(v: &[f32]) -> f32 {
     }
 
     // Leftover whole vectors (fewer than 64 floats remain).
-    let chunks = rest.chunks_exact(LANES);
-    let tail = chunks.remainder();
+    let (chunks, tail) = rest.as_chunks::<LANES>();
     for c in chunks {
         for l in 0..LANES {
             lanes[l] += c[l] * c[l];
