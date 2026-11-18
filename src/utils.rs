@@ -192,11 +192,47 @@ pub fn squared_norms_partial_parallel(
     norms
 }
 
+const LANES: usize = 8; // f32s per 256-bit vector (AVX2)
+const ACCS: usize = 8; // independent accumulators: ~FMA latency × ports
+
 #[inline]
-fn squared_norm(vector: &[f32]) -> f32 {
-    let mut sum = 0.0_f32;
-    for &v in vector {
-        sum += v * v;
+fn squared_norm(v: &[f32]) -> f32 {
+    // acc[a] is one "vector register" of 8 partial sums.
+    let mut acc = [[0.0_f32; LANES]; ACCS];
+
+    // Main loop: 64 floats per step, each accumulator gets its own 8.
+    let blocks = v.chunks_exact(LANES * ACCS);
+    let rest = blocks.remainder();
+    for block in blocks {
+        for a in 0..ACCS {
+            for l in 0..LANES {
+                let x = block[a * LANES + l];
+                acc[a][l] += x * x; // no dependency between different a's
+            }
+        }
+    }
+
+    // Fold the 8 accumulators into one vector of 8 lanes.
+    let mut lanes = [0.0_f32; LANES];
+    for a in 0..ACCS {
+        for l in 0..LANES {
+            lanes[l] += acc[a][l];
+        }
+    }
+
+    // Leftover whole vectors (fewer than 64 floats remain).
+    let chunks = rest.chunks_exact(LANES);
+    let tail = chunks.remainder();
+    for c in chunks {
+        for l in 0..LANES {
+            lanes[l] += c[l] * c[l];
+        }
+    }
+
+    // Horizontal sum, then the scalar tail (< 8 floats).
+    let mut sum = lanes.iter().fold(0.0_f32, |s, &x| s + x);
+    for &x in tail {
+        sum += x * x;
     }
     sum
 }
