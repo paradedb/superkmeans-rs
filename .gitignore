@@ -2,3 +2,8 @@
 SuperKMeans/
 /data/
 /target/criterion/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
