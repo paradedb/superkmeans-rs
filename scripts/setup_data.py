@@ -53,7 +53,11 @@ def download_base(data_dir: Path, cache_dir: Path) -> None:
             remote = f"passages_parquet/msmarco_v2.1_doc_segmented_{shard:02d}.parquet"
             print(f"Downloading {REPO_ID}/{remote} ...")
             local = hf_hub_download(
-                repo_id=REPO_ID, filename=remote, repo_type="dataset", cache_dir=cache_dir
+                repo_id=REPO_ID,
+                filename=remote,
+                repo_type="dataset",
+                revision="e78737fe92ac1b783211b705c12207ca75fcc9b7",
+                cache_dir=cache_dir,
             )
             for batch in pq.ParquetFile(local).iter_batches(batch_size=100_000, columns=["emb"]):
                 values = batch.column("emb").flatten().to_numpy()
@@ -80,7 +84,13 @@ def download_queries(data_dir: Path, cache_dir: Path) -> None:
     from datasets import load_dataset
 
     print(f"Downloading {REPO_ID} queries ...")
-    queries = load_dataset(REPO_ID, "queries", split="test", cache_dir=str(cache_dir))
+    queries = load_dataset(
+        REPO_ID,
+        "queries",
+        split="test",
+        revision="e78737fe92ac1b783211b705c12207ca75fcc9b7",
+        cache_dir=str(cache_dir),
+    )
     embeddings = np.asarray(queries[:N_QUERIES]["emb"], dtype=np.float32)
     embeddings.tofile(data_dir / "data_cohere_test.bin")
     print(f"  data_cohere_test.bin: {len(embeddings):,} x {embeddings.shape[1]}")
