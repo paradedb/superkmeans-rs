@@ -58,7 +58,7 @@ mod tests {
         for &d in dims {
             let split = get_dimension_split(d);
             assert!(
-                split.horizontal_d % H_DIM_SIZE == 0 || split.horizontal_d == 0,
+                split.horizontal_d.is_multiple_of(H_DIM_SIZE) || split.horizontal_d == 0,
                 "horizontal_d={} not a multiple of {} (or 0) for d={d}",
                 split.horizontal_d,
                 H_DIM_SIZE
