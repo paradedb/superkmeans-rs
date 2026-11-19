@@ -11,7 +11,7 @@ use rand_distr::Distribution as _;
 
 use superkmeans::adsampling::ADSamplingPruner;
 use superkmeans::common::PRUNER_INITIAL_THRESHOLD;
-use superkmeans::{SuperKMeans, SuperKMeansConfig, make_blobs};
+use superkmeans::{Matrix, SuperKMeans, SuperKMeansConfig, Vectors, make_blobs};
 
 fn default_blobs(n: usize, d: usize, n_clusters: usize) -> Vec<f32> {
     make_blobs(n, d, n_clusters, false, 1.0, 10.0, 42)
@@ -32,7 +32,7 @@ fn basic_training_small_dataset() {
     let mut kmeans = SuperKMeans::with_config(n_clusters, d, cfg);
     assert!(!kmeans.trained);
 
-    let centroids = kmeans.train(&data, n);
+    let centroids = kmeans.train(&mut Matrix::new(&data, n, d)).unwrap();
     assert!(kmeans.trained);
     assert_eq!(centroids.len(), n_clusters * d);
     assert_eq!(kmeans.n_clusters, n_clusters);
@@ -51,9 +51,12 @@ fn all_clusters_used() {
         ..Default::default()
     };
     let mut kmeans = SuperKMeans::with_config(n_clusters, d, cfg);
-    let centroids = kmeans.train(&data, n);
+    let centroids = kmeans.train(&mut Matrix::new(&data, n, d)).unwrap();
 
-    let assignments = kmeans.assign(&data, &centroids, n);
+    let assignments = kmeans.assign(
+        Matrix::new(&data, n, d),
+        Matrix::new(&centroids, n_clusters, d),
+    );
     let used: HashSet<u32> = assignments.iter().copied().collect();
     assert_eq!(
         used.len(),
@@ -76,8 +79,11 @@ fn perform_assignments_populates_assignments() {
         ..Default::default()
     };
     let mut kmeans = SuperKMeans::with_config(n_clusters, d, cfg);
-    let centroids = kmeans.train(&data, n);
-    let assignments = kmeans.assign(&data, &centroids, n);
+    let centroids = kmeans.train(&mut Matrix::new(&data, n, d)).unwrap();
+    let assignments = kmeans.assign(
+        Matrix::new(&data, n, d),
+        Matrix::new(&centroids, n_clusters, d),
+    );
 
     assert_eq!(assignments.len(), n);
     for (i, &a) in assignments.iter().enumerate() {
@@ -97,7 +103,7 @@ fn invalid_n_less_than_n_clusters() {
     let d = 32;
     let data = default_blobs(n, d, 10);
     let mut kmeans = SuperKMeans::new(n + 10, d);
-    kmeans.train(&data, n);
+    kmeans.train(&mut Matrix::new(&data, n, d)).unwrap();
 }
 
 #[test]
@@ -129,8 +135,8 @@ fn invalid_training_twice() {
     let d = 32;
     let data = default_blobs(n, d, 10);
     let mut kmeans = SuperKMeans::new(10, d);
-    let _ = kmeans.train(&data, n);
-    let _ = kmeans.train(&data, n);
+    let _ = kmeans.train(&mut Matrix::new(&data, n, d)).unwrap();
+    let _ = kmeans.train(&mut Matrix::new(&data, n, d)).unwrap();
 }
 
 // ----- Early termination -----
@@ -171,7 +177,7 @@ fn early_termination_shift_below_tol_stops() {
         ..Default::default()
     };
     let mut k_early = SuperKMeans::with_config(n_clusters, d, cfg_early);
-    k_early.train(&data, n);
+    k_early.train(&mut Matrix::new(&data, n, d)).unwrap();
     let iters_with_early = k_early.iteration_stats.len();
 
     let cfg_no_early = SuperKMeansConfig {
@@ -182,7 +188,7 @@ fn early_termination_shift_below_tol_stops() {
         ..Default::default()
     };
     let mut k_no_early = SuperKMeans::with_config(n_clusters, d, cfg_no_early);
-    k_no_early.train(&data, n);
+    k_no_early.train(&mut Matrix::new(&data, n, d)).unwrap();
     let iters_no_early = k_no_early.iteration_stats.len();
 
     assert!(
@@ -214,7 +220,7 @@ fn early_termination_disabled_runs_all_iterations() {
         ..Default::default()
     };
     let mut kmeans = SuperKMeans::with_config(n_clusters, d, cfg);
-    kmeans.train(&data, n);
+    kmeans.train(&mut Matrix::new(&data, n, d)).unwrap();
     assert_eq!(
         kmeans.iteration_stats.len(),
         max_iters as usize,
@@ -238,7 +244,7 @@ fn angular_mode_normalizes() {
         ..Default::default()
     };
     let mut kmeans = SuperKMeans::with_config(n_clusters, d, cfg);
-    let centroids = kmeans.train(&data, n);
+    let centroids = kmeans.train(&mut Matrix::new(&data, n, d)).unwrap();
     assert_eq!(centroids.len(), n_clusters * d);
 
     for c in 0..n_clusters {
@@ -271,7 +277,7 @@ fn pre_rotated_data_produces_identical_results() {
         ..Default::default()
     };
     let mut k1 = SuperKMeans::with_config(k, d, cfg1);
-    let centroids1 = k1.train(&data, n);
+    let centroids1 = k1.train(&mut Matrix::new(&data, n, d)).unwrap();
 
     // Case 2: rotate externally with the same pruner config, then run with
     // data_already_rotated=true (which forces unrotate_centroids=false).
@@ -288,7 +294,7 @@ fn pre_rotated_data_produces_identical_results() {
         ..Default::default()
     };
     let mut k2 = SuperKMeans::with_config(k, d, cfg2);
-    let centroids2 = k2.train(&rotated_data, n);
+    let centroids2 = k2.train(&mut Matrix::new(&rotated_data, n, d)).unwrap();
 
     assert_eq!(centroids1.len(), centroids2.len());
     assert_eq!(centroids1.len(), k * d);
@@ -352,10 +358,11 @@ fn train_owned_matches_train() {
         ..Default::default()
     };
     let mut borrowed = SuperKMeans::with_config(k, d, cfg.clone());
-    let centroids_borrowed = borrowed.train(&data, n);
+    let centroids_borrowed = borrowed.train(&mut Matrix::new(&data, n, d)).unwrap();
 
     let mut owned = SuperKMeans::with_config(k, d, cfg);
-    let centroids_owned = owned.train_owned(data.clone(), n);
+    let mut owned_data = Vectors::new(data.clone(), d);
+    let centroids_owned = owned.train(&mut owned_data).unwrap();
 
     assert_centroids_match(&centroids_borrowed, &centroids_owned, 1e-4);
 }
@@ -378,10 +385,11 @@ fn hierarchical_train_owned_matches_train() {
     cfg.base.suppress_warnings = true;
 
     let mut borrowed = HierarchicalSuperKMeans::with_config(d, cfg.clone());
-    let centroids_borrowed = borrowed.train(&data, n);
+    let centroids_borrowed = borrowed.train(&mut Matrix::new(&data, n, d));
 
     let mut owned = HierarchicalSuperKMeans::with_config(d, cfg);
-    let centroids_owned = owned.train_owned(data.clone(), n);
+    let mut owned_data = Vectors::new(data.clone(), d);
+    let centroids_owned = owned.train(&mut owned_data);
 
     assert_eq!(
         borrowed.base.n_clusters, owned.base.n_clusters,

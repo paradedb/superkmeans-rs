@@ -24,7 +24,7 @@ use crate::common::{
     DIMENSION_THRESHOLD_FOR_PRUNING, HIERARCHICAL_PRUNER_INITIAL_THRESHOLD,
     N_CLUSTERS_THRESHOLD_FOR_PRUNING,
 };
-use crate::dataset::{Dataset, IterDataset};
+use crate::dataset::{Contiguous, Dataset};
 use crate::matrix::Matrix;
 use crate::superkmeans::{SuperKMeans, SuperKMeansConfig, SuperKMeansIterationStats};
 use crate::utils::{normalize_rows_l2_sequential, squared_norms};
@@ -61,8 +61,7 @@ impl Default for HierarchicalSuperKMeansConfig {
 /// Statistics from hierarchical training: the per-pass stats of every local
 /// k-means run, plus counts describing the shape of the split tree.
 ///
-/// Only [`HierarchicalSuperKMeans::train`] and
-/// [`HierarchicalSuperKMeans::train_owned`] fill this in. The two-step
+/// Only [`HierarchicalSuperKMeans::train`] fills this in. The two-step
 /// streaming path returns per-pass stats alone, in [`MesoPartition::stats`]
 /// and [`FineClusters::stats`].
 #[derive(Default, Clone, Debug)]
@@ -153,7 +152,7 @@ struct Child {
 /// [`SuperKMeans::n_clusters`] on [`Self::base`].
 ///
 /// ```no_run
-/// use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig};
+/// use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, Matrix};
 ///
 /// let (n, d) = (10_000, 128);
 /// let data = vec![0.0_f32; n * d];
@@ -162,14 +161,14 @@ struct Child {
 /// config.target_leaf_size = 64;
 ///
 /// let mut kmeans = HierarchicalSuperKMeans::with_config(d, config);
-/// let centroids = kmeans.train(&data, n);
+/// let centroids = kmeans.train(&mut Matrix::new(&data, n, d));
 /// assert_eq!(centroids.len(), kmeans.base.n_clusters * d);
 /// ```
 pub struct HierarchicalSuperKMeans {
     /// Model holding the fine centroids once [`Self::train`] has run.
     pub base: SuperKMeans,
     pub config: HierarchicalSuperKMeansConfig,
-    /// Statistics from the last [`Self::train`] or [`Self::train_owned`] call.
+    /// Statistics from the last [`Self::train`] call.
     pub iteration_stats: HierarchicalSuperKMeansIterationStats,
     /// Shared by every per-split model to avoid repeating the O(d³)
     /// Householder QR per split.
@@ -218,26 +217,48 @@ impl HierarchicalSuperKMeans {
         }
     }
 
-    /// Cluster `n` row-major vectors and return the row-major fine centroids.
+    /// Cluster one contiguous sample and return the row-major fine centroids.
     ///
-    /// The cluster count is emergent; read it from [`Self::base`]'s
-    /// `n_clusters`.
+    /// A borrowed [`Matrix`] is left unchanged. An owned [`Vectors`](crate::Vectors)
+    /// is rotated in place.
     ///
     /// # Panics
     ///
-    /// Panics if `n` is zero or the model has already been trained.
-    pub fn train(&mut self, data: &[f32], n: usize) -> Vec<f32> {
-        self.train_impl(Cow::Borrowed(data), n)
+    /// Panics if `data` is not one contiguous block, the sample is empty, or
+    /// the model has already been trained. A scan uses [`Self::train_meso`]
+    /// and [`Self::train_meso_cluster`].
+    pub fn train<D: Dataset + ?Sized>(&mut self, data: &mut D) -> Vec<f32> {
+        match data.contiguous() {
+            Some(Contiguous::Borrowed(matrix)) => {
+                assert_eq!(
+                    matrix.d(),
+                    self.base.d,
+                    "matrix dimensionality {} does not match the model ({})",
+                    matrix.d(),
+                    self.base.d
+                );
+                self.train_impl(Cow::Borrowed(matrix.as_slice()), matrix.n())
+                    .0
+            }
+            Some(Contiguous::Owned(vectors)) => {
+                assert_eq!(
+                    vectors.d, self.base.d,
+                    "matrix dimensionality {} does not match the model ({})",
+                    vectors.d, self.base.d
+                );
+                let n = vectors.n();
+                let buf = std::mem::take(&mut vectors.data);
+                let (centroids, buf) = self.train_impl(Cow::Owned(buf), n);
+                vectors.data = buf;
+                centroids
+            }
+            None => panic!(
+                "hierarchical train needs one contiguous block; stream with train_meso and train_meso_cluster"
+            ),
+        }
     }
 
-    /// Like [`Self::train`], but takes ownership of `data` so the buffer can be
-    /// rotated and split in place. Peak memory is then one copy of the training
-    /// set rather than two.
-    pub fn train_owned(&mut self, data: Vec<f32>, n: usize) -> Vec<f32> {
-        self.train_impl(Cow::Owned(data), n)
-    }
-
-    fn train_impl(&mut self, data: Cow<'_, [f32]>, n: usize) -> Vec<f32> {
+    fn train_impl(&mut self, data: Cow<'_, [f32]>, n: usize) -> (Vec<f32>, Vec<f32>) {
         assert!(n > 0, "n must be positive");
         assert!(u32::try_from(n).is_ok(), "n must fit in u32");
         assert!(!self.base.trained, "already trained");
@@ -298,27 +319,25 @@ impl HierarchicalSuperKMeans {
         base.trained = true;
         let centroids = base.get_output_centroids(base.config.unrotate_centroids);
         self.base = base;
-        centroids
+        (centroids, data_to_cluster)
     }
 
-    /// Assign each of `n_vectors` vectors to its nearest centroid, returning one
-    /// index per vector.
+    /// Assign each vector to its nearest centroid, returning one index per vector.
     ///
     /// Pass the centroids returned by [`Self::train`] to get fine-cluster indices.
-    pub fn assign(&self, vectors: &[f32], centroids: &[f32], n_vectors: usize) -> Vec<u32> {
-        self.base.assign(vectors, centroids, n_vectors)
+    pub fn assign(&self, vectors: Matrix<'_>, centroids: Matrix<'_>) -> Vec<u32> {
+        self.base.assign(vectors, centroids)
     }
 
-    /// Assign each of `n_vectors` vectors to its nearest centroid and to a SOAR secondary,
+    /// Assign each vector to its nearest centroid and to a SOAR secondary,
     /// as [`SuperKMeans::assign_soar`].
     pub fn assign_soar(
         &self,
-        vectors: &[f32],
-        centroids: &[f32],
-        n_vectors: usize,
+        vectors: Matrix<'_>,
+        centroids: Matrix<'_>,
         lambda: f32,
     ) -> (Vec<u32>, Vec<u32>) {
-        self.base.assign_soar(vectors, centroids, n_vectors, lambda)
+        self.base.assign_soar(vectors, centroids, lambda)
     }
 
     /// Streaming meso step: cluster the `n` rows `data` scans into
@@ -362,7 +381,7 @@ impl HierarchicalSuperKMeans {
                 can_prune: self.meso_can_prune(k_meso),
             },
         );
-        skm.train_dataset(data)?;
+        skm.train_streaming(data)?;
         assert_eq!(
             skm.n_samples, n,
             "dataset yielded {} rows, expected {n}",
@@ -382,46 +401,67 @@ impl HierarchicalSuperKMeans {
         })
     }
 
-    /// [`Self::train_meso`] over a replayable iterator of [`Matrix`] batches.
-    /// `clone()` on the iterator must yield the same batches again.
-    pub fn train_meso_iter<'a, I>(&self, batches: I, n: usize) -> MesoPartition
-    where
-        I: IntoIterator<Item = Matrix<'a>>,
-        I::IntoIter: Clone,
-    {
-        let mut dataset = IterDataset::new(batches.into_iter());
-        match self.train_meso(&mut dataset, n) {
-            Ok(partition) => partition,
-            Err(never) => match never {},
-        }
-    }
-
-    /// Fine step for one meso cluster: split its `n` row-major vectors into
-    /// fine clusters of at most `target_leaf_size` rows each.
+    /// Split one contiguous meso cluster into leaves of at most `target_leaf_size` rows.
     ///
-    /// `data` is borrowed so the caller keeps the original vectors, e.g. to
-    /// write them out in [`FineClusters::order`]; the rotated working copy is
-    /// internal. Independent meso clusters can be trained in parallel.
+    /// A borrowed block is left unchanged, so the caller can write the original
+    /// vectors out in [`FineClusters::order`]. An owned [`Vectors`](crate::Vectors)
+    /// is rotated in place. Separate meso clusters can be trained in parallel.
     ///
     /// # Panics
     ///
-    /// Panics if `n` is zero or exceeds `u32::MAX`, or `data` holds fewer than
-    /// `n` vectors.
-    pub fn train_meso_cluster(&self, data: &[f32], n: usize) -> FineClusters {
+    /// Panics if `data` is not one contiguous block, or the block is empty.
+    pub fn train_meso_cluster<D: Dataset + ?Sized>(&self, data: &mut D) -> FineClusters {
+        let Some(block) = data.contiguous() else {
+            panic!(
+                "train_meso_cluster needs one contiguous block; stream the meso split with train_meso"
+            );
+        };
+        let (n, d) = match &block {
+            Contiguous::Borrowed(matrix) => (matrix.n(), matrix.d()),
+            Contiguous::Owned(vectors) => (vectors.n(), vectors.d),
+        };
+        assert_eq!(
+            d, self.base.d,
+            "matrix dimensionality {d} does not match the model ({})",
+            self.base.d
+        );
         assert!(n > 0, "n must be positive");
         assert!(u32::try_from(n).is_ok(), "n must fit in u32");
-        let d = self.base.d;
-        let len = n * d;
-        assert!(data.len() >= len, "data holds fewer than {n} vectors");
+        match block {
+            Contiguous::Borrowed(matrix) => {
+                let work = self.copy_meso_work(matrix.as_slice(), n);
+                self.split_meso_work(work, n).0
+            }
+            Contiguous::Owned(vectors) => {
+                let buf = std::mem::take(&mut vectors.data);
+                let work = self.take_meso_work(buf, n);
+                let (clusters, work) = self.split_meso_work(work, n);
+                vectors.data = work;
+                clusters
+            }
+        }
+    }
 
-        let base = &self.config.base;
-        let mut work = if base.data_already_rotated {
-            data[..len].to_vec()
+    fn copy_meso_work(&self, data: &[f32], n: usize) -> Vec<f32> {
+        if self.config.base.data_already_rotated {
+            data.to_vec()
         } else {
-            let mut rotated = vec![0.0_f32; len];
-            self.pruner.rotate(&data[..len], &mut rotated, n);
+            let mut rotated = vec![0.0_f32; data.len()];
+            self.pruner.rotate(data, &mut rotated, n);
             rotated
-        };
+        }
+    }
+
+    fn take_meso_work(&self, mut data: Vec<f32>, n: usize) -> Vec<f32> {
+        if !self.config.base.data_already_rotated {
+            self.pruner.rotate_in_place(&mut data, n);
+        }
+        data
+    }
+
+    fn split_meso_work(&self, mut work: Vec<f32>, n: usize) -> (FineClusters, Vec<f32>) {
+        let d = self.base.d;
+        let base = &self.config.base;
         let mut norms = squared_norms(&work, n, d);
         let mut ids: Vec<u32> = (0..n as u32).collect();
         let mut rows = Subset {
@@ -459,12 +499,15 @@ impl HierarchicalSuperKMeans {
         for &size in &sizes {
             offsets.push(offsets.last().unwrap() + size as usize);
         }
-        FineClusters {
-            centroids,
-            offsets,
-            order: ids,
-            stats: stats.local_runs,
-        }
+        (
+            FineClusters {
+                centroids,
+                offsets,
+                order: ids,
+                stats: stats.local_runs,
+            },
+            work,
+        )
     }
 
     /// Meso split, then split each meso cluster down to leaves.
@@ -618,7 +661,7 @@ impl HierarchicalSuperKMeans {
     ///
     /// Pruning needs a wide vector, more clusters than the GEMM cutoff, and
     /// the BLAS-only switch off — the same conditions as
-    /// [`SuperKMeans`](crate::SuperKMeans)'s streaming loop. Below that, the
+    /// [`SuperKMeans`]'s streaming loop. Below that, the
     /// rotation does not change which centroid a row lands on.
     fn meso_can_prune(&self, k_meso: usize) -> bool {
         self.base.d >= DIMENSION_THRESHOLD_FOR_PRUNING
@@ -951,6 +994,7 @@ enum LocalSkmMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::IterDataset;
     use crate::common::N_CLUSTERS_THRESHOLD_FOR_PRUNING;
     use crate::utils::make_blobs;
 
@@ -972,7 +1016,7 @@ mod tests {
     fn train(n: usize, d: usize, cfg: HierarchicalSuperKMeansConfig) -> HierarchicalSuperKMeans {
         let data = make_blobs(n, d, 8, true, 1.0, 5.0, 42);
         let mut kmeans = HierarchicalSuperKMeans::with_config(d, cfg);
-        let _centroids = kmeans.train(&data, n);
+        let _centroids = kmeans.train(&mut Matrix::new(&data, n, d));
         kmeans
     }
 
@@ -1021,14 +1065,20 @@ mod tests {
         assert!(k >= 2);
         assert!(!kmeans.meso_can_prune(k));
 
-        let meso = kmeans.train_meso_iter(Matrix::new(&data, n, d).chunks(256), n);
+        let meso = kmeans
+            .train_meso(
+                &mut IterDataset::new(Matrix::new(&data, n, d).chunks(256)),
+                n,
+            )
+            .unwrap();
         assert_eq!(meso.n_meso(), k, "meso clustering collapsed");
 
         let mut skm_cfg = cfg.base.clone();
         skm_cfg.iters = cfg.iters_meso;
         skm_cfg.data_already_rotated = true;
         let mut skm = SuperKMeans::with_config(k, d, skm_cfg);
-        skm.train_iter(Matrix::new(&data, n, d).chunks(256));
+        skm.train(&mut IterDataset::new(Matrix::new(&data, n, d).chunks(256)))
+            .unwrap();
 
         let mut from_meso = vec![0_u32; n];
         for m in 0..meso.n_meso() {
@@ -1058,8 +1108,8 @@ mod tests {
         cfg.base.angular = true;
         let kmeans = HierarchicalSuperKMeans::with_config(d, cfg.clone());
 
-        let left = kmeans.train_meso_cluster(&data[..150 * d], 150);
-        let right = kmeans.train_meso_cluster(&data[150 * d..], 150);
+        let left = kmeans.train_meso_cluster(&mut Matrix::new(&data[..150 * d], 150, d));
+        let right = kmeans.train_meso_cluster(&mut Matrix::new(&data[150 * d..], 150, d));
         assert_eq!(left.n_fine(), 1);
         assert_eq!(right.n_fine(), 1);
         assert_close(&left.centroids, &[1.0, 0.0]);
@@ -1069,13 +1119,13 @@ mod tests {
         let mut one_leaf = cfg.clone();
         one_leaf.target_leaf_size = n;
         let mut trained = HierarchicalSuperKMeans::with_config(d, one_leaf);
-        let centroid = trained.train(&data, n);
+        let centroid = trained.train(&mut Matrix::new(&data, n, d));
         assert_eq!(trained.base.n_clusters, 1);
         let scale = (5.0_f32 * 5.0 + 0.5 * 0.5).sqrt();
         assert_close(&centroid, &[5.0 / scale, 0.5 / scale]);
 
         let mut trained = HierarchicalSuperKMeans::with_config(d, cfg);
-        let centroids = trained.train(&data, n);
+        let centroids = trained.train(&mut Matrix::new(&data, n, d));
         assert_eq!(centroids.len(), 2 * d);
         let mut rows: Vec<[f32; 2]> = centroids.chunks_exact(d).map(|c| [c[0], c[1]]).collect();
         rows.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap());
@@ -1138,7 +1188,7 @@ mod tests {
         let data = make_blobs(n, d, 40, true, 1.0, 10.0, 7);
 
         let mut kmeans = HierarchicalSuperKMeans::with_config(d, config(target_leaf_size));
-        let _ = kmeans.train(&data, n);
+        let _ = kmeans.train(&mut Matrix::new(&data, n, d));
 
         let sizes: Vec<f64> = kmeans
             .base
@@ -1182,7 +1232,7 @@ mod tests {
         assert!(cfg.base.early_termination && cfg.base.use_aggressive_split);
 
         let kmeans = HierarchicalSuperKMeans::with_config(d, cfg);
-        let fine = kmeans.train_meso_cluster(&data, n);
+        let fine = kmeans.train_meso_cluster(&mut Matrix::new(&data, n, d));
 
         // The fixture has to reach the case: runs revive small clusters, and
         // runs stop before their last configured pass.
@@ -1242,8 +1292,11 @@ mod tests {
         let data = make_blobs(n, d, 40, true, 1.0, 10.0, 3);
 
         let mut kmeans = HierarchicalSuperKMeans::with_config(d, config(25));
-        let centroids = kmeans.train(&data, n);
-        let assignments = kmeans.assign(&data, &centroids, n);
+        let centroids = kmeans.train(&mut Matrix::new(&data, n, d));
+        let assignments = kmeans.assign(
+            Matrix::new(&data, n, d),
+            Matrix::new(&centroids, kmeans.base.n_clusters, d),
+        );
 
         let mut total = 0.0f64;
         for (i, &cluster) in assignments.iter().enumerate() {
@@ -1296,9 +1349,12 @@ mod tests {
         let (n, d) = (400usize, 16usize);
         let data = make_blobs(n, d, 8, true, 1.0, 5.0, 42);
         let mut kmeans = HierarchicalSuperKMeans::with_config(d, config(32));
-        let centroids = kmeans.train(&data, n);
+        let centroids = kmeans.train(&mut Matrix::new(&data, n, d));
 
-        let assignments = kmeans.assign(&data, &centroids, n);
+        let assignments = kmeans.assign(
+            Matrix::new(&data, n, d),
+            Matrix::new(&centroids, kmeans.base.n_clusters, d),
+        );
         assert_eq!(assignments.len(), n);
         assert!(
             assignments
@@ -1315,9 +1371,9 @@ mod tests {
         let data = make_blobs(n, d, 6, true, 1.0, 5.0, 11);
 
         let mut first = HierarchicalSuperKMeans::with_config(d, cfg.clone());
-        let first_centroids = first.train(&data, n);
+        let first_centroids = first.train(&mut Matrix::new(&data, n, d));
         let mut second = HierarchicalSuperKMeans::with_config(d, cfg);
-        let second_centroids = second.train(&data, n);
+        let second_centroids = second.train(&mut Matrix::new(&data, n, d));
 
         assert_eq!(first.base.n_clusters, second.base.n_clusters);
         assert_eq!(first_centroids, second_centroids);
@@ -1500,7 +1556,7 @@ mod tests {
         let d = 32usize;
         let data = make_blobs(n, d, 10, true, 1.0, 5.0, 1);
         let mut kmeans = HierarchicalSuperKMeans::with_config(d, cfg);
-        let centroids = kmeans.train(&data, n);
+        let centroids = kmeans.train(&mut Matrix::new(&data, n, d));
         assert_eq!(centroids.len(), kmeans.base.n_clusters * d);
         assert!(kmeans.base.n_clusters >= n.div_ceil(64));
     }

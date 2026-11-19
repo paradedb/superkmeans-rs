@@ -40,12 +40,12 @@ pub mod superkmeans;
 pub mod utils;
 
 pub use common::{DistanceFunction, KnnCandidate};
-pub use dataset::{Dataset, IterDataset};
+pub use dataset::{Contiguous, Dataset, IterDataset};
 pub use hierarchical::{
     FineClusters, HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig,
     HierarchicalSuperKMeansIterationStats, MesoPartition,
 };
-pub use matrix::{Matrix, MatrixChunks};
+pub use matrix::{Matrix, MatrixChunks, Vectors};
 pub use superkmeans::{
     ClusterBalanceStats, PruningStats, SoarAssigner, SuperKMeans, SuperKMeansConfig,
     SuperKMeansIterationStats, assign, assign_soar, assign_soar_replicas,

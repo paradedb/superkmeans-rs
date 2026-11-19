@@ -2,7 +2,15 @@
 
 use std::convert::Infallible;
 
-use crate::matrix::Matrix;
+use crate::matrix::{Matrix, Vectors};
+
+/// One contiguous `n × d` sample from [`Dataset::contiguous`].
+pub enum Contiguous<'a> {
+    /// Borrowed block. Training copies it.
+    Borrowed(Matrix<'a>),
+    /// Owned block. Training rotates [`Vectors::data`] in place.
+    Owned(&'a mut Vectors),
+}
 
 /// A sequential scan of row-major [`Matrix`] batches that can be replayed.
 ///
@@ -20,6 +28,14 @@ pub trait Dataset {
 
     /// Call `f` once per batch, in order. Stops at the first error.
     fn for_each_batch(&mut self, f: &mut dyn FnMut(Matrix<'_>)) -> Result<(), Self::Error>;
+
+    /// The whole sample when it is one contiguous block.
+    ///
+    /// The default is [`None`], and training streams. [`Matrix`] and [`Vectors`]
+    /// return themselves.
+    fn contiguous(&mut self) -> Option<Contiguous<'_>> {
+        None
+    }
 }
 
 /// A [`Clone`] iterator of [`Matrix`] batches, replayed by cloning it on
@@ -61,6 +77,25 @@ impl Dataset for Matrix<'_> {
             f(*self);
         }
         Ok(())
+    }
+
+    fn contiguous(&mut self) -> Option<Contiguous<'_>> {
+        Some(Contiguous::Borrowed(*self))
+    }
+}
+
+impl Dataset for Vectors {
+    type Error = Infallible;
+
+    fn for_each_batch(&mut self, f: &mut dyn FnMut(Matrix<'_>)) -> Result<(), Infallible> {
+        if !self.as_matrix().is_empty() {
+            f(self.as_matrix());
+        }
+        Ok(())
+    }
+
+    fn contiguous(&mut self) -> Option<Contiguous<'_>> {
+        Some(Contiguous::Owned(self))
     }
 }
 
@@ -149,7 +184,7 @@ mod tests {
         assert_eq!(seen[3].1, vec![18.0, 19.0]);
 
         // A single large matrix is split without changing values.
-        let mut whole = Matrix::from_slice(&data, d);
+        let mut whole = Matrix::new(&data, 10, d);
         let mut sizes = Vec::new();
         visit_work_batches(&mut whole, d, 4, &mut buf, |m| {
             sizes.push(m.n());
@@ -165,9 +200,8 @@ mod tests {
         let data: Vec<f32> = (0..14).map(|i| i as f32).collect();
         let d = 2;
         let (first, second) = data.split_at(5 * d);
-        let mut dataset = IterDataset::new(
-            [Matrix::from_slice(first, d), Matrix::from_slice(second, d)].into_iter(),
-        );
+        let mut dataset =
+            IterDataset::new([Matrix::new(first, 5, d), Matrix::new(second, 2, d)].into_iter());
 
         let mut buf = Vec::new();
         let mut seen = Vec::new();

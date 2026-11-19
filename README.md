@@ -26,14 +26,14 @@ The crate is published as `superkmeans-rs` and imported as `superkmeans`.
 Vectors are stored in a flat, row-major slice of `n * d` floats:
 
 ```rust
-use superkmeans::{SuperKMeans, make_blobs};
+use superkmeans::{Matrix, SuperKMeans, make_blobs};
 
 let (n, d, k) = (10_000, 128, 100);
 let data = make_blobs(n, d, k, true, 1.0, 10.0, 42);
 
 let mut kmeans = SuperKMeans::new(k, d);
-let centroids = kmeans.train(&data, n);
-let assignments = kmeans.assign(&data, &centroids, n);
+let centroids = kmeans.train(&mut Matrix::new(&data, n, d)).unwrap();
+let assignments = kmeans.assign(Matrix::new(&data, n, d), Matrix::new(&centroids, k, d));
 assert_eq!(assignments.len(), n);
 ```
 
@@ -41,8 +41,10 @@ Use [`SuperKMeansConfig`](https://docs.rs/superkmeans-rs/latest/superkmeans/stru
 to set iterations, seed, and pruning parameters. Set `RAYON_NUM_THREADS` to
 control parallelism, or run training in your own Rayon thread pool.
 
-For data that does not fit in memory, `train_iter` accepts replayable batches;
-`train_dataset` supports fallible data sources. Both scan the data on each pass.
+`train` takes a [`Dataset`](https://docs.rs/superkmeans-rs/latest/superkmeans/trait.Dataset.html).
+A [`Matrix`](https://docs.rs/superkmeans-rs/latest/superkmeans/struct.Matrix.html) or
+[`Vectors`](https://docs.rs/superkmeans-rs/latest/superkmeans/struct.Vectors.html) trains in memory.
+Any other dataset is scanned once per pass.
 [`HierarchicalSuperKMeans`](https://docs.rs/superkmeans-rs/latest/superkmeans/struct.HierarchicalSuperKMeans.html)
 splits clusters until they fit within the target leaf size and also supports streaming the
 initial partition. See the API docs and [examples](examples) for these workflows.

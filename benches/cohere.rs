@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, SuperKMeans};
+use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, Matrix, SuperKMeans};
 
 const N: usize = 10_000_000;
 const D: usize = 1024;
@@ -72,7 +72,9 @@ fn bench_train(c: &mut Criterion) {
         |b| {
             b.iter(|| {
                 let mut kmeans = SuperKMeans::new(K, D);
-                let centroids = kmeans.train(black_box(data), black_box(N));
+                let centroids = kmeans
+                    .train(&mut Matrix::new(black_box(data), N, D))
+                    .unwrap();
                 black_box(centroids);
             });
         },
@@ -90,7 +92,7 @@ fn bench_train(c: &mut Criterion) {
                     ..Default::default()
                 };
                 let mut kmeans = HierarchicalSuperKMeans::with_config(D, cfg);
-                let centroids = kmeans.train(black_box(data), black_box(N));
+                let centroids = kmeans.train(&mut Matrix::new(black_box(data), N, D));
                 black_box(centroids);
             });
         },
@@ -105,15 +107,16 @@ fn bench_assign(c: &mut Criterion) {
     // Train once outside the timed loop; assign is what we measure.
     let flat_centroids = {
         let mut kmeans = SuperKMeans::new(K, D);
-        kmeans.train(data, N)
+        kmeans.train(&mut Matrix::new(data, N, D)).unwrap()
     };
-    let hier_centroids = {
+    let (hier_centroids, hier_k) = {
         let cfg = HierarchicalSuperKMeansConfig {
             target_leaf_size: HIER_TARGET_LEAF_SIZE,
             ..Default::default()
         };
         let mut kmeans = HierarchicalSuperKMeans::with_config(D, cfg);
-        kmeans.train(data, N)
+        let centroids = kmeans.train(&mut Matrix::new(data, N, D));
+        (centroids, kmeans.base.n_clusters)
     };
 
     let mut group = c.benchmark_group("assign");
@@ -125,8 +128,10 @@ fn bench_assign(c: &mut Criterion) {
         |b| {
             b.iter(|| {
                 let kmeans = SuperKMeans::new(K, D);
-                let assignments =
-                    kmeans.assign(black_box(data), black_box(&flat_centroids), black_box(N));
+                let assignments = kmeans.assign(
+                    Matrix::new(black_box(data), N, D),
+                    Matrix::new(black_box(&flat_centroids), K, D),
+                );
                 black_box(assignments);
             });
         },
@@ -140,8 +145,10 @@ fn bench_assign(c: &mut Criterion) {
         |b| {
             b.iter(|| {
                 let kmeans = HierarchicalSuperKMeans::new(D);
-                let assignments =
-                    kmeans.assign(black_box(data), black_box(&hier_centroids), black_box(N));
+                let assignments = kmeans.assign(
+                    Matrix::new(black_box(data), N, D),
+                    Matrix::new(black_box(&hier_centroids), hier_k, D),
+                );
                 black_box(assignments);
             });
         },

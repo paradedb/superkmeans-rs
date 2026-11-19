@@ -7,7 +7,7 @@ use std::env;
 use std::process::ExitCode;
 
 use superkmeans::{
-    HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, SuperKMeans, TicToc, make_blobs,
+    HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, Matrix, SuperKMeans, TicToc, make_blobs,
 };
 
 fn print_usage(program: &str) {
@@ -56,12 +56,15 @@ fn main() -> ExitCode {
     println!("Running HierarchicalSuperKMeans...");
     let mut timer = TicToc::new();
     timer.tic();
-    let centroids = kmeans.train(&data, n);
+    let centroids = kmeans.train(&mut Matrix::new(&data, n, d));
     timer.toc();
     println!("Index built in: {} ms", timer.milliseconds());
     println!("Clusters: {}", kmeans.base.n_clusters);
 
-    let assignments = kmeans.assign(&data, &centroids, n);
+    let assignments = kmeans.assign(
+        Matrix::new(&data, n, d),
+        Matrix::new(&centroids, kmeans.base.n_clusters, d),
+    );
     println!("Got {} assignments", assignments.len());
 
     let stats = SuperKMeans::cluster_balance_stats(&assignments, n, kmeans.base.n_clusters);

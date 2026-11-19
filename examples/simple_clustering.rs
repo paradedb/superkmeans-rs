@@ -3,7 +3,7 @@
 use std::env;
 use std::process::ExitCode;
 
-use superkmeans::{SuperKMeans, SuperKMeansConfig, TicToc, make_blobs};
+use superkmeans::{Matrix, SuperKMeans, SuperKMeansConfig, TicToc, make_blobs};
 
 fn print_usage(program: &str) {
     println!(
@@ -44,14 +44,14 @@ fn main() -> ExitCode {
     println!("Running SuperKMeans with {} clusters...", k);
     let mut timer = TicToc::new();
     timer.tic();
-    let centroids = kmeans.train(&data, n);
+    let centroids = kmeans.train(&mut Matrix::new(&data, n, d)).unwrap();
     timer.toc();
     let construction_time_ms = timer.milliseconds();
     println!("Index built in: {} ms", construction_time_ms);
 
     timer.reset();
     timer.tic();
-    let assignments = kmeans.assign(&data, &centroids, n);
+    let assignments = kmeans.assign(Matrix::new(&data, n, d), Matrix::new(&centroids, k, d));
     timer.toc();
     let assignment_time_ms = timer.milliseconds();
     println!("Assignment time: {} ms", assignment_time_ms);

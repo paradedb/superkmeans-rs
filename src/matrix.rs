@@ -48,26 +48,6 @@ impl<'a> Matrix<'a> {
         Self { data, n, d }
     }
 
-    /// View `data` as `n = data.len() / d` row-major vectors of length `d`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `d == 0` or `data.len()` is not a multiple of `d`.
-    pub fn from_slice(data: &'a [f32], d: usize) -> Self {
-        assert!(d > 0, "dimensionality must be positive");
-        assert_eq!(
-            data.len() % d,
-            0,
-            "data length {} is not a multiple of d ({d})",
-            data.len()
-        );
-        Self {
-            data,
-            n: data.len() / d,
-            d,
-        }
-    }
-
     /// A single vector (`n = 1`), with `d = data.len()`.
     ///
     /// # Panics
@@ -123,8 +103,8 @@ impl<'a> Matrix<'a> {
     ///
     /// The last chunk may be shorter. `rows` must be positive.
     ///
-    /// The resulting iterator is [`Clone`], so it can be replayed across
-    /// k-means passes via [`crate::SuperKMeans::train_iter`].
+    /// The resulting iterator is [`Clone`], so an
+    /// [`IterDataset`](crate::IterDataset) can replay it.
     pub fn chunks(&self, rows: usize) -> MatrixChunks<'a> {
         assert!(rows > 0, "chunk row count must be positive");
         MatrixChunks {
@@ -156,8 +136,7 @@ impl Eq for Matrix<'_> {}
 
 /// Iterator of [`Matrix`] row-chunks produced by [`Matrix::chunks`].
 ///
-/// Cloneable so [`crate::SuperKMeans::train_iter`] can replay it each Lloyd
-/// iteration.
+/// [`Clone`], so an [`IterDataset`](crate::IterDataset) can replay each chunk.
 #[derive(Clone, Debug)]
 pub struct MatrixChunks<'a> {
     inner: std::slice::Chunks<'a, f32>,
@@ -186,16 +165,51 @@ impl<'a> Iterator for MatrixChunks<'a> {
 
 impl ExactSizeIterator for MatrixChunks<'_> {}
 
+/// An owned row-major `n × d` block of `f32`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Vectors {
+    pub data: Vec<f32>,
+    pub d: usize,
+}
+
+impl Vectors {
+    /// Build an owned block from a row-major buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `d` is zero or `data.len()` is not a multiple of `d`.
+    pub fn new(data: Vec<f32>, d: usize) -> Self {
+        assert!(d > 0, "dimensionality must be positive");
+        assert_eq!(
+            data.len() % d,
+            0,
+            "data length {} is not a multiple of d ({d})",
+            data.len()
+        );
+        Self { data, d }
+    }
+
+    pub fn n(&self) -> usize {
+        self.data.len() / self.d
+    }
+
+    pub fn as_slice(&self) -> &[f32] {
+        &self.data
+    }
+
+    pub fn as_matrix(&self) -> Matrix<'_> {
+        Matrix::new(&self.data, self.n(), self.d)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn new_and_from_slice_agree() {
+    fn rows_follow_n_and_d() {
         let data = [1.0, 2.0, 3.0, 4.0];
         let a = Matrix::new(&data, 2, 2);
-        let b = Matrix::from_slice(&data, 2);
-        assert_eq!(a, b);
         assert_eq!(a.row(0), &[1.0, 2.0]);
         assert_eq!(a.row(1), &[3.0, 4.0]);
     }
