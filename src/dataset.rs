@@ -4,15 +4,11 @@ use std::convert::Infallible;
 
 use crate::matrix::{Matrix, Vectors};
 
-/// One contiguous `n × d` sample.
-///
-/// [`Dataset::contiguous`] returns this when training can rotate the sample
-/// once and run Lloyd over it. A borrowed block is copied. An owned
-/// [`Vectors`] is rotated in place and left in working coordinates.
+/// One contiguous `n × d` sample from [`Dataset::contiguous`].
 pub enum Contiguous<'a> {
-    /// A borrowed view. Training copies it, then rotates the copy.
+    /// Borrowed block. Training copies it.
     Borrowed(Matrix<'a>),
-    /// An owned buffer. Training rotates [`Vectors::data`] in place.
+    /// Owned block. Training rotates [`Vectors::data`] in place.
     Owned(&'a mut Vectors),
 }
 
@@ -33,11 +29,10 @@ pub trait Dataset {
     /// Call `f` once per batch, in order. Stops at the first error.
     fn for_each_batch(&mut self, f: &mut dyn FnMut(Matrix<'_>)) -> Result<(), Self::Error>;
 
-    /// The whole sample when it already sits in one contiguous buffer.
+    /// The whole sample when it is one contiguous block.
     ///
-    /// The default is no block, so training streams. [`Matrix`] and [`Vectors`]
-    /// return themselves, and training then rotates once and runs Lloyd over
-    /// the whole sample.
+    /// The default is [`None`], and training streams. [`Matrix`] and [`Vectors`]
+    /// return themselves.
     fn contiguous(&mut self) -> Option<Contiguous<'_>> {
         None
     }

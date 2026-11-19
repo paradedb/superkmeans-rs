@@ -152,7 +152,7 @@ struct Child {
 /// [`SuperKMeans::n_clusters`] on [`Self::base`].
 ///
 /// ```no_run
-/// use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig};
+/// use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, Matrix};
 ///
 /// let (n, d) = (10_000, 128);
 /// let data = vec![0.0_f32; n * d];
@@ -161,7 +161,7 @@ struct Child {
 /// config.target_leaf_size = 64;
 ///
 /// let mut kmeans = HierarchicalSuperKMeans::with_config(d, config);
-/// let centroids = kmeans.train(&mut superkmeans::Matrix::new(&data, n, d));
+/// let centroids = kmeans.train(&mut Matrix::new(&data, n, d));
 /// assert_eq!(centroids.len(), kmeans.base.n_clusters * d);
 /// ```
 pub struct HierarchicalSuperKMeans {
@@ -219,16 +219,14 @@ impl HierarchicalSuperKMeans {
 
     /// Cluster one contiguous sample and return the row-major fine centroids.
     ///
-    /// The cluster count is emergent; read it from [`Self::base`]'s
-    /// `n_clusters`. A borrowed [`Matrix`] is copied. An owned
-    /// [`Vectors`](crate::Vectors) is rotated and split in place, then written
-    /// back in working coordinates.
+    /// A borrowed [`Matrix`] is left unchanged. An owned [`Vectors`](crate::Vectors)
+    /// is rotated in place.
     ///
     /// # Panics
     ///
     /// Panics if `data` is not one contiguous block, the sample is empty, or
-    /// the model has already been trained. Stream a dataset with
-    /// [`Self::train_meso`] and [`Self::train_meso_cluster`].
+    /// the model has already been trained. A scan uses [`Self::train_meso`]
+    /// and [`Self::train_meso_cluster`].
     pub fn train<D: Dataset + ?Sized>(&mut self, data: &mut D) -> Vec<f32> {
         match data.contiguous() {
             Some(Contiguous::Borrowed(matrix)) => {
@@ -403,13 +401,11 @@ impl HierarchicalSuperKMeans {
         })
     }
 
-    /// Fine step for one meso cluster: split one contiguous block into fine
-    /// clusters of at most `target_leaf_size` rows each.
+    /// Split one contiguous meso cluster into leaves of at most `target_leaf_size` rows.
     ///
-    /// A borrowed block is copied, so the caller keeps the original vectors,
-    /// e.g. to write them out in [`FineClusters::order`]. An owned
-    /// [`Vectors`](crate::Vectors) is rotated and split in place and written
-    /// back. Independent meso clusters can be trained in parallel.
+    /// A borrowed block is left unchanged, so the caller can write the original
+    /// vectors out in [`FineClusters::order`]. An owned [`Vectors`](crate::Vectors)
+    /// is rotated in place. Separate meso clusters can be trained in parallel.
     ///
     /// # Panics
     ///
@@ -420,26 +416,23 @@ impl HierarchicalSuperKMeans {
                 "train_meso_cluster needs one contiguous block; stream the meso split with train_meso"
             );
         };
+        let (n, d) = match &block {
+            Contiguous::Borrowed(matrix) => (matrix.n(), matrix.d()),
+            Contiguous::Owned(vectors) => (vectors.n(), vectors.d),
+        };
+        assert_eq!(
+            d, self.base.d,
+            "matrix dimensionality {d} does not match the model ({})",
+            self.base.d
+        );
+        assert!(n > 0, "n must be positive");
+        assert!(u32::try_from(n).is_ok(), "n must fit in u32");
         match block {
             Contiguous::Borrowed(matrix) => {
-                assert_eq!(
-                    matrix.d(),
-                    self.base.d,
-                    "matrix dimensionality {} does not match the model ({})",
-                    matrix.d(),
-                    self.base.d
-                );
-                let n = matrix.n();
                 let work = self.copy_meso_work(matrix.as_slice(), n);
                 self.split_meso_work(work, n).0
             }
             Contiguous::Owned(vectors) => {
-                assert_eq!(
-                    vectors.d, self.base.d,
-                    "matrix dimensionality {} does not match the model ({})",
-                    vectors.d, self.base.d
-                );
-                let n = vectors.n();
                 let buf = std::mem::take(&mut vectors.data);
                 let work = self.take_meso_work(buf, n);
                 let (clusters, work) = self.split_meso_work(work, n);
@@ -450,26 +443,16 @@ impl HierarchicalSuperKMeans {
     }
 
     fn copy_meso_work(&self, data: &[f32], n: usize) -> Vec<f32> {
-        assert!(n > 0, "n must be positive");
-        assert!(u32::try_from(n).is_ok(), "n must fit in u32");
-        let d = self.base.d;
-        let len = n * d;
-        assert!(data.len() >= len, "data holds fewer than {n} vectors");
         if self.config.base.data_already_rotated {
-            data[..len].to_vec()
+            data.to_vec()
         } else {
-            let mut rotated = vec![0.0_f32; len];
-            self.pruner.rotate(&data[..len], &mut rotated, n);
+            let mut rotated = vec![0.0_f32; data.len()];
+            self.pruner.rotate(data, &mut rotated, n);
             rotated
         }
     }
 
     fn take_meso_work(&self, mut data: Vec<f32>, n: usize) -> Vec<f32> {
-        assert!(n > 0, "n must be positive");
-        assert!(u32::try_from(n).is_ok(), "n must fit in u32");
-        let len = n * self.base.d;
-        assert!(data.len() >= len, "data holds fewer than {n} vectors");
-        data.truncate(len);
         if !self.config.base.data_already_rotated {
             self.pruner.rotate_in_place(&mut data, n);
         }

@@ -416,13 +416,11 @@ impl SuperKMeans {
         }
     }
 
-    /// Train the model and return row-major centroids (`n_clusters × d`).
+    /// Train on `data` and return row-major centroids (`n_clusters × d`).
     ///
-    /// A [`Matrix`] or [`Vectors`](crate::Vectors) is one contiguous block.
-    /// Training rotates that block once and runs Lloyd over every row. An
-    /// owned buffer is rotated in place and left in working coordinates. Any
-    /// other [`Dataset`], including an [`IterDataset`](crate::IterDataset) of
-    /// batches, is streamed. The scan stays on the calling thread.
+    /// A [`Matrix`] or [`Vectors`](crate::Vectors) is trained in memory, and an
+    /// owned [`Vectors`](crate::Vectors) is rotated in place. Any other
+    /// [`Dataset`] is streamed on the calling thread.
     ///
     /// ```
     /// use superkmeans::{IterDataset, Matrix, SuperKMeans, make_blobs};
@@ -438,15 +436,14 @@ impl SuperKMeans {
     ///
     /// # Errors
     ///
-    /// Returns the first error [`Dataset::for_each_batch`] fails with. A
-    /// contiguous block is not scanned, so [`Matrix`] and [`Vectors`](crate::Vectors)
-    /// return [`Ok`].
+    /// Returns the first error from [`Dataset::for_each_batch`]. [`Matrix`] and
+    /// [`Vectors`](crate::Vectors) do not scan, so they return [`Ok`].
     ///
     /// # Panics
     ///
-    /// Panics if the model is already trained, `k` was zero at construction,
-    /// the sample has fewer rows than `n_clusters`, a batch's dimensionality
-    /// differs from the model, or two streaming passes yield different row counts.
+    /// Panics if the model is already trained, the sample has fewer rows than
+    /// `n_clusters`, a batch's dimensionality differs from the model, or two
+    /// streaming passes yield different row counts.
     pub fn train<D: Dataset + ?Sized>(&mut self, data: &mut D) -> Result<Vec<f32>, D::Error> {
         if let Some(block) = data.contiguous() {
             return Ok(self.train_contiguous(block));
@@ -454,10 +451,10 @@ impl SuperKMeans {
         self.train_streaming(data)
     }
 
-    /// Reservoir-sample and stream Lloyd, even when `data` is one contiguous block.
+    /// Stream Lloyd, including when `data` is one contiguous block.
     ///
     /// [`HierarchicalSuperKMeans::train_meso`](crate::HierarchicalSuperKMeans::train_meso)
-    /// calls this so a full in-memory scan still uses the streaming init.
+    /// uses this so a full scan still reservoir-samples.
     pub(crate) fn train_streaming<D: Dataset + ?Sized>(
         &mut self,
         data: &mut D,

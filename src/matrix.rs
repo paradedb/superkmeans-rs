@@ -103,8 +103,8 @@ impl<'a> Matrix<'a> {
     ///
     /// The last chunk may be shorter. `rows` must be positive.
     ///
-    /// The resulting iterator is [`Clone`], so it can be replayed across
-    /// k-means passes inside an [`crate::IterDataset`].
+    /// The resulting iterator is [`Clone`], so an
+    /// [`IterDataset`](crate::IterDataset) can replay it.
     pub fn chunks(&self, rows: usize) -> MatrixChunks<'a> {
         assert!(rows > 0, "chunk row count must be positive");
         MatrixChunks {
@@ -136,8 +136,7 @@ impl Eq for Matrix<'_> {}
 
 /// Iterator of [`Matrix`] row-chunks produced by [`Matrix::chunks`].
 ///
-/// Cloneable so an [`crate::IterDataset`] of chunks can be replayed each Lloyd
-/// iteration.
+/// [`Clone`], so an [`IterDataset`](crate::IterDataset) can replay each chunk.
 #[derive(Clone, Debug)]
 pub struct MatrixChunks<'a> {
     inner: std::slice::Chunks<'a, f32>,
@@ -167,9 +166,6 @@ impl<'a> Iterator for MatrixChunks<'a> {
 impl ExactSizeIterator for MatrixChunks<'_> {}
 
 /// An owned row-major `n × d` block of `f32`.
-///
-/// `d` is stored on the value. A bare [`Vec<f32>`] does not know it.
-/// [`Vectors::as_matrix`] borrows the block as a [`Matrix`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct Vectors {
     pub data: Vec<f32>,
@@ -177,6 +173,8 @@ pub struct Vectors {
 }
 
 impl Vectors {
+    /// Build an owned block from a row-major buffer.
+    ///
     /// # Panics
     ///
     /// Panics if `d` is zero or `data.len()` is not a multiple of `d`.

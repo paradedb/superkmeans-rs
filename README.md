@@ -43,8 +43,8 @@ control parallelism, or run training in your own Rayon thread pool.
 
 `train` takes a [`Dataset`](https://docs.rs/superkmeans-rs/latest/superkmeans/trait.Dataset.html).
 A [`Matrix`](https://docs.rs/superkmeans-rs/latest/superkmeans/struct.Matrix.html) or
-[`Vectors`](https://docs.rs/superkmeans-rs/latest/superkmeans/struct.Vectors.html) is clustered
-in memory. Any other dataset, including an `IterDataset` of batches, is scanned once per pass.
+[`Vectors`](https://docs.rs/superkmeans-rs/latest/superkmeans/struct.Vectors.html) trains in memory.
+Any other dataset is scanned once per pass.
 [`HierarchicalSuperKMeans`](https://docs.rs/superkmeans-rs/latest/superkmeans/struct.HierarchicalSuperKMeans.html)
 splits clusters until they fit within the target leaf size and also supports streaming the
 initial partition. See the API docs and [examples](examples) for these workflows.
