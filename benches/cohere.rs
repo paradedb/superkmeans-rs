@@ -109,13 +109,14 @@ fn bench_assign(c: &mut Criterion) {
         let mut kmeans = SuperKMeans::new(K, D);
         kmeans.train(&mut Matrix::new(data, N, D)).unwrap()
     };
-    let hier_centroids = {
+    let (hier_centroids, hier_k) = {
         let cfg = HierarchicalSuperKMeansConfig {
             target_leaf_size: HIER_TARGET_LEAF_SIZE,
             ..Default::default()
         };
         let mut kmeans = HierarchicalSuperKMeans::with_config(D, cfg);
-        kmeans.train(&mut Matrix::new(data, N, D))
+        let centroids = kmeans.train(&mut Matrix::new(data, N, D));
+        (centroids, kmeans.base.n_clusters)
     };
 
     let mut group = c.benchmark_group("assign");
@@ -129,7 +130,7 @@ fn bench_assign(c: &mut Criterion) {
                 let kmeans = SuperKMeans::new(K, D);
                 let assignments = kmeans.assign(
                     Matrix::new(black_box(data), N, D),
-                    Matrix::from_slice(black_box(&flat_centroids), D),
+                    Matrix::new(black_box(&flat_centroids), K, D),
                 );
                 black_box(assignments);
             });
@@ -146,7 +147,7 @@ fn bench_assign(c: &mut Criterion) {
                 let kmeans = HierarchicalSuperKMeans::new(D);
                 let assignments = kmeans.assign(
                     Matrix::new(black_box(data), N, D),
-                    Matrix::from_slice(black_box(&hier_centroids), D),
+                    Matrix::new(black_box(&hier_centroids), hier_k, D),
                 );
                 black_box(assignments);
             });

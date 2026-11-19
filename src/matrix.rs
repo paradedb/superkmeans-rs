@@ -48,26 +48,6 @@ impl<'a> Matrix<'a> {
         Self { data, n, d }
     }
 
-    /// View `data` as `n = data.len() / d` row-major vectors of length `d`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `d == 0` or `data.len()` is not a multiple of `d`.
-    pub fn from_slice(data: &'a [f32], d: usize) -> Self {
-        assert!(d > 0, "dimensionality must be positive");
-        assert_eq!(
-            data.len() % d,
-            0,
-            "data length {} is not a multiple of d ({d})",
-            data.len()
-        );
-        Self {
-            data,
-            n: data.len() / d,
-            d,
-        }
-    }
-
     /// A single vector (`n = 1`), with `d = data.len()`.
     ///
     /// # Panics
@@ -220,7 +200,7 @@ impl Vectors {
     }
 
     pub fn as_matrix(&self) -> Matrix<'_> {
-        Matrix::from_slice(&self.data, self.d)
+        Matrix::new(&self.data, self.n(), self.d)
     }
 }
 
@@ -229,11 +209,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new_and_from_slice_agree() {
+    fn rows_follow_n_and_d() {
         let data = [1.0, 2.0, 3.0, 4.0];
         let a = Matrix::new(&data, 2, 2);
-        let b = Matrix::from_slice(&data, 2);
-        assert_eq!(a, b);
         assert_eq!(a.row(0), &[1.0, 2.0]);
         assert_eq!(a.row(1), &[3.0, 4.0]);
     }

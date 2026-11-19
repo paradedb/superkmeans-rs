@@ -54,7 +54,10 @@ fn each_point_assigned_to_nearest_centroid() {
     };
     let mut kmeans = SuperKMeans::with_config(n_clusters, d, cfg);
     let centroids = kmeans.train(&mut Matrix::new(&data, n, d)).unwrap();
-    let assignments = kmeans.assign(Matrix::new(&data, n, d), Matrix::from_slice(&centroids, d));
+    let assignments = kmeans.assign(
+        Matrix::new(&data, n, d),
+        Matrix::new(&centroids, n_clusters, d),
+    );
     assert_eq!(assignments.len(), n);
     assert_eq!(centroids.len(), n_clusters * d);
 
@@ -95,7 +98,10 @@ fn each_point_assigned_to_nearest_centroid_high_dim() {
     };
     let mut kmeans = SuperKMeans::with_config(n_clusters, d, cfg);
     let centroids = kmeans.train(&mut Matrix::new(&data, n, d)).unwrap();
-    let assignments = kmeans.assign(Matrix::new(&data, n, d), Matrix::from_slice(&centroids, d));
+    let assignments = kmeans.assign(
+        Matrix::new(&data, n, d),
+        Matrix::new(&centroids, n_clusters, d),
+    );
     assert_eq!(assignments.len(), n);
 
     let mut incorrect = 0;
@@ -135,9 +141,14 @@ fn use_train_state_matches_brute_force() {
     let mut kmeans = SuperKMeans::with_config(n_clusters, d, cfg);
     let centroids = kmeans.train(&mut Matrix::new(&data, n, d)).unwrap();
 
-    let fast =
-        kmeans.assign_training_points(Matrix::new(&data, n, d), Matrix::from_slice(&centroids, d));
-    let brute = kmeans.assign(Matrix::new(&data, n, d), Matrix::from_slice(&centroids, d));
+    let fast = kmeans.assign_training_points(
+        Matrix::new(&data, n, d),
+        Matrix::new(&centroids, n_clusters, d),
+    );
+    let brute = kmeans.assign(
+        Matrix::new(&data, n, d),
+        Matrix::new(&centroids, n_clusters, d),
+    );
     assert_eq!(fast.len(), n);
     assert_eq!(brute.len(), n);
 
@@ -173,11 +184,11 @@ fn use_train_state_matches_brute_force_on_a_caller_side_sample() {
 
     let fast = kmeans.assign_training_points(
         Matrix::new(sample, sampled, d),
-        Matrix::from_slice(&centroids, d),
+        Matrix::new(&centroids, n_clusters, d),
     );
     let brute = kmeans.assign(
         Matrix::new(sample, sampled, d),
-        Matrix::from_slice(&centroids, d),
+        Matrix::new(&centroids, n_clusters, d),
     );
     assert_eq!(fast.len(), sampled);
     assert_eq!(brute.len(), sampled);
@@ -208,9 +219,14 @@ fn use_train_state_matches_brute_force_full() {
     let mut kmeans = SuperKMeans::with_config(n_clusters, d, cfg);
     let centroids = kmeans.train(&mut Matrix::new(&data, n, d)).unwrap();
 
-    let fast =
-        kmeans.assign_training_points(Matrix::new(&data, n, d), Matrix::from_slice(&centroids, d));
-    let brute = kmeans.assign(Matrix::new(&data, n, d), Matrix::from_slice(&centroids, d));
+    let fast = kmeans.assign_training_points(
+        Matrix::new(&data, n, d),
+        Matrix::new(&centroids, n_clusters, d),
+    );
+    let brute = kmeans.assign(
+        Matrix::new(&data, n, d),
+        Matrix::new(&centroids, n_clusters, d),
+    );
 
     let matches = fast.iter().zip(&brute).filter(|(a, b)| a == b).count();
     let pct = 100.0 * matches as f64 / n as f64;
@@ -236,7 +252,10 @@ fn all_clusters_non_empty() {
     };
     let mut kmeans = SuperKMeans::with_config(n_clusters, d, cfg);
     let centroids = kmeans.train(&mut Matrix::new(&data, n, d)).unwrap();
-    let assignments = kmeans.assign(Matrix::new(&data, n, d), Matrix::from_slice(&centroids, d));
+    let assignments = kmeans.assign(
+        Matrix::new(&data, n, d),
+        Matrix::new(&centroids, n_clusters, d),
+    );
     assert_eq!(assignments.len(), n);
 
     let mut counts = vec![0_usize; n_clusters];
@@ -269,8 +288,8 @@ fn standalone_assignment_matches_brute_force() {
         data[..d].copy_from_slice(&centroids[..d]);
         for n in [0, 1, 1031] {
             let assigned = assign(
-                Matrix::from_slice(&data[..n * d], d),
-                Matrix::from_slice(&centroids, d),
+                Matrix::new(&data[..n * d], n, d),
+                Matrix::new(&centroids, 20, d),
             );
             assert_eq!(assigned.len(), n, "d={d}, n={n}");
             let mut incorrect = 0;
@@ -300,8 +319,8 @@ fn standalone_assignment_matches_brute_force() {
 #[test]
 #[should_panic(expected = "vectors and centroids must share d")]
 fn assign_rejects_mismatched_dimensionality() {
-    let vectors = Matrix::from_slice(&[0.0, 0.0], 2);
-    let centroids = Matrix::from_slice(&[0.0], 1);
+    let vectors = Matrix::new(&[0.0, 0.0], 1, 2);
+    let centroids = Matrix::new(&[0.0], 1, 1);
     let _ = assign(vectors, centroids);
 }
 
@@ -489,13 +508,13 @@ fn soar_secondaries_minimize_the_objective() {
     for lambda in [0.0_f32, 2.0] {
         let (primary, secondary) = kmeans.assign_soar(
             Matrix::new(&data, n, d),
-            Matrix::from_slice(&centroids, d),
+            Matrix::new(&centroids, k, d),
             lambda,
         );
         assert_soar_optimal(&data, &centroids, n, k, d, lambda, &primary, &secondary);
         let (free_primary, free_secondary) = assign_soar(
             Matrix::new(&data, n, d),
-            Matrix::from_slice(&centroids, d),
+            Matrix::new(&centroids, k, d),
             lambda,
         );
         assert_eq!(free_primary, primary);
@@ -508,11 +527,8 @@ fn soar_with_lambda_zero_picks_the_second_nearest() {
     let (n, d, k) = (2_000, 16, 150);
     let data = generate_random_vectors(n, d, -1.0, 1.0, 21);
     let centroids = generate_random_vectors(k, d, -1.0, 1.0, 23);
-    let (primary, secondary) = assign_soar(
-        Matrix::new(&data, n, d),
-        Matrix::from_slice(&centroids, d),
-        0.0,
-    );
+    let (primary, secondary) =
+        assign_soar(Matrix::new(&data, n, d), Matrix::new(&centroids, k, d), 0.0);
     for i in 0..n {
         let point = &data[i * d..(i + 1) * d];
         let mut distances: Vec<(f32, u32)> = (0..k)
@@ -540,11 +556,8 @@ fn soar_with_one_centroid_has_no_secondary() {
     let (n, d) = (500, 12);
     let data = generate_random_vectors(n, d, -1.0, 1.0, 31);
     let centroid = generate_random_vectors(1, d, -1.0, 1.0, 37);
-    let (primary, secondary) = assign_soar(
-        Matrix::new(&data, n, d),
-        Matrix::from_slice(&centroid, d),
-        2.0,
-    );
+    let (primary, secondary) =
+        assign_soar(Matrix::new(&data, n, d), Matrix::new(&centroid, 1, d), 2.0);
     assert!(primary.iter().all(|&c| c == 0));
     assert!(secondary.iter().all(|&c| c == u32::MAX));
 }
@@ -632,8 +645,8 @@ fn soar_ties_across_centroid_tiles_keep_the_first_centroid() {
     let data = vec![1.0; 257 * 4];
     for candidates in [None, Some(1), Some(64), Some(k)] {
         let (primary, secondary) = soar_with(
-            Matrix::from_slice(&data, 4),
-            Matrix::from_slice(&centroids, 4),
+            Matrix::new(&data, 257, 4),
+            Matrix::new(&centroids, k, 4),
             2.0,
             2,
             candidates,
@@ -695,8 +708,8 @@ fn soar_replica_counts_handle_missing_centroids_and_zero_residuals() {
             // The shortlist fills at most `candidates` slots; the rest stay empty.
             for candidates in [None, Some(0), Some(1), Some(2)] {
                 let (primary, secondary) = soar_with(
-                    Matrix::from_slice(&data, 4),
-                    Matrix::from_slice(&centroids, 4),
+                    Matrix::new(&data, 7, 4),
+                    Matrix::new(&centroids, k, 4),
                     2.0,
                     replicas,
                     candidates,

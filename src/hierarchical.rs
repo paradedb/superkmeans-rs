@@ -161,7 +161,7 @@ struct Child {
 /// config.target_leaf_size = 64;
 ///
 /// let mut kmeans = HierarchicalSuperKMeans::with_config(d, config);
-/// let centroids = kmeans.train(&mut superkmeans::Matrix::from_slice(&data, d));
+/// let centroids = kmeans.train(&mut superkmeans::Matrix::new(&data, n, d));
 /// assert_eq!(centroids.len(), kmeans.base.n_clusters * d);
 /// ```
 pub struct HierarchicalSuperKMeans {
@@ -1310,8 +1310,10 @@ mod tests {
 
         let mut kmeans = HierarchicalSuperKMeans::with_config(d, config(25));
         let centroids = kmeans.train(&mut Matrix::new(&data, n, d));
-        let assignments =
-            kmeans.assign(Matrix::new(&data, n, d), Matrix::from_slice(&centroids, d));
+        let assignments = kmeans.assign(
+            Matrix::new(&data, n, d),
+            Matrix::new(&centroids, kmeans.base.n_clusters, d),
+        );
 
         let mut total = 0.0f64;
         for (i, &cluster) in assignments.iter().enumerate() {
@@ -1366,8 +1368,10 @@ mod tests {
         let mut kmeans = HierarchicalSuperKMeans::with_config(d, config(32));
         let centroids = kmeans.train(&mut Matrix::new(&data, n, d));
 
-        let assignments =
-            kmeans.assign(Matrix::new(&data, n, d), Matrix::from_slice(&centroids, d));
+        let assignments = kmeans.assign(
+            Matrix::new(&data, n, d),
+            Matrix::new(&centroids, kmeans.base.n_clusters, d),
+        );
         assert_eq!(assignments.len(), n);
         assert!(
             assignments

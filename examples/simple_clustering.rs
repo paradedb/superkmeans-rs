@@ -51,7 +51,7 @@ fn main() -> ExitCode {
 
     timer.reset();
     timer.tic();
-    let assignments = kmeans.assign(Matrix::new(&data, n, d), Matrix::from_slice(&centroids, d));
+    let assignments = kmeans.assign(Matrix::new(&data, n, d), Matrix::new(&centroids, k, d));
     timer.toc();
     let assignment_time_ms = timer.milliseconds();
     println!("Assignment time: {} ms", assignment_time_ms);

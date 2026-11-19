@@ -126,7 +126,7 @@ fn main() {
 
     // Assign the full base set, which is what actually fills the posting lists.
     timer.tic();
-    let assignments = kmeans.assign(Matrix::new(base, n, d), Matrix::from_slice(&centroids, d));
+    let assignments = kmeans.assign(Matrix::new(base, n, d), Matrix::new(&centroids, n_lists, d));
     timer.toc();
     println!(
         "assigned {n} vectors in {:.2}s",

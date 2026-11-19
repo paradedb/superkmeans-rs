@@ -34,7 +34,7 @@ fn leaf_config(target_leaf_size: usize) -> HierarchicalSuperKMeansConfig {
 fn nearest_distortion(kmeans: &SuperKMeans, data: &[f32], n: usize, centroids: &[f32]) -> f64 {
     let assignments = kmeans.assign(
         Matrix::new(data, n, kmeans.d),
-        Matrix::from_slice(centroids, kmeans.d),
+        Matrix::new(centroids, kmeans.n_clusters, kmeans.d),
     );
     distortion(data, kmeans.d, centroids, &assignments)
 }
@@ -176,8 +176,10 @@ fn hierarchical_trains_from_an_iterator() {
 
     let mut in_memory = HierarchicalSuperKMeans::with_config(d, cfg);
     let reference = in_memory.train(&mut Matrix::new(&data, n, d));
-    let reference_assignments =
-        in_memory.assign(Matrix::new(&data, n, d), Matrix::from_slice(&reference, d));
+    let reference_assignments = in_memory.assign(
+        Matrix::new(&data, n, d),
+        Matrix::new(&reference, in_memory.base.n_clusters, d),
+    );
 
     let streamed_distortion = distortion(&data, d, &centroids, &assignments);
     let reference_distortion = distortion(&data, d, &reference, &reference_assignments);

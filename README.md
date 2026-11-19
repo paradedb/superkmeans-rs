@@ -32,13 +32,8 @@ let (n, d, k) = (10_000, 128, 100);
 let data = make_blobs(n, d, k, true, 1.0, 10.0, 42);
 
 let mut kmeans = SuperKMeans::new(k, d);
-let centroids = kmeans
-    .train(&mut Matrix::from_slice(&data, d))
-    .unwrap();
-let assignments = kmeans.assign(
-    Matrix::from_slice(&data, d),
-    Matrix::from_slice(&centroids, d),
-);
+let centroids = kmeans.train(&mut Matrix::new(&data, n, d)).unwrap();
+let assignments = kmeans.assign(Matrix::new(&data, n, d), Matrix::new(&centroids, k, d));
 assert_eq!(assignments.len(), n);
 ```
 

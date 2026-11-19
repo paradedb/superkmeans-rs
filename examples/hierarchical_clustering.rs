@@ -61,7 +61,10 @@ fn main() -> ExitCode {
     println!("Index built in: {} ms", timer.milliseconds());
     println!("Clusters: {}", kmeans.base.n_clusters);
 
-    let assignments = kmeans.assign(Matrix::new(&data, n, d), Matrix::from_slice(&centroids, d));
+    let assignments = kmeans.assign(
+        Matrix::new(&data, n, d),
+        Matrix::new(&centroids, kmeans.base.n_clusters, d),
+    );
     println!("Got {} assignments", assignments.len());
 
     let stats = SuperKMeans::cluster_balance_stats(&assignments, n, kmeans.base.n_clusters);

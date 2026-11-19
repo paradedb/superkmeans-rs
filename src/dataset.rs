@@ -189,7 +189,7 @@ mod tests {
         assert_eq!(seen[3].1, vec![18.0, 19.0]);
 
         // A single large matrix is split without changing values.
-        let mut whole = Matrix::from_slice(&data, d);
+        let mut whole = Matrix::new(&data, 10, d);
         let mut sizes = Vec::new();
         visit_work_batches(&mut whole, d, 4, &mut buf, |m| {
             sizes.push(m.n());
@@ -205,9 +205,8 @@ mod tests {
         let data: Vec<f32> = (0..14).map(|i| i as f32).collect();
         let d = 2;
         let (first, second) = data.split_at(5 * d);
-        let mut dataset = IterDataset::new(
-            [Matrix::from_slice(first, d), Matrix::from_slice(second, d)].into_iter(),
-        );
+        let mut dataset =
+            IterDataset::new([Matrix::new(first, 5, d), Matrix::new(second, 2, d)].into_iter());
 
         let mut buf = Vec::new();
         let mut seen = Vec::new();

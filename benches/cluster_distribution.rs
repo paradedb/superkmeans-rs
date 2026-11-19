@@ -225,7 +225,7 @@ fn bench_full_sample_baseline(base: &[f32], n: usize, full_leaf_size: usize) {
         let train_summary = summarize(&skm.cluster_sizes);
         let assignments = skm.assign(
             Matrix::new(&base[..n * COHERE_D], n, COHERE_D),
-            Matrix::from_slice(&centroids, COHERE_D),
+            Matrix::new(&centroids, target_k, COHERE_D),
         );
         let assign_summary = summarize_assignments(&assignments, target_k);
 
@@ -271,7 +271,7 @@ fn bench_full_sample_baseline(base: &[f32], n: usize, full_leaf_size: usize) {
         let tree_summary = summarize(&hskm.base.cluster_sizes);
         let assignments = hskm.assign(
             Matrix::new(&base[..n * COHERE_D], n, COHERE_D),
-            Matrix::from_slice(&centroids, COHERE_D),
+            Matrix::new(&centroids, actual_k, COHERE_D),
         );
         let assign_summary = summarize_assignments(&assignments, actual_k);
 
@@ -352,7 +352,7 @@ fn bench_sample_sweep(base: &[f32], n: usize, full_leaf_size: usize) {
         let train_summary = summarize(&hskm.base.cluster_sizes);
         let assignments = hskm.assign(
             Matrix::new(&base[..n * COHERE_D], n, COHERE_D),
-            Matrix::from_slice(&centroids, COHERE_D),
+            Matrix::new(&centroids, actual_k, COHERE_D),
         );
         let assign_summary = summarize_assignments(&assignments, actual_k);
 
@@ -496,7 +496,7 @@ fn bench_iterations_sweep(base: &[f32], n: usize, full_leaf_size: usize) {
         let train_summary = summarize(&hskm.base.cluster_sizes);
         let assignments = hskm.assign(
             Matrix::new(&base[..n * COHERE_D], n, COHERE_D),
-            Matrix::from_slice(&centroids, COHERE_D),
+            Matrix::new(&centroids, actual_k, COHERE_D),
         );
         let assign_summary = summarize_assignments(&assignments, actual_k);
         let mse = mean_squared_error(&base[..n * COHERE_D], n, COHERE_D, &centroids, &assignments);
@@ -551,7 +551,7 @@ fn bench_iterations_sweep(base: &[f32], n: usize, full_leaf_size: usize) {
         let train_summary = summarize(&skm.cluster_sizes);
         let assignments = skm.assign(
             Matrix::new(&base[..n * COHERE_D], n, COHERE_D),
-            Matrix::from_slice(&centroids, COHERE_D),
+            Matrix::new(&centroids, target_k, COHERE_D),
         );
         let assign_summary = summarize_assignments(&assignments, target_k);
         let train_mse = skm.iteration_stats.last().map_or(0.0, |s| s.mse);

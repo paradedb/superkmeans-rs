@@ -53,7 +53,10 @@ fn all_clusters_used() {
     let mut kmeans = SuperKMeans::with_config(n_clusters, d, cfg);
     let centroids = kmeans.train(&mut Matrix::new(&data, n, d)).unwrap();
 
-    let assignments = kmeans.assign(Matrix::new(&data, n, d), Matrix::from_slice(&centroids, d));
+    let assignments = kmeans.assign(
+        Matrix::new(&data, n, d),
+        Matrix::new(&centroids, n_clusters, d),
+    );
     let used: HashSet<u32> = assignments.iter().copied().collect();
     assert_eq!(
         used.len(),
@@ -77,7 +80,10 @@ fn perform_assignments_populates_assignments() {
     };
     let mut kmeans = SuperKMeans::with_config(n_clusters, d, cfg);
     let centroids = kmeans.train(&mut Matrix::new(&data, n, d)).unwrap();
-    let assignments = kmeans.assign(Matrix::new(&data, n, d), Matrix::from_slice(&centroids, d));
+    let assignments = kmeans.assign(
+        Matrix::new(&data, n, d),
+        Matrix::new(&centroids, n_clusters, d),
+    );
 
     assert_eq!(assignments.len(), n);
     for (i, &a) in assignments.iter().enumerate() {
