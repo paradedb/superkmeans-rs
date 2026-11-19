@@ -1,4 +1,4 @@
-//! Cluster distribution benchmark on the Cohere Embed-V3 1M dataset.
+//! Cluster distribution benchmark on the Cohere Embed-V3 10M dataset.
 //!
 //! 1. **Full-Dataset Baseline (`sample = 100%`, zero sampling noise):**
 //!    Single baseline run at `1.0` sampling ratio (`n_sample = n`,
@@ -26,16 +26,16 @@ use superkmeans::{
     SuperKMeansConfig, TicToc,
 };
 
-const COHERE_N: usize = 1_000_000;
+const COHERE_N: usize = 10_000_000;
 const COHERE_D: usize = 1024;
 const DEFAULT_FULL_LEAF_SIZE: usize = 200;
 
 fn load_cohere(rows: usize) -> Vec<f32> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/data_cohere_1m.bin");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/data_cohere.bin");
     let expected_bytes = COHERE_N * COHERE_D * size_of::<f32>();
     let meta = std::fs::metadata(&path).unwrap_or_else(|e| {
         panic!(
-            "missing Cohere 1M dataset at {} ({e}). Run: uv run --script scripts/download_cohere.py",
+            "missing Cohere 10M dataset at {} ({e}). Run: uv run --script scripts/setup_data.py",
             path.display()
         );
     });
@@ -571,7 +571,7 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_FULL_LEAF_SIZE);
 
-    println!("Loading Cohere 1M dataset (first {n} rows, d={COHERE_D})...");
+    println!("Loading Cohere 10M dataset (first {n} rows, d={COHERE_D})...");
     let base = load_cohere(n);
 
     match mode {

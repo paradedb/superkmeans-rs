@@ -18,14 +18,14 @@ use superkmeans::{
     HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, SuperKMeans, TicToc, make_blobs,
 };
 
-const COHERE_N: usize = 1_000_000;
+const COHERE_N: usize = 10_000_000;
 const COHERE_D: usize = 1024;
 const TOP_K: usize = 10;
 const TARGET_LEAF_SIZE: usize = 100;
 
 /// Read the first `rows` vectors of the Cohere dump, or `None` if it is absent.
 fn load_cohere(rows: usize) -> Option<(Vec<f32>, usize)> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/data_cohere_1m.bin");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/data_cohere.bin");
     let meta = std::fs::metadata(&path).ok()?;
     if meta.len() as usize != COHERE_N * COHERE_D * size_of::<f32>() {
         return None;
@@ -74,7 +74,7 @@ fn main() {
 
     let (all, d) = match load_cohere(n + n_queries) {
         Some(v) => {
-            println!("dataset: Cohere 1M (first {} rows)", n + n_queries);
+            println!("dataset: Cohere 10M (first {} rows)", n + n_queries);
             v
         }
         None => {

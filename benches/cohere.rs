@@ -1,8 +1,7 @@
 //! Criterion benches for SuperKMeans / HierarchicalSuperKMeans on Cohere Embed-V3.
 //!
-//! Dataset: first 1M vectors of `Cohere/msmarco-v2.1-embed-english-v3` (d=1024),
-//! matching the C++ cohere bench source at a RAM-friendly scale.
-//! Download with: `uv run --script scripts/download_cohere.py`
+//! Dataset: first 10M vectors of `Cohere/msmarco-v2.1-embed-english-v3` (d=1024).
+//! Download with: `uv run --script scripts/setup_data.py`
 //!
 //! Run:
 //!   cargo bench --bench cohere -- train
@@ -18,24 +17,24 @@ use std::sync::OnceLock;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, SuperKMeans};
 
-const N: usize = 1_000_000;
+const N: usize = 10_000_000;
 const D: usize = 1024;
 const K: usize = 10_000;
 /// Request at least K leaves for the hierarchical bench (`N / target_leaf_size`).
 const HIER_TARGET_LEAF_SIZE: usize = N / K;
 
 fn data_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/data_cohere_1m.bin")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/data_cohere.bin")
 }
 
-fn load_cohere_1m() -> &'static [f32] {
+fn load_cohere() -> &'static [f32] {
     static DATA: OnceLock<Vec<f32>> = OnceLock::new();
     DATA.get_or_init(|| {
         let path = data_path();
         let expected_bytes = N * D * size_of::<f32>();
         let meta = std::fs::metadata(&path).unwrap_or_else(|e| {
             panic!(
-                "missing Cohere 1M dataset at {} ({e}). Run: uv run --script scripts/download_cohere.py",
+                "missing Cohere 10M dataset at {} ({e}). Run: uv run --script scripts/setup_data.py",
                 path.display()
             );
         });
@@ -50,7 +49,7 @@ fn load_cohere_1m() -> &'static [f32] {
 
         let mut file = File::open(&path).expect("open cohere dataset");
         let mut floats = vec![0.0f32; N * D];
-        // Raw little-endian f32 binary (same layout as SuperKMeans setup_data.py).
+        // Raw little-endian f32 binary (same layout as scripts/setup_data.py).
         let bytes = unsafe {
             std::slice::from_raw_parts_mut(floats.as_mut_ptr().cast::<u8>(), expected_bytes)
         };
@@ -61,7 +60,7 @@ fn load_cohere_1m() -> &'static [f32] {
 }
 
 fn bench_train(c: &mut Criterion) {
-    let data = load_cohere_1m();
+    let data = load_cohere();
 
     let mut group = c.benchmark_group("train");
     // Criterion's minimum sample size is 10.
@@ -101,7 +100,7 @@ fn bench_train(c: &mut Criterion) {
 }
 
 fn bench_assign(c: &mut Criterion) {
-    let data = load_cohere_1m();
+    let data = load_cohere();
 
     // Train once outside the timed loop; assign is what we measure.
     let flat_centroids = {
