@@ -8,9 +8,8 @@ use std::sync::OnceLock;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, Normal};
-use rayon::prelude::*;
 
-use crate::common::{KnnCandidate, MINI_BATCH_SIZE};
+use crate::common::KnnCandidate;
 use crate::gemm;
 
 pub struct ADSamplingPruner {
@@ -65,27 +64,23 @@ impl ADSamplingPruner {
         let d = self.num_dimensions;
         debug_assert!(vectors.len() >= n * d);
         debug_assert!(out.len() >= n * d);
+        if n == 0 || d == 0 {
+            return;
+        }
         let matrix = self.matrix();
-        out[..n * d]
-            .par_chunks_mut(MINI_BATCH_SIZE * d)
-            .enumerate()
-            .for_each(|(mb, out_chunk)| {
-                let r = mb * MINI_BATCH_SIZE;
-                let rows = out_chunk.len() / d;
-                gemm::sgemm_ld(
-                    false,
-                    true,
-                    rows,
-                    d,
-                    d,
-                    &vectors[r * d..(r + rows) * d],
-                    d,
-                    matrix,
-                    d,
-                    out_chunk,
-                    d,
-                );
-            });
+        gemm::sgemm_ld(
+            false,
+            true,
+            n,
+            d,
+            d,
+            &vectors[..n * d],
+            d,
+            matrix,
+            d,
+            &mut out[..n * d],
+            d,
+        );
     }
 
     /// In-place `rotate`: rewrites `data` block-by-block through a bounded
@@ -97,32 +92,27 @@ impl ADSamplingPruner {
     fn rotate_in_place_blocked(&self, data: &mut [f32], n: usize, scratch_bytes: usize) {
         let d = self.num_dimensions;
         debug_assert!(data.len() >= n * d);
+        if n == 0 || d == 0 {
+            return;
+        }
         let matrix = self.matrix();
         let block_rows = (scratch_bytes / (d * 4)).clamp(1, n.max(1));
-        let mini_rows = MINI_BATCH_SIZE.min(block_rows).max(1);
         let mut scratch = vec![0.0_f32; block_rows * d];
         for chunk in data[..n * d].chunks_mut(block_rows * d) {
             let rows = chunk.len() / d;
-            scratch[..rows * d]
-                .par_chunks_mut(mini_rows * d)
-                .enumerate()
-                .for_each(|(mb, scratch_sub)| {
-                    let r = mb * mini_rows;
-                    let sub_rows = scratch_sub.len() / d;
-                    gemm::sgemm_ld(
-                        false,
-                        true,
-                        sub_rows,
-                        d,
-                        d,
-                        &chunk[r * d..(r + sub_rows) * d],
-                        d,
-                        matrix,
-                        d,
-                        scratch_sub,
-                        d,
-                    );
-                });
+            gemm::sgemm_ld(
+                false,
+                true,
+                rows,
+                d,
+                d,
+                chunk,
+                d,
+                matrix,
+                d,
+                &mut scratch[..rows * d],
+                d,
+            );
             chunk.copy_from_slice(&scratch[..rows * d]);
         }
     }
@@ -132,22 +122,11 @@ impl ADSamplingPruner {
         let d = self.num_dimensions;
         debug_assert!(rotated.len() >= n * d);
         debug_assert!(out.len() >= n * d);
+        if n == 0 || d == 0 {
+            return;
+        }
         let matrix = self.matrix();
-        out[..n * d]
-            .par_chunks_mut(MINI_BATCH_SIZE * d)
-            .enumerate()
-            .for_each(|(mb, out_chunk)| {
-                let r = mb * MINI_BATCH_SIZE;
-                let rows = out_chunk.len() / d;
-                gemm::sgemm_row_major(
-                    rows,
-                    d,
-                    d,
-                    &rotated[r * d..(r + rows) * d],
-                    matrix,
-                    out_chunk,
-                );
-            });
+        gemm::sgemm_row_major(n, d, d, &rotated[..n * d], matrix, &mut out[..n * d]);
     }
 }
 

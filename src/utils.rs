@@ -67,7 +67,7 @@ pub fn make_blobs(
     let point_dist = Normal::new(0.0_f32, cluster_std).unwrap();
     let cluster_dist = Uniform::new(0_usize, n_centers);
 
-    data.par_chunks_mut(n_features)
+    data.chunks_mut(n_features)
         .enumerate()
         .for_each(|(i, row)| {
             let mut local_rng = ChaCha8Rng::seed_from_u64(random_state.wrapping_add(i as u64 + 1));
@@ -79,7 +79,7 @@ pub fn make_blobs(
         });
 
     if normalize {
-        data.par_chunks_mut(n_features).for_each(|row| {
+        data.chunks_mut(n_features).for_each(|row| {
             let mut norm_sq = 0.0_f32;
             for &v in row.iter() {
                 norm_sq += v * v;
@@ -151,11 +151,7 @@ pub fn squared_norms_partial(
     d: usize,
     partial_d: usize,
 ) -> Vec<f32> {
-    if n_vectors * partial_d.min(d) < NORM_PARALLEL_MIN_ELEMENTS {
-        squared_norms_partial_sequential(vectors, n_vectors, d, partial_d)
-    } else {
-        squared_norms_partial_parallel(vectors, n_vectors, d, partial_d)
-    }
+    squared_norms_partial_sequential(vectors, n_vectors, d, partial_d)
 }
 
 /// Single-threaded [`squared_norms_partial`].
@@ -246,6 +242,7 @@ fn squared_norm(v: &[f32]) -> f32 {
 ///
 /// Calibrated for those non-worker calls. Crossing into the pool once at the top
 /// of training instead would move the crossover down.
+#[allow(dead_code)]
 const REDUCTION_PARALLEL_MIN_ELEMENTS: usize = 64 * 1024;
 
 /// The same crossover for the per-vector squared norm, at twice the bar the other
@@ -261,6 +258,7 @@ const REDUCTION_PARALLEL_MIN_ELEMENTS: usize = 64 * 1024;
 /// Measured against the elements *summed*, `n_vectors * partial_d`, not the
 /// footprint walked: prefix norms stride over a matrix several times that size
 /// and still track the summed count.
+#[allow(dead_code)]
 const NORM_PARALLEL_MIN_ELEMENTS: usize = 128 * 1024;
 
 /// The same crossover for kernels that only *scale* each element, which sits 16x
@@ -271,6 +269,7 @@ const NORM_PARALLEL_MIN_ELEMENTS: usize = 128 * 1024;
 /// bound, so spreading it over rayon returns ~1.5x rather than the ~5x a reduction
 /// gets. Recovering 13 µs out of a 1.5x saving takes ~800K elements, which is
 /// where the measured crossover sits.
+#[allow(dead_code)]
 const SCALE_PARALLEL_MIN_ELEMENTS: usize = 1024 * 1024;
 
 /// Input size below which a sequential pass wins for the per-cluster scatter,
@@ -281,6 +280,7 @@ const SCALE_PARALLEL_MIN_ELEMENTS: usize = 1024 * 1024;
 /// and 512K elements read: at 192K the parallel form still loses (0.6-0.7x), at
 /// 384K it is within noise (1.0-1.2x), and by 768K it is clearly ahead
 /// (1.4-1.7x).
+#[allow(dead_code)]
 const SCATTER_PARALLEL_MIN_INPUT_ELEMENTS: usize = 512 * 1024;
 
 /// Output size below which a sequential pass wins for the per-cluster scatter,
@@ -291,6 +291,7 @@ const SCATTER_PARALLEL_MIN_INPUT_ELEMENTS: usize = 512 * 1024;
 /// elements the parallel form never gets ahead (0.9-1.2x) even over 8M elements
 /// of input, while at 16K and up it holds 1.1-2.0x. Both ends reproduce at
 /// d=128 and d=768, so the product is what matters, not either factor.
+#[allow(dead_code)]
 const SCATTER_PARALLEL_MIN_OUTPUT_ELEMENTS: usize = 16 * 1024;
 
 /// Total squared distance the centroids moved this iteration, summed over the
@@ -308,11 +309,7 @@ pub fn centroid_shift(
     n_clusters: usize,
     d: usize,
 ) -> f32 {
-    if n_clusters * d < REDUCTION_PARALLEL_MIN_ELEMENTS {
-        centroid_shift_sequential(new_centroids, prev_centroids, n_clusters, d)
-    } else {
-        centroid_shift_parallel(new_centroids, prev_centroids, n_clusters, d)
-    }
+    centroid_shift_sequential(new_centroids, prev_centroids, n_clusters, d)
 }
 
 /// Single-threaded [`centroid_shift`].
@@ -368,13 +365,7 @@ pub fn sum_rows_by_assignment(
     cluster_sizes: &mut [u32],
     d: usize,
 ) {
-    let enough_input = assignments.len() * d >= SCATTER_PARALLEL_MIN_INPUT_ELEMENTS;
-    let enough_output = cluster_sizes.len() * d >= SCATTER_PARALLEL_MIN_OUTPUT_ELEMENTS;
-    if enough_input && enough_output {
-        sum_rows_by_assignment_parallel(vectors, assignments, centroids, cluster_sizes, d);
-    } else {
-        sum_rows_by_assignment_sequential(vectors, assignments, centroids, cluster_sizes, d);
-    }
+    sum_rows_by_assignment_sequential(vectors, assignments, centroids, cluster_sizes, d);
 }
 
 /// Single-threaded [`sum_rows_by_assignment`]: one pass, scattering each vector
@@ -471,13 +462,7 @@ pub fn accumulate_rows_by_assignment(
     cluster_sizes: &mut [u32],
     d: usize,
 ) {
-    let enough_input = assignments.len() * d >= SCATTER_PARALLEL_MIN_INPUT_ELEMENTS;
-    let enough_output = cluster_sizes.len() * d >= SCATTER_PARALLEL_MIN_OUTPUT_ELEMENTS;
-    if enough_input && enough_output {
-        accumulate_rows_by_assignment_parallel(vectors, assignments, centroids, cluster_sizes, d);
-    } else {
-        accumulate_rows_by_assignment_sequential(vectors, assignments, centroids, cluster_sizes, d);
-    }
+    accumulate_rows_by_assignment_sequential(vectors, assignments, centroids, cluster_sizes, d);
 }
 
 /// Single-threaded [`accumulate_rows_by_assignment`].
@@ -566,11 +551,7 @@ fn accumulate_vector(centroid: &mut [f32], vector: &[f32]) {
 /// Dispatches on matrix size between [`mean_rows_by_count_sequential`] and
 /// [`mean_rows_by_count_parallel`].
 pub fn mean_rows_by_count(rows: &mut [f32], counts: &[u32], d: usize) {
-    if counts.len() * d < SCALE_PARALLEL_MIN_ELEMENTS {
-        mean_rows_by_count_sequential(rows, counts, d);
-    } else {
-        mean_rows_by_count_parallel(rows, counts, d);
-    }
+    mean_rows_by_count_sequential(rows, counts, d);
 }
 
 /// Single-threaded [`mean_rows_by_count`].
@@ -607,11 +588,7 @@ fn mean_row(row: &mut [f32], count: u32) {
 /// Dispatches on matrix size between [`normalize_rows_l2_sequential`] and
 /// [`normalize_rows_l2_parallel`].
 pub fn normalize_rows_l2(rows: &mut [f32], n_rows: usize, d: usize) {
-    if n_rows * d < REDUCTION_PARALLEL_MIN_ELEMENTS {
-        normalize_rows_l2_sequential(rows, n_rows, d);
-    } else {
-        normalize_rows_l2_parallel(rows, n_rows, d);
-    }
+    normalize_rows_l2_sequential(rows, n_rows, d);
 }
 
 /// Single-threaded [`normalize_rows_l2`].

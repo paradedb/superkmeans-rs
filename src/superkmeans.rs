@@ -383,7 +383,7 @@ impl SuperKMeans {
             config.unrotate_centroids = false;
         }
         let n_threads = if config.n_threads == 0 {
-            rayon::current_num_threads()
+            1
         } else {
             config.n_threads as usize
         };

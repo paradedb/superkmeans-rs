@@ -2,10 +2,8 @@
 
 use std::collections::BinaryHeap;
 
-use rayon::prelude::*;
-
 use crate::adsampling::ADSamplingPruner;
-use crate::common::{MINI_BATCH_SIZE, X_BATCH_SIZE, Y_BATCH_SIZE};
+use crate::common::{X_BATCH_SIZE, Y_BATCH_SIZE};
 use crate::distance::{dot, l2_squared};
 use crate::pdxearch::top1_partial_search;
 
@@ -21,36 +19,27 @@ fn blas_dot_products(
     out: &mut [f32], // batch_n_x rows of batch_n_y values, ldc apart
     ldc: usize,
 ) {
+    if batch_n_x == 0 || batch_n_y == 0 {
+        return;
+    }
     debug_assert!(x_batch.len() >= batch_n_x * d);
     debug_assert!(y_batch.len() >= batch_n_y * d);
     debug_assert!(ldc >= batch_n_y);
     debug_assert!(out.len() >= (batch_n_x - 1) * ldc + batch_n_y);
     // out = x[:, :effective_d] * y[:, :effective_d]^T ; both rows are d-wide.
-    let gemm = |rows: usize, x: &[f32], c: &mut [f32]| {
-        crate::gemm::sgemm_ld(
-            false,
-            true,
-            rows,
-            effective_d,
-            batch_n_y,
-            x,
-            d,
-            y_batch,
-            d,
-            c,
-            ldc,
-        );
-    };
-
-    // Dispatch mini-batches across Rayon threads and keep each `sgemm_ld` call
-    // single-threaded so BLAS and Rayon never run competing thread pools.
-    out.par_chunks_mut(MINI_BATCH_SIZE * ldc)
-        .enumerate()
-        .for_each(|(mb, chunk)| {
-            let r = mb * MINI_BATCH_SIZE;
-            let rows = MINI_BATCH_SIZE.min(batch_n_x - r);
-            gemm(rows, &x_batch[r * d..(r + rows) * d], chunk);
-        });
+    crate::gemm::sgemm_ld(
+        false,
+        true,
+        batch_n_x,
+        effective_d,
+        batch_n_y,
+        x_batch,
+        d,
+        y_batch,
+        d,
+        out,
+        ldc,
+    );
 }
 
 /// Maximum bytes per distance/product matrix in a SOAR x-tile.
@@ -160,7 +149,7 @@ pub fn find_soar_replica_assignments(
         let block_len = t * y_tile;
 
         dist[..t * n_y]
-            .par_chunks_mut(block_len)
+            .chunks_mut(block_len)
             .enumerate()
             .for_each(|(block, distances)| {
                 let j = block * y_tile;
@@ -181,7 +170,7 @@ pub fn find_soar_replica_assignments(
                     }
                 }
             });
-        primary.par_iter_mut().enumerate().for_each(|(r, idx)| {
+        primary.iter_mut().enumerate().for_each(|(r, idx)| {
             let mut best = f32::MAX;
             for (block, distances) in dist[..t * n_y].chunks(block_len).enumerate() {
                 let cols = distances.len() / t;
@@ -208,8 +197,8 @@ pub fn find_soar_replica_assignments(
 
         for replica in 0..secondaries.min(n_y - 1) {
             residuals[..t * d]
-                .par_chunks_mut(d)
-                .zip(along[..t].par_iter_mut())
+                .chunks_mut(d)
+                .zip(along[..t].iter_mut())
                 .enumerate()
                 .for_each(|(r, (residual, a))| {
                     let xr = &x_tile[r * d..(r + 1) * d];
@@ -238,8 +227,8 @@ pub fn find_soar_replica_assignments(
                 });
 
             prod[..t * n_y]
-                .par_chunks_mut(block_len)
-                .zip(dist[..t * n_y].par_chunks_mut(block_len))
+                .chunks_mut(block_len)
+                .zip(dist[..t * n_y].chunks_mut(block_len))
                 .enumerate()
                 .for_each(|(block, (costs, distances))| {
                     let j = block * y_tile;
@@ -275,7 +264,7 @@ pub fn find_soar_replica_assignments(
                     }
                 });
             secondary
-                .par_chunks_mut(secondaries)
+                .chunks_mut(secondaries)
                 .enumerate()
                 .for_each(|(r, assignments)| {
                     let mut best = f32::MAX;
@@ -461,6 +450,7 @@ pub(crate) fn find_soar_replica_assignments_shortlist(
     let tile = soar_tile_rows(n_x, n_y);
     let y_tile = Y_BATCH_SIZE.min(n_y);
     let mut dots = vec![0.0_f32; tile * n_y];
+    let mut scratch = ShortlistScratch::new(n_y, m);
 
     let mut i = 0;
     while i < n_x {
@@ -472,7 +462,7 @@ pub(crate) fn find_soar_replica_assignments_shortlist(
         let dots = &mut dots[..t * n_y];
 
         // Pass 1: centroid-major blocks of `⟨x, y_c⟩`.
-        dots.par_chunks_mut(block_len)
+        dots.chunks_mut(block_len)
             .enumerate()
             .for_each(|(block, products)| {
                 let j = block * y_tile;
@@ -497,53 +487,50 @@ pub(crate) fn find_soar_replica_assignments_shortlist(
         };
 
         primary
-            .par_iter_mut()
-            .zip(secondary.par_chunks_mut(secondaries))
+            .iter_mut()
+            .zip(secondary.chunks_mut(secondaries))
             .enumerate()
-            .for_each_init(
-                || ShortlistScratch::new(n_y, m),
-                |scratch, (r, (first, slots))| {
-                    let norm_x = norms_x[i + r];
-                    // Distances and the primary, reduced block by block as pass 1 of
-                    // `find_soar_replica_assignments` reduces them, clamp included.
-                    let mut best = f32::MAX;
-                    for (block, products) in dots.chunks(block_len).enumerate() {
-                        let j = block * y_tile;
-                        let cols = products.len() / t;
-                        let row = &products[r * cols..(r + 1) * cols];
-                        let mut min_v = f32::MAX;
-                        let mut min_c = 0;
-                        let dist = &mut scratch.dist[j..j + cols];
-                        for (c, (out, &dot)) in dist.iter_mut().zip(row).enumerate() {
-                            let value = -2.0 * dot + norm_x + norms_y[j + c];
-                            *out = value;
-                            if value < min_v {
-                                min_v = value;
-                                min_c = c;
-                            }
-                        }
-                        if min_v < best {
-                            best = min_v.max(0.0);
-                            *first = (j + min_c) as u32;
+            .for_each(|(r, (first, slots))| {
+                let norm_x = norms_x[i + r];
+                // Distances and the primary, reduced block by block as pass 1 of
+                // `find_soar_replica_assignments` reduces them, clamp included.
+                let mut best = f32::MAX;
+                for (block, products) in dots.chunks(block_len).enumerate() {
+                    let j = block * y_tile;
+                    let cols = products.len() / t;
+                    let row = &products[r * cols..(r + 1) * cols];
+                    let mut min_v = f32::MAX;
+                    let mut min_c = 0;
+                    let dist = &mut scratch.dist[j..j + cols];
+                    for (c, (out, &dot)) in dist.iter_mut().zip(row).enumerate() {
+                        let value = -2.0 * dot + norm_x + norms_y[j + c];
+                        *out = value;
+                        if value < min_v {
+                            min_v = value;
+                            min_c = c;
                         }
                     }
-                    if m == 0 {
-                        return;
+                    if min_v < best {
+                        best = min_v.max(0.0);
+                        *first = (j + min_c) as u32;
                     }
-                    let first = *first as usize;
-                    scratch.shortlist(first, m, |c| dot_at(r, c));
-                    scratch.choose(
-                        slots,
-                        first,
-                        dot_at(r, first),
-                        norm_x,
-                        norms_y,
-                        y,
-                        d,
-                        lambda,
-                    );
-                },
-            );
+                }
+                if m == 0 {
+                    return;
+                }
+                let first = *first as usize;
+                scratch.shortlist(first, m, |c| dot_at(r, c));
+                scratch.choose(
+                    slots,
+                    first,
+                    dot_at(r, first),
+                    norm_x,
+                    norms_y,
+                    y,
+                    d,
+                    lambda,
+                );
+            });
         i += t;
     }
 }
@@ -609,9 +596,9 @@ pub fn find_nearest_neighbor(
             let j_off = j;
 
             buf[..batch_n_x * batch_n_y]
-                .par_chunks_mut(batch_n_y)
-                .zip(dist_window.par_iter_mut())
-                .zip(knn_window.par_iter_mut())
+                .chunks_mut(batch_n_y)
+                .zip(dist_window.iter_mut())
+                .zip(knn_window.iter_mut())
                 .enumerate()
                 .for_each(|(r, ((row, best_d), best_idx))| {
                     let norm_x_i = nx[i + r];
@@ -693,9 +680,9 @@ pub fn find_k_nearest_neighbors(
             let knn_window = &mut out_knn[i_base * k..(i_base + batch_n_x) * k];
 
             buf_slice
-                .par_chunks_mut(bn_y)
-                .zip(dist_window.par_chunks_mut(k))
-                .zip(knn_window.par_chunks_mut(k))
+                .chunks_mut(bn_y)
+                .zip(dist_window.chunks_mut(k))
+                .zip(knn_window.chunks_mut(k))
                 .enumerate()
                 .for_each(|(r, ((row, dist_row), knn_row))| {
                     let norm_x_i = nx[i_base + r];
@@ -753,6 +740,7 @@ pub fn find_nearest_neighbor_with_pruning(
     buf: &mut Vec<f32>,
 ) {
     ensure_buf(buf, n_x, n_y);
+    let mut positions = Vec::<u32>::with_capacity(Y_BATCH_SIZE.min(n_y));
 
     let mut i = 0;
     while i < n_x {
@@ -787,54 +775,49 @@ pub fn find_nearest_neighbor_with_pruning(
             let npc_window = &mut out_not_pruned_counts[i_base..i_base + batch_n_x];
 
             buf_slice
-                .par_chunks_mut(bn_y)
-                .zip(knn_window.par_iter_mut())
-                .zip(dist_window.par_iter_mut())
-                .zip(npc_window.par_iter_mut())
+                .chunks_mut(bn_y)
+                .zip(knn_window.iter_mut())
+                .zip(dist_window.iter_mut())
+                .zip(npc_window.iter_mut())
                 .enumerate()
-                // Reuse one `positions` scratch buffer per worker thread instead
-                // of allocating a Vec per row; top1_partial_search clears it.
-                .for_each_init(
-                    || Vec::<u32>::with_capacity(bn_y),
-                    |positions, (r, (((row, knn), dist), npc))| {
-                        let i_idx = i_base + r;
-                        let norm_x_i = nx[i_idx];
-                        // Convert raw dot products to partial L2 distances. Iterate
-                        // over zipped slices (no bounds checks, no aliasing) so the
-                        // autovectorizer emits a SIMD FMA loop — the Rust equivalent
-                        // of the C++ `SKM_VECTORIZE_LOOP` conversion pass.
-                        for (rv, &ny_c) in row.iter_mut().zip(&ny[j_base..j_base + bn_y]) {
-                            *rv = norm_x_i + ny_c - 2.0 * *rv;
-                        }
-                        let data_p = &x[i_idx * d..i_idx * d + d];
-                        let prev_assignment = *knn;
-                        let dist_to_prev = if j_base == 0 {
-                            let other_start = prev_assignment as usize * d;
-                            l2_squared(&y[other_start..other_start + d], data_p)
-                        } else {
-                            *dist
-                        };
+                .for_each(|(r, (((row, knn), dist), npc))| {
+                    let i_idx = i_base + r;
+                    let norm_x_i = nx[i_idx];
+                    // Convert raw dot products to partial L2 distances. Iterate
+                    // over zipped slices (no bounds checks, no aliasing) so the
+                    // autovectorizer emits a SIMD FMA loop — the Rust equivalent
+                    // of the C++ `SKM_VECTORIZE_LOOP` conversion pass.
+                    for (rv, &ny_c) in row.iter_mut().zip(&ny[j_base..j_base + bn_y]) {
+                        *rv = norm_x_i + ny_c - 2.0 * *rv;
+                    }
+                    let data_p = &x[i_idx * d..i_idx * d + d];
+                    let prev_assignment = *knn;
+                    let dist_to_prev = if j_base == 0 {
+                        let other_start = prev_assignment as usize * d;
+                        l2_squared(&y[other_start..other_start + d], data_p)
+                    } else {
+                        *dist
+                    };
 
-                        let (assignment, local_not_pruned) = top1_partial_search(
-                            pruner,
-                            data_p,
-                            batch_y_p,
-                            bn_y,
-                            d,
-                            vertical_d,
-                            horizontal_d,
-                            row,
-                            partial_d,
-                            prev_assignment,
-                            dist_to_prev,
-                            j_base as u32,
-                            positions,
-                        );
-                        *npc += local_not_pruned;
-                        *knn = assignment.index;
-                        *dist = assignment.distance.max(0.0);
-                    },
-                );
+                    let (assignment, local_not_pruned) = top1_partial_search(
+                        pruner,
+                        data_p,
+                        batch_y_p,
+                        bn_y,
+                        d,
+                        vertical_d,
+                        horizontal_d,
+                        row,
+                        partial_d,
+                        prev_assignment,
+                        dist_to_prev,
+                        j_base as u32,
+                        &mut positions,
+                    );
+                    *npc += local_not_pruned;
+                    *knn = assignment.index;
+                    *dist = assignment.distance.max(0.0);
+                });
 
             j += batch_n_y;
         }
