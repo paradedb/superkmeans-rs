@@ -220,7 +220,7 @@ impl HierarchicalSuperKMeans {
     /// Cluster one contiguous sample and return the row-major fine centroids.
     ///
     /// The cluster count is emergent; read it from [`Self::base`]'s
-    /// `n_clusters`. A borrowed [`Matrix`](crate::Matrix) is copied. An owned
+    /// `n_clusters`. A borrowed [`Matrix`] is copied. An owned
     /// [`Vectors`](crate::Vectors) is rotated and split in place, then written
     /// back in working coordinates.
     ///
@@ -678,7 +678,7 @@ impl HierarchicalSuperKMeans {
     ///
     /// Pruning needs a wide vector, more clusters than the GEMM cutoff, and
     /// the BLAS-only switch off — the same conditions as
-    /// [`SuperKMeans`](crate::SuperKMeans)'s streaming loop. Below that, the
+    /// [`SuperKMeans`]'s streaming loop. Below that, the
     /// rotation does not change which centroid a row lands on.
     fn meso_can_prune(&self, k_meso: usize) -> bool {
         self.base.d >= DIMENSION_THRESHOLD_FOR_PRUNING
