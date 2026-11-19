@@ -53,8 +53,8 @@ fn each_point_assigned_to_nearest_centroid() {
         ..Default::default()
     };
     let mut kmeans = SuperKMeans::with_config(n_clusters, d, cfg);
-    let centroids = kmeans.train(&data, n);
-    let assignments = kmeans.assign(&data, &centroids, n);
+    let centroids = kmeans.train(&mut Matrix::new(&data, n, d)).unwrap();
+    let assignments = kmeans.assign(Matrix::new(&data, n, d), Matrix::from_slice(&centroids, d));
     assert_eq!(assignments.len(), n);
     assert_eq!(centroids.len(), n_clusters * d);
 
@@ -94,8 +94,8 @@ fn each_point_assigned_to_nearest_centroid_high_dim() {
         ..Default::default()
     };
     let mut kmeans = SuperKMeans::with_config(n_clusters, d, cfg);
-    let centroids = kmeans.train(&data, n);
-    let assignments = kmeans.assign(&data, &centroids, n);
+    let centroids = kmeans.train(&mut Matrix::new(&data, n, d)).unwrap();
+    let assignments = kmeans.assign(Matrix::new(&data, n, d), Matrix::from_slice(&centroids, d));
     assert_eq!(assignments.len(), n);
 
     let mut incorrect = 0;
@@ -133,10 +133,11 @@ fn use_train_state_matches_brute_force() {
         ..Default::default()
     };
     let mut kmeans = SuperKMeans::with_config(n_clusters, d, cfg);
-    let centroids = kmeans.train(&data, n);
+    let centroids = kmeans.train(&mut Matrix::new(&data, n, d)).unwrap();
 
-    let fast = kmeans.assign_training_points(&data, &centroids, n);
-    let brute = kmeans.assign(&data, &centroids, n);
+    let fast =
+        kmeans.assign_training_points(Matrix::new(&data, n, d), Matrix::from_slice(&centroids, d));
+    let brute = kmeans.assign(Matrix::new(&data, n, d), Matrix::from_slice(&centroids, d));
     assert_eq!(fast.len(), n);
     assert_eq!(brute.len(), n);
 
@@ -168,10 +169,16 @@ fn use_train_state_matches_brute_force_on_a_caller_side_sample() {
 
     let sampled = n / 2;
     let sample = &data[..sampled * d];
-    let centroids = kmeans.train(sample, sampled);
+    let centroids = kmeans.train(&mut Matrix::new(sample, sampled, d)).unwrap();
 
-    let fast = kmeans.assign_training_points(sample, &centroids, sampled);
-    let brute = kmeans.assign(sample, &centroids, sampled);
+    let fast = kmeans.assign_training_points(
+        Matrix::new(sample, sampled, d),
+        Matrix::from_slice(&centroids, d),
+    );
+    let brute = kmeans.assign(
+        Matrix::new(sample, sampled, d),
+        Matrix::from_slice(&centroids, d),
+    );
     assert_eq!(fast.len(), sampled);
     assert_eq!(brute.len(), sampled);
 
@@ -199,10 +206,11 @@ fn use_train_state_matches_brute_force_full() {
         ..Default::default()
     };
     let mut kmeans = SuperKMeans::with_config(n_clusters, d, cfg);
-    let centroids = kmeans.train(&data, n);
+    let centroids = kmeans.train(&mut Matrix::new(&data, n, d)).unwrap();
 
-    let fast = kmeans.assign_training_points(&data, &centroids, n);
-    let brute = kmeans.assign(&data, &centroids, n);
+    let fast =
+        kmeans.assign_training_points(Matrix::new(&data, n, d), Matrix::from_slice(&centroids, d));
+    let brute = kmeans.assign(Matrix::new(&data, n, d), Matrix::from_slice(&centroids, d));
 
     let matches = fast.iter().zip(&brute).filter(|(a, b)| a == b).count();
     let pct = 100.0 * matches as f64 / n as f64;
@@ -227,8 +235,8 @@ fn all_clusters_non_empty() {
         ..Default::default()
     };
     let mut kmeans = SuperKMeans::with_config(n_clusters, d, cfg);
-    let centroids = kmeans.train(&data, n);
-    let assignments = kmeans.assign(&data, &centroids, n);
+    let centroids = kmeans.train(&mut Matrix::new(&data, n, d)).unwrap();
+    let assignments = kmeans.assign(Matrix::new(&data, n, d), Matrix::from_slice(&centroids, d));
     assert_eq!(assignments.len(), n);
 
     let mut counts = vec![0_usize; n_clusters];
@@ -411,8 +419,7 @@ fn soar_with(
 ) -> (Vec<u32>, Vec<u32>) {
     match candidates {
         None => assign_soar_replicas(vectors, centroids, lambda, replicas),
-        Some(m) => SoarAssigner::with_candidates(centroids, lambda, replicas, m)
-            .assign(vectors.as_slice(), vectors.n()),
+        Some(m) => SoarAssigner::with_candidates(centroids, lambda, replicas, m).assign(vectors),
     }
 }
 
@@ -480,7 +487,11 @@ fn soar_secondaries_minimize_the_objective() {
     let centroids = generate_random_vectors(k, d, -10.0, 10.0, 9);
     let kmeans = SuperKMeans::new(k, d);
     for lambda in [0.0_f32, 2.0] {
-        let (primary, secondary) = kmeans.assign_soar(&data, &centroids, n, lambda);
+        let (primary, secondary) = kmeans.assign_soar(
+            Matrix::new(&data, n, d),
+            Matrix::from_slice(&centroids, d),
+            lambda,
+        );
         assert_soar_optimal(&data, &centroids, n, k, d, lambda, &primary, &secondary);
         let (free_primary, free_secondary) = assign_soar(
             Matrix::new(&data, n, d),

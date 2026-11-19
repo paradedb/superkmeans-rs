@@ -305,7 +305,7 @@ fn bench_soar(c: &mut Criterion) {
         });
         let shortlist = SoarAssigner::with_candidates(centers, 2.0, 2, 64);
         group.bench_function(BenchmarkId::new("shortlist_soar", &id), |b| {
-            b.iter(|| black_box(shortlist.assign(black_box(&vectors), n)));
+            b.iter(|| black_box(shortlist.assign(Matrix::new(black_box(&vectors), n, d))));
         });
     }
 

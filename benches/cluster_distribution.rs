@@ -22,8 +22,8 @@ use std::path::PathBuf;
 use rayon::prelude::*;
 use superkmeans::distance::l2_squared;
 use superkmeans::{
-    ClusterBalanceStats, HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, SuperKMeans,
-    SuperKMeansConfig, TicToc,
+    ClusterBalanceStats, HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, Matrix,
+    SuperKMeans, SuperKMeansConfig, TicToc, Vectors,
 };
 
 const COHERE_N: usize = 10_000_000;
@@ -216,12 +216,17 @@ fn bench_full_sample_baseline(base: &[f32], n: usize, full_leaf_size: usize) {
         };
         let mut skm = SuperKMeans::with_config(target_k, COHERE_D, cfg);
         timer.tic();
-        let centroids = skm.train(&base[..n * COHERE_D], n);
+        let centroids = skm
+            .train(&mut Matrix::new(&base[..n * COHERE_D], n, COHERE_D))
+            .unwrap();
         timer.toc();
         let train_ms = timer.milliseconds();
 
         let train_summary = summarize(&skm.cluster_sizes);
-        let assignments = skm.assign(&base[..n * COHERE_D], &centroids, n);
+        let assignments = skm.assign(
+            Matrix::new(&base[..n * COHERE_D], n, COHERE_D),
+            Matrix::from_slice(&centroids, COHERE_D),
+        );
         let assign_summary = summarize_assignments(&assignments, target_k);
 
         print_baseline_row("flat-train", target_k, &train_summary, train_ms);
@@ -258,13 +263,16 @@ fn bench_full_sample_baseline(base: &[f32], n: usize, full_leaf_size: usize) {
         cfg.base.suppress_warnings = true;
         let mut hskm = HierarchicalSuperKMeans::with_config(COHERE_D, cfg);
         timer.tic();
-        let centroids = hskm.train(&base[..n * COHERE_D], n);
+        let centroids = hskm.train(&mut Matrix::new(&base[..n * COHERE_D], n, COHERE_D));
         timer.toc();
         let train_ms = timer.milliseconds();
 
         let actual_k = hskm.base.n_clusters;
         let tree_summary = summarize(&hskm.base.cluster_sizes);
-        let assignments = hskm.assign(&base[..n * COHERE_D], &centroids, n);
+        let assignments = hskm.assign(
+            Matrix::new(&base[..n * COHERE_D], n, COHERE_D),
+            Matrix::from_slice(&centroids, COHERE_D),
+        );
         let assign_summary = summarize_assignments(&assignments, actual_k);
 
         print_baseline_row("hier-train", actual_k, &tree_summary, train_ms);
@@ -336,12 +344,16 @@ fn bench_sample_sweep(base: &[f32], n: usize, full_leaf_size: usize) {
         cfg.base.suppress_warnings = true;
         let mut hskm = HierarchicalSuperKMeans::with_config(COHERE_D, cfg);
         timer.tic();
-        let centroids = hskm.train_owned(sample, n_sample);
+        let mut sample = Vectors::new(sample, COHERE_D);
+        let centroids = hskm.train(&mut sample);
         timer.toc();
 
         let actual_k = hskm.base.n_clusters;
         let train_summary = summarize(&hskm.base.cluster_sizes);
-        let assignments = hskm.assign(base, &centroids, n);
+        let assignments = hskm.assign(
+            Matrix::new(&base[..n * COHERE_D], n, COHERE_D),
+            Matrix::from_slice(&centroids, COHERE_D),
+        );
         let assign_summary = summarize_assignments(&assignments, actual_k);
 
         for (stage, exp_size, s) in [
@@ -476,13 +488,16 @@ fn bench_iterations_sweep(base: &[f32], n: usize, full_leaf_size: usize) {
 
         let mut hskm = HierarchicalSuperKMeans::with_config(COHERE_D, cfg);
         timer.tic();
-        let centroids = hskm.train(&base[..n * COHERE_D], n);
+        let centroids = hskm.train(&mut Matrix::new(&base[..n * COHERE_D], n, COHERE_D));
         timer.toc();
         let train_ms = timer.milliseconds();
 
         let actual_k = hskm.base.n_clusters;
         let train_summary = summarize(&hskm.base.cluster_sizes);
-        let assignments = hskm.assign(&base[..n * COHERE_D], &centroids, n);
+        let assignments = hskm.assign(
+            Matrix::new(&base[..n * COHERE_D], n, COHERE_D),
+            Matrix::from_slice(&centroids, COHERE_D),
+        );
         let assign_summary = summarize_assignments(&assignments, actual_k);
         let mse = mean_squared_error(&base[..n * COHERE_D], n, COHERE_D, &centroids, &assignments);
         let revived: usize = hskm
@@ -527,12 +542,17 @@ fn bench_iterations_sweep(base: &[f32], n: usize, full_leaf_size: usize) {
         };
         let mut skm = SuperKMeans::with_config(target_k, COHERE_D, cfg);
         timer.tic();
-        let centroids = skm.train(&base[..n * COHERE_D], n);
+        let centroids = skm
+            .train(&mut Matrix::new(&base[..n * COHERE_D], n, COHERE_D))
+            .unwrap();
         timer.toc();
         let train_ms = timer.milliseconds();
 
         let train_summary = summarize(&skm.cluster_sizes);
-        let assignments = skm.assign(&base[..n * COHERE_D], &centroids, n);
+        let assignments = skm.assign(
+            Matrix::new(&base[..n * COHERE_D], n, COHERE_D),
+            Matrix::from_slice(&centroids, COHERE_D),
+        );
         let assign_summary = summarize_assignments(&assignments, target_k);
         let train_mse = skm.iteration_stats.last().map_or(0.0, |s| s.mse);
         let assign_mse =

@@ -2,7 +2,19 @@
 
 use std::convert::Infallible;
 
-use crate::matrix::Matrix;
+use crate::matrix::{Matrix, Vectors};
+
+/// One contiguous `n × d` sample.
+///
+/// [`Dataset::contiguous`] returns this when training can rotate the sample
+/// once and run Lloyd over it. A borrowed block is copied. An owned
+/// [`Vectors`] is rotated in place and left in working coordinates.
+pub enum Contiguous<'a> {
+    /// A borrowed view. Training copies it, then rotates the copy.
+    Borrowed(Matrix<'a>),
+    /// An owned buffer. Training rotates [`Vectors::data`] in place.
+    Owned(&'a mut Vectors),
+}
 
 /// A sequential scan of row-major [`Matrix`] batches that can be replayed.
 ///
@@ -20,6 +32,15 @@ pub trait Dataset {
 
     /// Call `f` once per batch, in order. Stops at the first error.
     fn for_each_batch(&mut self, f: &mut dyn FnMut(Matrix<'_>)) -> Result<(), Self::Error>;
+
+    /// The whole sample when it already sits in one contiguous buffer.
+    ///
+    /// The default is no block, so training streams. [`Matrix`] and [`Vectors`]
+    /// return themselves, and training then rotates once and runs Lloyd over
+    /// the whole sample.
+    fn contiguous(&mut self) -> Option<Contiguous<'_>> {
+        None
+    }
 }
 
 /// A [`Clone`] iterator of [`Matrix`] batches, replayed by cloning it on
@@ -61,6 +82,25 @@ impl Dataset for Matrix<'_> {
             f(*self);
         }
         Ok(())
+    }
+
+    fn contiguous(&mut self) -> Option<Contiguous<'_>> {
+        Some(Contiguous::Borrowed(*self))
+    }
+}
+
+impl Dataset for Vectors {
+    type Error = Infallible;
+
+    fn for_each_batch(&mut self, f: &mut dyn FnMut(Matrix<'_>)) -> Result<(), Infallible> {
+        if !self.as_matrix().is_empty() {
+            f(self.as_matrix());
+        }
+        Ok(())
+    }
+
+    fn contiguous(&mut self) -> Option<Contiguous<'_>> {
+        Some(Contiguous::Owned(self))
     }
 }
 

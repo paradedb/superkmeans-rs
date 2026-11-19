@@ -13,7 +13,7 @@ use crate::common::{
     CENTROID_PERTURBATION_EPS, DIMENSION_THRESHOLD_FOR_PRUNING, MIN_PARTIAL_D,
     N_CLUSTERS_THRESHOLD_FOR_PRUNING, PRUNER_INITIAL_THRESHOLD, X_BATCH_SIZE, Y_BATCH_SIZE,
 };
-use crate::dataset::{self, Dataset, IterDataset};
+use crate::dataset::{self, Contiguous, Dataset};
 use crate::layout;
 use crate::matrix::Matrix;
 use crate::utils::{
@@ -33,7 +33,6 @@ pub struct SuperKMeansConfig {
     pub use_blas_only: bool,
     pub tol: f32,
     pub early_termination: bool,
-    pub sample_queries: bool,
     pub min_not_pruned_pct: f32,
     pub max_not_pruned_pct: f32,
     pub adjustment_factor_for_partial_d: f32,
@@ -61,7 +60,6 @@ impl Default for SuperKMeansConfig {
             use_blas_only: false,
             tol: 1.0e-4,
             early_termination: true,
-            sample_queries: false,
             min_not_pruned_pct: 0.03,
             max_not_pruned_pct: 0.05,
             adjustment_factor_for_partial_d: 0.20,
@@ -313,10 +311,16 @@ impl<'a> SoarAssigner<'a> {
     ///
     /// # Panics
     ///
-    /// Panics if `vectors.len() != n_vectors * d`.
-    pub fn assign(&self, vectors: &[f32], n_vectors: usize) -> (Vec<u32>, Vec<u32>) {
+    /// Panics if `vectors.d()` differs from the centroids.
+    pub fn assign(&self, vectors: Matrix<'_>) -> (Vec<u32>, Vec<u32>) {
         let d = self.centroids.d();
-        let vectors = Matrix::new(vectors, n_vectors, d);
+        assert_eq!(
+            vectors.d(),
+            d,
+            "vectors dimensionality {} does not match the centroids ({d})",
+            vectors.d()
+        );
+        let n_vectors = vectors.n();
         let n_centroids = self.centroids.n();
         if self.replicas < 2 || n_centroids < 2 {
             // No secondary is possible: the nearest centroid alone.
@@ -412,35 +416,91 @@ impl SuperKMeans {
         }
     }
 
-    /// Train the model and return row-major centroids (n_clusters × d).
-    pub fn train(&mut self, data: &[f32], n: usize) -> Vec<f32> {
-        self.train_with_queries(data, n, &[], 0)
+    /// Train the model and return row-major centroids (`n_clusters × d`).
+    ///
+    /// A [`Matrix`] or [`Vectors`](crate::Vectors) is one contiguous block.
+    /// Training rotates that block once and runs Lloyd over every row. An
+    /// owned buffer is rotated in place and left in working coordinates. Any
+    /// other [`Dataset`], including an [`IterDataset`](crate::IterDataset) of
+    /// batches, is streamed. The scan stays on the calling thread.
+    ///
+    /// ```
+    /// use superkmeans::{IterDataset, Matrix, SuperKMeans, make_blobs};
+    ///
+    /// let (n, d, k) = (2_000, 32, 10);
+    /// let data = make_blobs(n, d, k, true, 1.0, 10.0, 42);
+    /// let mut kmeans = SuperKMeans::new(k, d);
+    /// let centroids = kmeans
+    ///     .train(&mut IterDataset::new(Matrix::new(&data, n, d).chunks(256)))
+    ///     .unwrap();
+    /// assert_eq!(centroids.len(), k * d);
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error [`Dataset::for_each_batch`] fails with. A
+    /// contiguous block is not scanned, so [`Matrix`] and [`Vectors`](crate::Vectors)
+    /// return [`Ok`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the model is already trained, `k` was zero at construction,
+    /// the sample has fewer rows than `n_clusters`, a batch's dimensionality
+    /// differs from the model, or two streaming passes yield different row counts.
+    pub fn train<D: Dataset + ?Sized>(&mut self, data: &mut D) -> Result<Vec<f32>, D::Error> {
+        if let Some(block) = data.contiguous() {
+            return Ok(self.train_contiguous(block));
+        }
+        self.train_streaming(data)
     }
 
-    /// Like [`Self::train`], but takes ownership of `data` so the buffer can be
-    /// rotated in place. Peak memory is then one copy of the training set
-    /// rather than two.
-    pub fn train_owned(&mut self, data: Vec<f32>, n: usize) -> Vec<f32> {
-        self.train_impl(Cow::Owned(data), n, &[], 0)
-    }
-
-    pub fn train_with_queries(
+    /// Reservoir-sample and stream Lloyd, even when `data` is one contiguous block.
+    ///
+    /// [`HierarchicalSuperKMeans::train_meso`](crate::HierarchicalSuperKMeans::train_meso)
+    /// calls this so a full in-memory scan still uses the streaming init.
+    pub(crate) fn train_streaming<D: Dataset + ?Sized>(
         &mut self,
-        data: &[f32],
-        n: usize,
-        queries: &[f32],
-        n_queries: usize,
-    ) -> Vec<f32> {
-        self.train_impl(Cow::Borrowed(data), n, queries, n_queries)
+        data: &mut D,
+    ) -> Result<Vec<f32>, D::Error> {
+        assert!(!self.trained, "The clustering has already been trained");
+        let rotate = !self.config.data_already_rotated;
+        let (n, sample) = self.reservoir_sample(data)?;
+        self.prepare_stream_state(n);
+        self.install_centroids(&sample, rotate);
+        self.run_dataset_loop(data, rotate)?;
+        self.trained = true;
+        Ok(self.get_output_centroids(self.config.unrotate_centroids))
     }
 
-    fn train_impl(
-        &mut self,
-        data: Cow<'_, [f32]>,
-        n: usize,
-        queries: &[f32],
-        n_queries: usize,
-    ) -> Vec<f32> {
+    fn train_contiguous(&mut self, block: Contiguous<'_>) -> Vec<f32> {
+        match block {
+            Contiguous::Borrowed(matrix) => {
+                assert_eq!(
+                    matrix.d(),
+                    self.d,
+                    "matrix dimensionality {} does not match the model ({})",
+                    matrix.d(),
+                    self.d
+                );
+                self.train_impl(Cow::Borrowed(matrix.as_slice()), matrix.n())
+                    .0
+            }
+            Contiguous::Owned(vectors) => {
+                assert_eq!(
+                    vectors.d, self.d,
+                    "matrix dimensionality {} does not match the model ({})",
+                    vectors.d, self.d
+                );
+                let n = vectors.n();
+                let buf = std::mem::take(&mut vectors.data);
+                let (centroids, buf) = self.train_impl(Cow::Owned(buf), n);
+                vectors.data = buf;
+                centroids
+            }
+        }
+    }
+
+    fn train_impl(&mut self, data: Cow<'_, [f32]>, n: usize) -> (Vec<f32>, Vec<f32>) {
         assert!(n > 0, "n must be positive");
         assert!(!self.trained, "The clustering has already been trained");
         assert!(
@@ -449,9 +509,6 @@ impl SuperKMeans {
             n,
             self.n_clusters
         );
-        if n_queries > 0 && queries.is_empty() && !self.config.sample_queries {
-            panic!("Queries must be provided if n_queries > 0 and sample_queries is false");
-        }
 
         self.iteration_stats.clear();
         // Every row handed in is clustered; sampling belongs to the caller.
@@ -491,72 +548,13 @@ impl SuperKMeans {
         self.data_norms = squared_norms(&data_to_cluster, n_samples, d);
         self.centroid_norms = squared_norms(&self.prev_centroids, n_clusters, d);
 
-        // Queries are unused: recall tracking is not ported, so training runs the
-        // same with or without them (early termination on shift/SSE still works).
-        let _ = queries;
-        let _ = n_queries;
-
         self.run_core_loop(&data_to_cluster);
 
         self.trained = true;
-        self.get_output_centroids(self.config.unrotate_centroids)
-    }
-
-    /// Train from a replayable iterator of [`Matrix`] batches and return
-    /// row-major centroids (n_clusters × d).
-    ///
-    /// `clone()` on the iterator must yield the same batches again; see
-    /// [`Self::train_dataset`] for how the data is walked.
-    ///
-    /// ```
-    /// use superkmeans::{Matrix, SuperKMeans, make_blobs};
-    ///
-    /// let (n, d, k) = (2_000, 32, 10);
-    /// let data = make_blobs(n, d, k, true, 1.0, 10.0, 42);
-    /// let mut kmeans = SuperKMeans::new(k, d);
-    /// let centroids = kmeans.train_iter(Matrix::new(&data, n, d).chunks(256));
-    /// assert_eq!(centroids.len(), k * d);
-    /// ```
-    pub fn train_iter<'a, I>(&mut self, batches: I) -> Vec<f32>
-    where
-        I: IntoIterator<Item = Matrix<'a>>,
-        I::IntoIter: Clone,
-    {
-        let mut dataset = IterDataset::new(batches.into_iter());
-        match self.train_dataset(&mut dataset) {
-            Ok(centroids) => centroids,
-            Err(never) => match never {},
-        }
-    }
-
-    /// Train from a replayable [`Dataset`] without holding it in memory, and
-    /// return row-major centroids (n_clusters × d).
-    ///
-    /// The first pass counts the rows and reservoir-samples the starting
-    /// centroids; each Lloyd iteration is one more pass. Vectors are rotated
-    /// and scored one work batch at a time, so the only per-row state is one
-    /// assignment (4 bytes), kept to seed pruning in the next pass.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first error [`Dataset::for_each_batch`] fails with.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the model is already trained, the dataset yields fewer rows
-    /// than `n_clusters`, or two passes yield different row counts.
-    pub fn train_dataset<D: Dataset + ?Sized>(
-        &mut self,
-        data: &mut D,
-    ) -> Result<Vec<f32>, D::Error> {
-        assert!(!self.trained, "The clustering has already been trained");
-        let rotate = !self.config.data_already_rotated;
-        let (n, sample) = self.reservoir_sample(data)?;
-        self.prepare_stream_state(n);
-        self.install_centroids(&sample, rotate);
-        self.run_dataset_loop(data, rotate)?;
-        self.trained = true;
-        Ok(self.get_output_centroids(self.config.unrotate_centroids))
+        (
+            self.get_output_centroids(self.config.unrotate_centroids),
+            data_to_cluster,
+        )
     }
 
     /// One pass: count the rows and reservoir-sample `n_clusters` of them
@@ -824,13 +822,23 @@ impl SuperKMeans {
     ///
     /// # Panics
     ///
-    /// Panics if `vectors.len() != n_vectors * d`, or if `centroids.len()` is
-    /// not a multiple of `d`.
-    pub fn assign(&self, vectors: &[f32], centroids: &[f32], n_vectors: usize) -> Vec<u32> {
-        assign(
-            Matrix::new(vectors, n_vectors, self.d),
-            Matrix::from_slice(centroids, self.d),
-        )
+    /// Panics if either matrix's dimensionality differs from this model.
+    pub fn assign(&self, vectors: Matrix<'_>, centroids: Matrix<'_>) -> Vec<u32> {
+        assert_eq!(
+            vectors.d(),
+            self.d,
+            "vectors dimensionality {} does not match the model ({})",
+            vectors.d(),
+            self.d
+        );
+        assert_eq!(
+            centroids.d(),
+            self.d,
+            "centroids dimensionality {} does not match the model ({})",
+            centroids.d(),
+            self.d
+        );
+        assign(vectors, centroids)
     }
 
     /// Brute-force assignment to the nearest centroid and a SOAR secondary, as
@@ -839,20 +847,20 @@ impl SuperKMeans {
     ///
     /// # Panics
     ///
-    /// Panics if `vectors.len() != n_vectors * d`, or if `centroids.len()` is
-    /// not a multiple of `d`.
+    /// Panics if either matrix's dimensionality differs from this model.
     pub fn assign_soar(
         &self,
-        vectors: &[f32],
-        centroids: &[f32],
-        n_vectors: usize,
+        vectors: Matrix<'_>,
+        centroids: Matrix<'_>,
         lambda: f32,
     ) -> (Vec<u32>, Vec<u32>) {
-        assign_soar(
-            Matrix::new(vectors, n_vectors, self.d),
-            Matrix::from_slice(centroids, self.d),
-            lambda,
-        )
+        assert_eq!(vectors.d(), self.d, "vectors dimensionality does not match");
+        assert_eq!(
+            centroids.d(),
+            self.d,
+            "centroids dimensionality does not match"
+        );
+        assign_soar(vectors, centroids, lambda)
     }
 
     /// Re-assign the training set to its nearest centroid using the pruning path.
@@ -868,18 +876,24 @@ impl SuperKMeans {
     ///
     /// # Panics
     ///
-    /// Panics if the model is untrained, or if `n_vectors` differs from the row
-    /// count passed to training.
+    /// Panics if the model is untrained, `vectors` is not the training set, or
+    /// either matrix's dimensionality differs from this model.
     pub fn assign_training_points(
         &mut self,
-        vectors: &[f32],
-        centroids: &[f32],
-        n_vectors: usize,
+        vectors: Matrix<'_>,
+        centroids: Matrix<'_>,
     ) -> Vec<u32> {
         assert!(
             self.trained,
             "assign_training_points requires training first"
         );
+        assert_eq!(vectors.d(), self.d, "vectors dimensionality does not match");
+        assert_eq!(
+            centroids.d(),
+            self.d,
+            "centroids dimensionality does not match"
+        );
+        let n_vectors = vectors.n();
         assert_eq!(
             n_vectors, self.n_samples,
             "assign_training_points re-assigns the training set; pass the {} rows given to \
@@ -887,7 +901,7 @@ impl SuperKMeans {
             self.n_samples
         );
         let d = self.d;
-        let n_centroids = centroids.len() / d;
+        let n_centroids = centroids.n();
 
         // Fall-back path: when pruning isn't beneficial, defer to brute force.
         if self.config.use_blas_only
@@ -899,8 +913,9 @@ impl SuperKMeans {
                     "WARNING: AssignTrainingPoints cannot use pruning, falling back to brute force"
                 );
             }
-            return self.assign(vectors, centroids, n_vectors);
+            return self.assign(vectors, centroids);
         }
+        let vectors = vectors.as_slice();
 
         self.partial_d = self.initial_partial_d();
 

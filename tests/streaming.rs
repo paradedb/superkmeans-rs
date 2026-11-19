@@ -4,8 +4,8 @@
 use std::convert::Infallible;
 
 use superkmeans::{
-    Dataset, FineClusters, HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, Matrix,
-    SuperKMeans, SuperKMeansConfig, make_blobs,
+    Dataset, FineClusters, HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, IterDataset,
+    Matrix, SuperKMeans, SuperKMeansConfig, make_blobs,
 };
 
 /// Mean squared distance from each row to the centroid it is assigned to.
@@ -32,7 +32,10 @@ fn leaf_config(target_leaf_size: usize) -> HierarchicalSuperKMeansConfig {
 }
 
 fn nearest_distortion(kmeans: &SuperKMeans, data: &[f32], n: usize, centroids: &[f32]) -> f64 {
-    let assignments = kmeans.assign(data, centroids, n);
+    let assignments = kmeans.assign(
+        Matrix::new(data, n, kmeans.d),
+        Matrix::from_slice(centroids, kmeans.d),
+    );
     distortion(data, kmeans.d, centroids, &assignments)
 }
 
@@ -42,13 +45,17 @@ fn superkmeans_trains_from_an_iterator() {
     let data = make_blobs(n, d, k, true, 1.0, 10.0, 42);
 
     let mut streamed = SuperKMeans::new(k, d);
-    let centroids = streamed.train_iter(Matrix::new(&data, n, d).chunks(1_000));
+    let centroids = streamed
+        .train(&mut IterDataset::new(
+            Matrix::new(&data, n, d).chunks(1_000),
+        ))
+        .unwrap();
     assert!(streamed.trained);
     assert_eq!(centroids.len(), k * d);
     assert_eq!(streamed.n_samples, n);
 
     let mut in_memory = SuperKMeans::new(k, d);
-    let reference = in_memory.train(&data, n);
+    let reference = in_memory.train(&mut Matrix::new(&data, n, d)).unwrap();
 
     let streamed_distortion = nearest_distortion(&streamed, &data, n, &centroids);
     let reference_distortion = nearest_distortion(&in_memory, &data, n, &reference);
@@ -66,10 +73,16 @@ fn batch_shape_does_not_change_the_result() {
     let data = make_blobs(n, d, k, true, 1.0, 10.0, 3);
 
     let mut by_vector = SuperKMeans::new(k, d);
-    let one_at_a_time = by_vector.train_iter(data.chunks_exact(d).map(Matrix::vector));
+    let one_at_a_time = by_vector
+        .train(&mut IterDataset::new(
+            data.chunks_exact(d).map(Matrix::vector),
+        ))
+        .unwrap();
 
     let mut by_chunk = SuperKMeans::new(k, d);
-    let chunked = by_chunk.train_iter(Matrix::new(&data, n, d).chunks(777));
+    let chunked = by_chunk
+        .train(&mut IterDataset::new(Matrix::new(&data, n, d).chunks(777)))
+        .unwrap();
 
     assert_eq!(one_at_a_time, chunked);
 }
@@ -87,14 +100,18 @@ fn streaming_with_pruning_matches_in_memory_quality() {
     };
 
     let mut streamed = SuperKMeans::with_config(k, d, cfg.clone());
-    let centroids = streamed.train_iter(Matrix::new(&data, n, d).chunks(4_096));
+    let centroids = streamed
+        .train(&mut IterDataset::new(
+            Matrix::new(&data, n, d).chunks(4_096),
+        ))
+        .unwrap();
     assert!(
         streamed.iteration_stats.iter().any(|s| !s.is_gemm_only()),
         "pruning never engaged"
     );
 
     let mut in_memory = SuperKMeans::with_config(k, d, cfg);
-    let reference = in_memory.train(&data, n);
+    let reference = in_memory.train(&mut Matrix::new(&data, n, d)).unwrap();
 
     let streamed_distortion = nearest_distortion(&streamed, &data, n, &centroids);
     let reference_distortion = nearest_distortion(&in_memory, &data, n, &reference);
@@ -113,7 +130,12 @@ fn hierarchical_trains_from_an_iterator() {
     let cfg = leaf_config(target_leaf_size);
     let kmeans = HierarchicalSuperKMeans::with_config(d, cfg.clone());
 
-    let meso = kmeans.train_meso_iter(Matrix::new(&data, n, d).chunks(1_000), n);
+    let meso = kmeans
+        .train_meso(
+            &mut IterDataset::new(Matrix::new(&data, n, d).chunks(1_000)),
+            n,
+        )
+        .unwrap();
     assert!(meso.n_meso() >= 2);
 
     let mut centroids = Vec::new();
@@ -129,7 +151,8 @@ fn hierarchical_trains_from_an_iterator() {
             .iter()
             .flat_map(|&r| data[r as usize * d..(r as usize + 1) * d].iter().copied())
             .collect();
-        let fine: FineClusters = kmeans.train_meso_cluster(&vectors, rows.len());
+        let fine: FineClusters =
+            kmeans.train_meso_cluster(&mut Matrix::new(&vectors, rows.len(), d));
 
         let first = sizes.len() as u32;
         for c in 0..fine.n_fine() {
@@ -152,8 +175,9 @@ fn hierarchical_trains_from_an_iterator() {
     assert!(sizes.len() >= n.div_ceil(target_leaf_size));
 
     let mut in_memory = HierarchicalSuperKMeans::with_config(d, cfg);
-    let reference = in_memory.train(&data, n);
-    let reference_assignments = in_memory.assign(&data, &reference, n);
+    let reference = in_memory.train(&mut Matrix::new(&data, n, d));
+    let reference_assignments =
+        in_memory.assign(Matrix::new(&data, n, d), Matrix::from_slice(&reference, d));
 
     let streamed_distortion = distortion(&data, d, &centroids, &assignments);
     let reference_distortion = distortion(&data, d, &reference, &reference_assignments);
@@ -221,7 +245,7 @@ fn a_sample_that_fits_one_leaf_needs_no_meso_pass() {
     assert_eq!(scan.passes, 0);
     assert_eq!(meso.n_meso(), 1);
 
-    let fine = kmeans.train_meso_cluster(&data, n);
+    let fine = kmeans.train_meso_cluster(&mut Matrix::new(&data, n, d));
     assert_eq!(fine.n_fine(), 1);
     assert_eq!(fine.members(0).len(), n);
 }
@@ -257,10 +281,7 @@ fn scan_errors_come_back_out_of_training() {
         passes: 0,
     };
     let mut kmeans = SuperKMeans::new(10, d);
-    assert_eq!(
-        kmeans.train_dataset(&mut scan),
-        Err("read failed".to_string())
-    );
+    assert_eq!(kmeans.train(&mut scan), Err("read failed".to_string()));
     assert!(!kmeans.trained);
 
     let hierarchical = HierarchicalSuperKMeans::with_config(d, leaf_config(50));
@@ -277,5 +298,8 @@ fn train_meso_rejects_a_wrong_row_count() {
     let (n, d) = (4_000usize, 16usize);
     let data = make_blobs(n, d, 10, true, 1.0, 10.0, 9);
     let kmeans = HierarchicalSuperKMeans::with_config(d, leaf_config(10));
-    let _ = kmeans.train_meso_iter(Matrix::new(&data, n, d).chunks(500), 100);
+    let _ = kmeans.train_meso(
+        &mut IterDataset::new(Matrix::new(&data, n, d).chunks(500)),
+        100,
+    );
 }

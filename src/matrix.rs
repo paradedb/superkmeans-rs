@@ -124,7 +124,7 @@ impl<'a> Matrix<'a> {
     /// The last chunk may be shorter. `rows` must be positive.
     ///
     /// The resulting iterator is [`Clone`], so it can be replayed across
-    /// k-means passes via [`crate::SuperKMeans::train_iter`].
+    /// k-means passes inside an [`crate::IterDataset`].
     pub fn chunks(&self, rows: usize) -> MatrixChunks<'a> {
         assert!(rows > 0, "chunk row count must be positive");
         MatrixChunks {
@@ -156,7 +156,7 @@ impl Eq for Matrix<'_> {}
 
 /// Iterator of [`Matrix`] row-chunks produced by [`Matrix::chunks`].
 ///
-/// Cloneable so [`crate::SuperKMeans::train_iter`] can replay it each Lloyd
+/// Cloneable so an [`crate::IterDataset`] of chunks can be replayed each Lloyd
 /// iteration.
 #[derive(Clone, Debug)]
 pub struct MatrixChunks<'a> {
@@ -185,6 +185,44 @@ impl<'a> Iterator for MatrixChunks<'a> {
 }
 
 impl ExactSizeIterator for MatrixChunks<'_> {}
+
+/// An owned row-major `n × d` block of `f32`.
+///
+/// `d` is stored on the value. A bare [`Vec<f32>`] does not know it.
+/// [`Vectors::as_matrix`] borrows the block as a [`Matrix`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct Vectors {
+    pub data: Vec<f32>,
+    pub d: usize,
+}
+
+impl Vectors {
+    /// # Panics
+    ///
+    /// Panics if `d` is zero or `data.len()` is not a multiple of `d`.
+    pub fn new(data: Vec<f32>, d: usize) -> Self {
+        assert!(d > 0, "dimensionality must be positive");
+        assert_eq!(
+            data.len() % d,
+            0,
+            "data length {} is not a multiple of d ({d})",
+            data.len()
+        );
+        Self { data, d }
+    }
+
+    pub fn n(&self) -> usize {
+        self.data.len() / self.d
+    }
+
+    pub fn as_slice(&self) -> &[f32] {
+        &self.data
+    }
+
+    pub fn as_matrix(&self) -> Matrix<'_> {
+        Matrix::from_slice(&self.data, self.d)
+    }
+}
 
 #[cfg(test)]
 mod tests {
