@@ -135,6 +135,60 @@ fn invalid_zero_iters() {
     let _ = SuperKMeans::with_config(32, cfg);
 }
 
+// ----- One model, many runs -----
+
+/// A run on a reused model is the run a fresh model gives, whatever the model
+/// trained before.
+#[test]
+fn one_model_trains_many_datasets_and_cluster_counts() {
+    let d = 32;
+    let first = default_blobs(2_000, d, 10);
+    let second = make_blobs(3_000, d, 20, false, 1.0, 10.0, 7);
+    let kmeans = SuperKMeans::new(d);
+
+    for (data, n, k) in [
+        (&first, 2_000, 10),
+        (&second, 3_000, 20),
+        (&first, 2_000, 25),
+        (&first, 2_000, 10),
+    ] {
+        let reused = kmeans.train(&mut Matrix::new(data, n, d), k).unwrap();
+        let fresh = SuperKMeans::new(d)
+            .train(&mut Matrix::new(data, n, d), k)
+            .unwrap();
+        assert_eq!(reused.centroids, fresh.centroids);
+        assert_eq!(reused.assignments, fresh.assignments);
+        assert_eq!(reused.cluster_sizes, fresh.cluster_sizes);
+    }
+}
+
+/// Downstream caches one trainer in an `Arc` and trains from worker threads.
+#[test]
+fn trainers_are_send_and_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<SuperKMeans>();
+    assert_send_sync::<superkmeans::HierarchicalSuperKMeans>();
+}
+
+/// Training takes `&self`, so threads share one model.
+#[test]
+fn one_model_trains_from_several_threads() {
+    let (n, d, k) = (2_000, 32, 10);
+    let data = default_blobs(n, d, k);
+    let kmeans = SuperKMeans::new(d);
+    let expected = kmeans.train(&mut Matrix::new(&data, n, d), k).unwrap();
+
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| {
+                let trained = kmeans.train(&mut Matrix::new(&data, n, d), k).unwrap();
+                assert_eq!(trained.centroids, expected.centroids);
+                assert_eq!(trained.assignments, expected.assignments);
+            });
+        }
+    });
+}
+
 // ----- Early termination -----
 
 fn make_well_separated_blobs(n: usize, d: usize, n_clusters: usize, seed: u64) -> Vec<f32> {
@@ -403,4 +457,28 @@ fn hierarchical_train_owned_matches_train() {
         "owned path produced a different cluster count"
     );
     assert_centroids_match(&borrowed.centroids, &owned.centroids, 1e-4);
+}
+
+/// Every split of every run goes through the model's one `SuperKMeans`, and
+/// none of them leaves state behind for the next.
+#[test]
+fn one_hierarchical_model_trains_many_datasets() {
+    use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig};
+
+    let d = 32;
+    let first = make_blobs(4_000, d, 40, false, 1.0, 10.0, 42);
+    let second = make_blobs(6_000, d, 80, false, 1.0, 10.0, 7);
+    let cfg = HierarchicalSuperKMeansConfig {
+        target_leaf_size: 50,
+        ..Default::default()
+    };
+    let kmeans = HierarchicalSuperKMeans::with_config(d, cfg.clone());
+
+    for (data, n) in [(&first, 4_000), (&second, 6_000), (&first, 4_000)] {
+        let reused = kmeans.train(&mut Matrix::new(data, n, d));
+        let fresh = HierarchicalSuperKMeans::with_config(d, cfg.clone())
+            .train(&mut Matrix::new(data, n, d));
+        assert_eq!(reused.centroids, fresh.centroids);
+        assert_eq!(reused.cluster_sizes, fresh.cluster_sizes);
+    }
 }
