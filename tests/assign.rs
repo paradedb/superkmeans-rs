@@ -52,8 +52,11 @@ fn each_point_assigned_to_nearest_centroid() {
         unrotate_centroids: true,
         ..Default::default()
     };
-    let mut kmeans = SuperKMeans::with_config(n_clusters, d, cfg);
-    let centroids = kmeans.train(&mut Matrix::new(&data, n, d)).unwrap();
+    let kmeans = SuperKMeans::with_config(d, cfg);
+    let centroids = kmeans
+        .train(&mut Matrix::new(&data, n, d), n_clusters)
+        .unwrap()
+        .centroids;
     let assignments = kmeans.assign(
         Matrix::new(&data, n, d),
         Matrix::new(&centroids, n_clusters, d),
@@ -96,8 +99,11 @@ fn each_point_assigned_to_nearest_centroid_high_dim() {
         unrotate_centroids: true,
         ..Default::default()
     };
-    let mut kmeans = SuperKMeans::with_config(n_clusters, d, cfg);
-    let centroids = kmeans.train(&mut Matrix::new(&data, n, d)).unwrap();
+    let kmeans = SuperKMeans::with_config(d, cfg);
+    let centroids = kmeans
+        .train(&mut Matrix::new(&data, n, d), n_clusters)
+        .unwrap()
+        .centroids;
     let assignments = kmeans.assign(
         Matrix::new(&data, n, d),
         Matrix::new(&centroids, n_clusters, d),
@@ -138,16 +144,15 @@ fn use_train_state_matches_brute_force() {
         unrotate_centroids: true,
         ..Default::default()
     };
-    let mut kmeans = SuperKMeans::with_config(n_clusters, d, cfg);
-    let centroids = kmeans.train(&mut Matrix::new(&data, n, d)).unwrap();
+    let kmeans = SuperKMeans::with_config(d, cfg);
+    let trained = kmeans
+        .train(&mut Matrix::new(&data, n, d), n_clusters)
+        .unwrap();
 
-    let fast = kmeans.assign_training_points(
-        Matrix::new(&data, n, d),
-        Matrix::new(&centroids, n_clusters, d),
-    );
+    let fast = kmeans.assign_training_points(Matrix::new(&data, n, d), &trained);
     let brute = kmeans.assign(
         Matrix::new(&data, n, d),
-        Matrix::new(&centroids, n_clusters, d),
+        Matrix::new(&trained.centroids, n_clusters, d),
     );
     assert_eq!(fast.len(), n);
     assert_eq!(brute.len(), n);
@@ -176,19 +181,18 @@ fn use_train_state_matches_brute_force_on_a_caller_side_sample() {
         unrotate_centroids: true,
         ..Default::default()
     };
-    let mut kmeans = SuperKMeans::with_config(n_clusters, d, cfg);
+    let kmeans = SuperKMeans::with_config(d, cfg);
 
     let sampled = n / 2;
     let sample = &data[..sampled * d];
-    let centroids = kmeans.train(&mut Matrix::new(sample, sampled, d)).unwrap();
+    let trained = kmeans
+        .train(&mut Matrix::new(sample, sampled, d), n_clusters)
+        .unwrap();
 
-    let fast = kmeans.assign_training_points(
-        Matrix::new(sample, sampled, d),
-        Matrix::new(&centroids, n_clusters, d),
-    );
+    let fast = kmeans.assign_training_points(Matrix::new(sample, sampled, d), &trained);
     let brute = kmeans.assign(
         Matrix::new(sample, sampled, d),
-        Matrix::new(&centroids, n_clusters, d),
+        Matrix::new(&trained.centroids, n_clusters, d),
     );
     assert_eq!(fast.len(), sampled);
     assert_eq!(brute.len(), sampled);
@@ -216,16 +220,15 @@ fn use_train_state_matches_brute_force_full() {
         unrotate_centroids: true,
         ..Default::default()
     };
-    let mut kmeans = SuperKMeans::with_config(n_clusters, d, cfg);
-    let centroids = kmeans.train(&mut Matrix::new(&data, n, d)).unwrap();
+    let kmeans = SuperKMeans::with_config(d, cfg);
+    let trained = kmeans
+        .train(&mut Matrix::new(&data, n, d), n_clusters)
+        .unwrap();
 
-    let fast = kmeans.assign_training_points(
-        Matrix::new(&data, n, d),
-        Matrix::new(&centroids, n_clusters, d),
-    );
+    let fast = kmeans.assign_training_points(Matrix::new(&data, n, d), &trained);
     let brute = kmeans.assign(
         Matrix::new(&data, n, d),
-        Matrix::new(&centroids, n_clusters, d),
+        Matrix::new(&trained.centroids, n_clusters, d),
     );
 
     let matches = fast.iter().zip(&brute).filter(|(a, b)| a == b).count();
@@ -250,8 +253,11 @@ fn all_clusters_non_empty() {
         unrotate_centroids: true,
         ..Default::default()
     };
-    let mut kmeans = SuperKMeans::with_config(n_clusters, d, cfg);
-    let centroids = kmeans.train(&mut Matrix::new(&data, n, d)).unwrap();
+    let kmeans = SuperKMeans::with_config(d, cfg);
+    let centroids = kmeans
+        .train(&mut Matrix::new(&data, n, d), n_clusters)
+        .unwrap()
+        .centroids;
     let assignments = kmeans.assign(
         Matrix::new(&data, n, d),
         Matrix::new(&centroids, n_clusters, d),
@@ -504,7 +510,7 @@ fn soar_secondaries_minimize_the_objective() {
     let (n, d, k) = (3_000, 24, 200);
     let data = make_blobs(n, d, k, false, 1.0, 10.0, 5);
     let centroids = generate_random_vectors(k, d, -10.0, 10.0, 9);
-    let kmeans = SuperKMeans::new(k, d);
+    let kmeans = SuperKMeans::new(d);
     for lambda in [0.0_f32, 2.0] {
         let (primary, secondary) = kmeans.assign_soar(
             Matrix::new(&data, n, d),

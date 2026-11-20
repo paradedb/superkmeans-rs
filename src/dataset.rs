@@ -12,6 +12,15 @@ pub enum Contiguous<'a> {
     Owned(&'a mut Vectors),
 }
 
+impl Contiguous<'_> {
+    pub fn as_matrix(&self) -> Matrix<'_> {
+        match self {
+            Self::Borrowed(matrix) => *matrix,
+            Self::Owned(vectors) => vectors.as_matrix(),
+        }
+    }
+}
+
 /// A sequential scan of row-major [`Matrix`] batches that can be replayed.
 ///
 /// Streaming training walks the data once to pick the starting centroids and
