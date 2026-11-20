@@ -31,10 +31,10 @@ use superkmeans::{Matrix, SuperKMeans, make_blobs};
 let (n, d, k) = (10_000, 128, 100);
 let data = make_blobs(n, d, k, true, 1.0, 10.0, 42);
 
-let mut kmeans = SuperKMeans::new(k, d);
-let centroids = kmeans.train(&mut Matrix::new(&data, n, d)).unwrap();
-let assignments = kmeans.assign(Matrix::new(&data, n, d), Matrix::new(&centroids, k, d));
-assert_eq!(assignments.len(), n);
+let kmeans = SuperKMeans::new(d);
+let trained = kmeans.train(&mut Matrix::new(&data, n, d), k).unwrap();
+assert_eq!(trained.centroids.len(), k * d);
+assert_eq!(trained.assignments.len(), n);
 ```
 
 Use [`SuperKMeansConfig`](https://docs.rs/superkmeans-rs/latest/superkmeans/struct.SuperKMeansConfig.html)

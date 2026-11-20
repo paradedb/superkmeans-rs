@@ -115,18 +115,19 @@ fn main() {
     cfg.base.suppress_warnings = true;
 
     println!("training on {n_train} rows (stride {stride}, leaf cap {leaf_size})...");
-    let mut kmeans = HierarchicalSuperKMeans::with_config(d, cfg);
+    let kmeans = HierarchicalSuperKMeans::with_config(d, cfg);
     timer.tic();
     let mut train_set = Vectors::new(train_set, d);
-    let centroids = kmeans.train(&mut train_set);
+    let trained = kmeans.train(&mut train_set);
     timer.toc();
     let build_secs = timer.milliseconds() / 1000.0;
-    let n_lists = kmeans.base.n_clusters;
+    let n_lists = trained.n_clusters();
+    let centroids = &trained.centroids;
     println!("built {n_lists} lists in {build_secs:.2}s");
 
     // Assign the full base set, which is what actually fills the posting lists.
     timer.tic();
-    let assignments = kmeans.assign(Matrix::new(base, n, d), Matrix::new(&centroids, n_lists, d));
+    let assignments = kmeans.assign(Matrix::new(base, n, d), Matrix::new(centroids, n_lists, d));
     timer.toc();
     println!(
         "assigned {n} vectors in {:.2}s",
