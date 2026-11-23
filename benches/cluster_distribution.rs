@@ -214,28 +214,39 @@ fn bench_full_sample_baseline(base: &[f32], n: usize, full_leaf_size: usize) {
             use_aggressive_split: true,
             ..Default::default()
         };
-        let mut skm = SuperKMeans::with_config(target_k, COHERE_D, cfg);
+        let skm = SuperKMeans::with_config(COHERE_D, cfg);
         timer.tic();
-        let centroids = skm
-            .train(&mut Matrix::new(&base[..n * COHERE_D], n, COHERE_D))
+        let trained = skm
+            .train(
+                &mut Matrix::new(&base[..n * COHERE_D], n, COHERE_D),
+                target_k,
+            )
             .unwrap();
         timer.toc();
         let train_ms = timer.milliseconds();
 
-        let train_summary = summarize(&skm.cluster_sizes);
+        let train_summary = summarize(&trained.cluster_sizes);
         let assignments = skm.assign(
             Matrix::new(&base[..n * COHERE_D], n, COHERE_D),
-            Matrix::new(&centroids, target_k, COHERE_D),
+            Matrix::new(&trained.centroids, target_k, COHERE_D),
         );
         let assign_summary = summarize_assignments(&assignments, target_k);
 
         print_baseline_row("flat-train", target_k, &train_summary, train_ms);
         print_baseline_row("flat-assigned", target_k, &assign_summary, train_ms);
-        let empty_revived: usize = skm.iteration_stats.iter().map(|s| s.empty_revived).sum();
-        let small_revived: usize = skm.iteration_stats.iter().map(|s| s.small_revived).sum();
-        let last_split = skm.iteration_stats.last().map_or(0, |s| s.revived());
-        let last_mse = skm.iteration_stats.last().map_or(0.0, |s| s.mse);
-        let per_iter: Vec<String> = skm
+        let empty_revived: usize = trained
+            .iteration_stats
+            .iter()
+            .map(|s| s.empty_revived)
+            .sum();
+        let small_revived: usize = trained
+            .iteration_stats
+            .iter()
+            .map(|s| s.small_revived)
+            .sum();
+        let last_split = trained.iteration_stats.last().map_or(0, |s| s.revived());
+        let last_mse = trained.iteration_stats.last().map_or(0.0, |s| s.mse);
+        let per_iter: Vec<String> = trained
             .iteration_stats
             .iter()
             .map(|s| format!("i{}:{}+{}", s.iteration, s.empty_revived, s.small_revived))
@@ -261,23 +272,23 @@ fn bench_full_sample_baseline(base: &[f32], n: usize, full_leaf_size: usize) {
         };
         cfg.base.angular = true;
         cfg.base.suppress_warnings = true;
-        let mut hskm = HierarchicalSuperKMeans::with_config(COHERE_D, cfg);
+        let hskm = HierarchicalSuperKMeans::with_config(COHERE_D, cfg);
         timer.tic();
-        let centroids = hskm.train(&mut Matrix::new(&base[..n * COHERE_D], n, COHERE_D));
+        let trained = hskm.train(&mut Matrix::new(&base[..n * COHERE_D], n, COHERE_D));
         timer.toc();
         let train_ms = timer.milliseconds();
 
-        let actual_k = hskm.base.n_clusters;
-        let tree_summary = summarize(&hskm.base.cluster_sizes);
+        let actual_k = trained.n_clusters();
+        let tree_summary = summarize(&trained.cluster_sizes);
         let assignments = hskm.assign(
             Matrix::new(&base[..n * COHERE_D], n, COHERE_D),
-            Matrix::new(&centroids, actual_k, COHERE_D),
+            Matrix::new(&trained.centroids, actual_k, COHERE_D),
         );
         let assign_summary = summarize_assignments(&assignments, actual_k);
 
         print_baseline_row("hier-train", actual_k, &tree_summary, train_ms);
         print_baseline_row("hier-assigned", actual_k, &assign_summary, train_ms);
-        let hs = &hskm.iteration_stats;
+        let hs = &trained.iteration_stats;
         let empty_revived: usize = hs.local_runs.iter().map(|s| s.empty_revived).sum();
         let small_revived: usize = hs.local_runs.iter().map(|s| s.small_revived).sum();
         println!(
@@ -342,17 +353,17 @@ fn bench_sample_sweep(base: &[f32], n: usize, full_leaf_size: usize) {
         };
         cfg.base.angular = true;
         cfg.base.suppress_warnings = true;
-        let mut hskm = HierarchicalSuperKMeans::with_config(COHERE_D, cfg);
+        let hskm = HierarchicalSuperKMeans::with_config(COHERE_D, cfg);
         timer.tic();
         let mut sample = Vectors::new(sample, COHERE_D);
-        let centroids = hskm.train(&mut sample);
+        let trained = hskm.train(&mut sample);
         timer.toc();
 
-        let actual_k = hskm.base.n_clusters;
-        let train_summary = summarize(&hskm.base.cluster_sizes);
+        let actual_k = trained.n_clusters();
+        let train_summary = summarize(&trained.cluster_sizes);
         let assignments = hskm.assign(
             Matrix::new(&base[..n * COHERE_D], n, COHERE_D),
-            Matrix::new(&centroids, actual_k, COHERE_D),
+            Matrix::new(&trained.centroids, actual_k, COHERE_D),
         );
         let assign_summary = summarize_assignments(&assignments, actual_k);
 
@@ -486,21 +497,27 @@ fn bench_iterations_sweep(base: &[f32], n: usize, full_leaf_size: usize) {
         cfg.base.early_termination = false;
         cfg.base.suppress_warnings = true;
 
-        let mut hskm = HierarchicalSuperKMeans::with_config(COHERE_D, cfg);
+        let hskm = HierarchicalSuperKMeans::with_config(COHERE_D, cfg);
         timer.tic();
-        let centroids = hskm.train(&mut Matrix::new(&base[..n * COHERE_D], n, COHERE_D));
+        let trained = hskm.train(&mut Matrix::new(&base[..n * COHERE_D], n, COHERE_D));
         timer.toc();
         let train_ms = timer.milliseconds();
 
-        let actual_k = hskm.base.n_clusters;
-        let train_summary = summarize(&hskm.base.cluster_sizes);
+        let actual_k = trained.n_clusters();
+        let train_summary = summarize(&trained.cluster_sizes);
         let assignments = hskm.assign(
             Matrix::new(&base[..n * COHERE_D], n, COHERE_D),
-            Matrix::new(&centroids, actual_k, COHERE_D),
+            Matrix::new(&trained.centroids, actual_k, COHERE_D),
         );
         let assign_summary = summarize_assignments(&assignments, actual_k);
-        let mse = mean_squared_error(&base[..n * COHERE_D], n, COHERE_D, &centroids, &assignments);
-        let revived: usize = hskm
+        let mse = mean_squared_error(
+            &base[..n * COHERE_D],
+            n,
+            COHERE_D,
+            &trained.centroids,
+            &assignments,
+        );
+        let revived: usize = trained
             .iteration_stats
             .local_runs
             .iter()
@@ -540,24 +557,32 @@ fn bench_iterations_sweep(base: &[f32], n: usize, full_leaf_size: usize) {
             use_aggressive_split: true,
             ..Default::default()
         };
-        let mut skm = SuperKMeans::with_config(target_k, COHERE_D, cfg);
+        let skm = SuperKMeans::with_config(COHERE_D, cfg);
         timer.tic();
-        let centroids = skm
-            .train(&mut Matrix::new(&base[..n * COHERE_D], n, COHERE_D))
+        let trained = skm
+            .train(
+                &mut Matrix::new(&base[..n * COHERE_D], n, COHERE_D),
+                target_k,
+            )
             .unwrap();
         timer.toc();
         let train_ms = timer.milliseconds();
 
-        let train_summary = summarize(&skm.cluster_sizes);
+        let train_summary = summarize(&trained.cluster_sizes);
         let assignments = skm.assign(
             Matrix::new(&base[..n * COHERE_D], n, COHERE_D),
-            Matrix::new(&centroids, target_k, COHERE_D),
+            Matrix::new(&trained.centroids, target_k, COHERE_D),
         );
         let assign_summary = summarize_assignments(&assignments, target_k);
-        let train_mse = skm.iteration_stats.last().map_or(0.0, |s| s.mse);
-        let assign_mse =
-            mean_squared_error(&base[..n * COHERE_D], n, COHERE_D, &centroids, &assignments);
-        let revived: usize = skm.iteration_stats.iter().map(|s| s.revived()).sum();
+        let train_mse = trained.iteration_stats.last().map_or(0.0, |s| s.mse);
+        let assign_mse = mean_squared_error(
+            &base[..n * COHERE_D],
+            n,
+            COHERE_D,
+            &trained.centroids,
+            &assignments,
+        );
+        let revived: usize = trained.iteration_stats.iter().map(|s| s.revived()).sum();
         let label = iters.to_string();
 
         print_iter_row(

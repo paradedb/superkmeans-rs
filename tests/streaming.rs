@@ -2,6 +2,8 @@
 //! it through an iterator (or `Dataset`) of `Matrix` batches.
 
 use std::convert::Infallible;
+use std::marker::PhantomData;
+use std::thread::ThreadId;
 
 use superkmeans::{
     Dataset, FineClusters, HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, IterDataset,
@@ -32,11 +34,12 @@ fn leaf_config(target_leaf_size: usize) -> HierarchicalSuperKMeansConfig {
 }
 
 fn nearest_distortion(kmeans: &SuperKMeans, data: &[f32], n: usize, centroids: &[f32]) -> f64 {
+    let d = kmeans.d();
     let assignments = kmeans.assign(
-        Matrix::new(data, n, kmeans.d),
-        Matrix::new(centroids, kmeans.n_clusters, kmeans.d),
+        Matrix::new(data, n, d),
+        Matrix::new(centroids, centroids.len() / d, d),
     );
-    distortion(data, kmeans.d, centroids, &assignments)
+    distortion(data, d, centroids, &assignments)
 }
 
 #[test]
@@ -44,21 +47,20 @@ fn superkmeans_trains_from_an_iterator() {
     let (n, d, k) = (10_000, 32, 40);
     let data = make_blobs(n, d, k, true, 1.0, 10.0, 42);
 
-    let mut streamed = SuperKMeans::new(k, d);
-    let centroids = streamed
-        .train(&mut IterDataset::new(
-            Matrix::new(&data, n, d).chunks(1_000),
-        ))
+    let kmeans = SuperKMeans::new(d);
+    let streamed = kmeans
+        .train(
+            &mut IterDataset::new(Matrix::new(&data, n, d).chunks(1_000)),
+            k,
+        )
         .unwrap();
-    assert!(streamed.trained);
-    assert_eq!(centroids.len(), k * d);
-    assert_eq!(streamed.n_samples, n);
+    assert_eq!(streamed.centroids.len(), k * d);
+    assert_eq!(streamed.assignments.len(), n);
 
-    let mut in_memory = SuperKMeans::new(k, d);
-    let reference = in_memory.train(&mut Matrix::new(&data, n, d)).unwrap();
+    let reference = kmeans.train(&mut Matrix::new(&data, n, d), k).unwrap();
 
-    let streamed_distortion = nearest_distortion(&streamed, &data, n, &centroids);
-    let reference_distortion = nearest_distortion(&in_memory, &data, n, &reference);
+    let streamed_distortion = nearest_distortion(&kmeans, &data, n, &streamed.centroids);
+    let reference_distortion = nearest_distortion(&kmeans, &data, n, &reference.centroids);
     assert!(
         streamed_distortion <= reference_distortion * 1.1,
         "streamed distortion {streamed_distortion} vs in-memory {reference_distortion}"
@@ -72,19 +74,22 @@ fn batch_shape_does_not_change_the_result() {
     let (n, d, k) = (5_000, 16, 20);
     let data = make_blobs(n, d, k, true, 1.0, 10.0, 3);
 
-    let mut by_vector = SuperKMeans::new(k, d);
-    let one_at_a_time = by_vector
-        .train(&mut IterDataset::new(
-            data.chunks_exact(d).map(Matrix::vector),
-        ))
+    let kmeans = SuperKMeans::new(d);
+    let one_at_a_time = kmeans
+        .train(
+            &mut IterDataset::new(data.chunks_exact(d).map(Matrix::vector)),
+            k,
+        )
+        .unwrap();
+    let chunked = kmeans
+        .train(
+            &mut IterDataset::new(Matrix::new(&data, n, d).chunks(777)),
+            k,
+        )
         .unwrap();
 
-    let mut by_chunk = SuperKMeans::new(k, d);
-    let chunked = by_chunk
-        .train(&mut IterDataset::new(Matrix::new(&data, n, d).chunks(777)))
-        .unwrap();
-
-    assert_eq!(one_at_a_time, chunked);
+    assert_eq!(one_at_a_time.centroids, chunked.centroids);
+    assert_eq!(one_at_a_time.assignments, chunked.assignments);
 }
 
 /// d >= 128 and k > 256 turn on the pruning kernels, which seed each pass
@@ -99,22 +104,22 @@ fn streaming_with_pruning_matches_in_memory_quality() {
         ..Default::default()
     };
 
-    let mut streamed = SuperKMeans::with_config(k, d, cfg.clone());
-    let centroids = streamed
-        .train(&mut IterDataset::new(
-            Matrix::new(&data, n, d).chunks(4_096),
-        ))
+    let kmeans = SuperKMeans::with_config(d, cfg);
+    let streamed = kmeans
+        .train(
+            &mut IterDataset::new(Matrix::new(&data, n, d).chunks(4_096)),
+            k,
+        )
         .unwrap();
     assert!(
         streamed.iteration_stats.iter().any(|s| !s.is_gemm_only()),
         "pruning never engaged"
     );
 
-    let mut in_memory = SuperKMeans::with_config(k, d, cfg);
-    let reference = in_memory.train(&mut Matrix::new(&data, n, d)).unwrap();
+    let reference = kmeans.train(&mut Matrix::new(&data, n, d), k).unwrap();
 
-    let streamed_distortion = nearest_distortion(&streamed, &data, n, &centroids);
-    let reference_distortion = nearest_distortion(&in_memory, &data, n, &reference);
+    let streamed_distortion = nearest_distortion(&kmeans, &data, n, &streamed.centroids);
+    let reference_distortion = nearest_distortion(&kmeans, &data, n, &reference.centroids);
     assert!(
         streamed_distortion <= reference_distortion * 1.1,
         "streamed distortion {streamed_distortion} vs in-memory {reference_distortion}"
@@ -127,8 +132,7 @@ fn streaming_with_pruning_matches_in_memory_quality() {
 fn hierarchical_trains_from_an_iterator() {
     let (n, d, target_leaf_size) = (20_000usize, 32usize, 100usize);
     let data = make_blobs(n, d, 40, true, 1.0, 10.0, 7);
-    let cfg = leaf_config(target_leaf_size);
-    let kmeans = HierarchicalSuperKMeans::with_config(d, cfg.clone());
+    let kmeans = HierarchicalSuperKMeans::with_config(d, leaf_config(target_leaf_size));
 
     let meso = kmeans
         .train_meso(
@@ -174,15 +178,14 @@ fn hierarchical_trains_from_an_iterator() {
     assert!(sizes.iter().all(|&s| s > 0 && s <= target_leaf_size));
     assert!(sizes.len() >= n.div_ceil(target_leaf_size));
 
-    let mut in_memory = HierarchicalSuperKMeans::with_config(d, cfg);
-    let reference = in_memory.train(&mut Matrix::new(&data, n, d));
-    let reference_assignments = in_memory.assign(
+    let reference = kmeans.train(&mut Matrix::new(&data, n, d));
+    let reference_assignments = kmeans.assign(
         Matrix::new(&data, n, d),
-        Matrix::new(&reference, in_memory.base.n_clusters, d),
+        Matrix::new(&reference.centroids, reference.n_clusters(), d),
     );
 
     let streamed_distortion = distortion(&data, d, &centroids, &assignments);
-    let reference_distortion = distortion(&data, d, &reference, &reference_assignments);
+    let reference_distortion = distortion(&data, d, &reference.centroids, &reference_assignments);
     assert!(
         streamed_distortion <= reference_distortion * 1.1,
         "streamed distortion {streamed_distortion} vs in-memory {reference_distortion}"
@@ -252,6 +255,51 @@ fn a_sample_that_fits_one_leaf_needs_no_meso_pass() {
     assert_eq!(fine.members(0).len(), n);
 }
 
+/// A scan that cannot leave its thread, and records the thread of each pass.
+struct Pinned<'a> {
+    data: Matrix<'a>,
+    passes: Vec<ThreadId>,
+    not_send: PhantomData<*const ()>,
+}
+
+impl Dataset for Pinned<'_> {
+    type Error = Infallible;
+
+    fn for_each_batch(&mut self, f: &mut dyn FnMut(Matrix<'_>)) -> Result<(), Infallible> {
+        self.passes.push(std::thread::current().id());
+        for chunk in self.data.chunks(512) {
+            f(chunk);
+        }
+        Ok(())
+    }
+}
+
+/// Training computes on the model's pool, but the scan itself stays with
+/// the caller, so a dataset tied to its thread still trains.
+#[test]
+fn scans_run_on_the_calling_thread() {
+    let (n, d) = (4_000usize, 16usize);
+    let data = make_blobs(n, d, 10, true, 1.0, 10.0, 9);
+    let scan = || Pinned {
+        data: Matrix::new(&data, n, d),
+        passes: Vec::new(),
+        not_send: PhantomData,
+    };
+    let here = std::thread::current().id();
+
+    let mut flat = scan();
+    SuperKMeans::new(d).train(&mut flat, 10).unwrap();
+    assert!(!flat.passes.is_empty());
+    assert!(flat.passes.iter().all(|&thread| thread == here));
+
+    let mut meso = scan();
+    HierarchicalSuperKMeans::with_config(d, leaf_config(50))
+        .train_meso(&mut meso, n)
+        .unwrap();
+    assert!(!meso.passes.is_empty());
+    assert!(meso.passes.iter().all(|&thread| thread == here));
+}
+
 /// A scan that fails partway through its second pass.
 struct FailsOnSecondPass<'a> {
     data: Matrix<'a>,
@@ -282,9 +330,10 @@ fn scan_errors_come_back_out_of_training() {
         data: Matrix::new(&data, n, d),
         passes: 0,
     };
-    let mut kmeans = SuperKMeans::new(10, d);
-    assert_eq!(kmeans.train(&mut scan), Err("read failed".to_string()));
-    assert!(!kmeans.trained);
+    let kmeans = SuperKMeans::new(d);
+    assert_eq!(kmeans.train(&mut scan, 10).unwrap_err(), "read failed");
+    // A failed run leaves nothing behind.
+    assert!(kmeans.train(&mut Matrix::new(&data, n, d), 10).is_ok());
 
     let hierarchical = HierarchicalSuperKMeans::with_config(d, leaf_config(50));
     scan.passes = 0;

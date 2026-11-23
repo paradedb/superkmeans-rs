@@ -39,19 +39,22 @@ fn main() -> ExitCode {
 
     let mut cfg = SuperKMeansConfig::default();
     cfg.verbose = env::var("SUPERKMEANS_VERBOSE").is_ok();
-    let mut kmeans = SuperKMeans::with_config(k, d, cfg);
+    let kmeans = SuperKMeans::with_config(d, cfg);
 
     println!("Running SuperKMeans with {} clusters...", k);
     let mut timer = TicToc::new();
     timer.tic();
-    let centroids = kmeans.train(&mut Matrix::new(&data, n, d)).unwrap();
+    let trained = kmeans.train(&mut Matrix::new(&data, n, d), k).unwrap();
     timer.toc();
     let construction_time_ms = timer.milliseconds();
     println!("Index built in: {} ms", construction_time_ms);
 
     timer.reset();
     timer.tic();
-    let assignments = kmeans.assign(Matrix::new(&data, n, d), Matrix::new(&centroids, k, d));
+    let assignments = kmeans.assign(
+        Matrix::new(&data, n, d),
+        Matrix::new(&trained.centroids, k, d),
+    );
     timer.toc();
     let assignment_time_ms = timer.milliseconds();
     println!("Assignment time: {} ms", assignment_time_ms);

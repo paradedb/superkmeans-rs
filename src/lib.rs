@@ -43,12 +43,12 @@ pub use common::{DistanceFunction, KnnCandidate};
 pub use dataset::{Contiguous, Dataset, IterDataset};
 pub use hierarchical::{
     FineClusters, HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig,
-    HierarchicalSuperKMeansIterationStats, MesoPartition,
+    HierarchicalSuperKMeansIterationStats, HierarchicalSuperKMeansResult, MesoPartition,
 };
 pub use matrix::{Matrix, MatrixChunks, Vectors};
 pub use superkmeans::{
     ClusterBalanceStats, PruningStats, SoarAssigner, SuperKMeans, SuperKMeansConfig,
-    SuperKMeansIterationStats, assign, assign_soar, assign_soar_replicas,
+    SuperKMeansIterationStats, SuperKMeansResult, assign, assign_soar, assign_soar_replicas,
 };
 pub use utils::{
     TicToc, centroid_shift, compute_l2_squared, find_nearest_neighbor_brute_force,

@@ -71,11 +71,11 @@ fn bench_train(c: &mut Criterion) {
         BenchmarkId::new("SuperKMeans", format!("n{N}_k{K}_d{D}")),
         |b| {
             b.iter(|| {
-                let mut kmeans = SuperKMeans::new(K, D);
-                let centroids = kmeans
-                    .train(&mut Matrix::new(black_box(data), N, D))
+                let kmeans = SuperKMeans::new(D);
+                let trained = kmeans
+                    .train(&mut Matrix::new(black_box(data), N, D), K)
                     .unwrap();
-                black_box(centroids);
+                black_box(trained);
             });
         },
     );
@@ -91,9 +91,9 @@ fn bench_train(c: &mut Criterion) {
                     target_leaf_size: HIER_TARGET_LEAF_SIZE,
                     ..Default::default()
                 };
-                let mut kmeans = HierarchicalSuperKMeans::with_config(D, cfg);
-                let centroids = kmeans.train(&mut Matrix::new(black_box(data), N, D));
-                black_box(centroids);
+                let kmeans = HierarchicalSuperKMeans::with_config(D, cfg);
+                let trained = kmeans.train(&mut Matrix::new(black_box(data), N, D));
+                black_box(trained);
             });
         },
     );
@@ -106,17 +106,21 @@ fn bench_assign(c: &mut Criterion) {
 
     // Train once outside the timed loop; assign is what we measure.
     let flat_centroids = {
-        let mut kmeans = SuperKMeans::new(K, D);
-        kmeans.train(&mut Matrix::new(data, N, D)).unwrap()
+        let kmeans = SuperKMeans::new(D);
+        kmeans
+            .train(&mut Matrix::new(data, N, D), K)
+            .unwrap()
+            .centroids
     };
     let (hier_centroids, hier_k) = {
         let cfg = HierarchicalSuperKMeansConfig {
             target_leaf_size: HIER_TARGET_LEAF_SIZE,
             ..Default::default()
         };
-        let mut kmeans = HierarchicalSuperKMeans::with_config(D, cfg);
-        let centroids = kmeans.train(&mut Matrix::new(data, N, D));
-        (centroids, kmeans.base.n_clusters)
+        let kmeans = HierarchicalSuperKMeans::with_config(D, cfg);
+        let trained = kmeans.train(&mut Matrix::new(data, N, D));
+        let k = trained.n_clusters();
+        (trained.centroids, k)
     };
 
     let mut group = c.benchmark_group("assign");
@@ -126,8 +130,8 @@ fn bench_assign(c: &mut Criterion) {
     group.bench_function(
         BenchmarkId::new("SuperKMeans", format!("n{N}_k{K}_d{D}")),
         |b| {
+            let kmeans = SuperKMeans::new(D);
             b.iter(|| {
-                let kmeans = SuperKMeans::new(K, D);
                 let assignments = kmeans.assign(
                     Matrix::new(black_box(data), N, D),
                     Matrix::new(black_box(&flat_centroids), K, D),
@@ -143,8 +147,8 @@ fn bench_assign(c: &mut Criterion) {
             format!("n{N}_leaf{HIER_TARGET_LEAF_SIZE}_d{D}"),
         ),
         |b| {
+            let kmeans = HierarchicalSuperKMeans::new(D);
             b.iter(|| {
-                let kmeans = HierarchicalSuperKMeans::new(D);
                 let assignments = kmeans.assign(
                     Matrix::new(black_box(data), N, D),
                     Matrix::new(black_box(&hier_centroids), hier_k, D),

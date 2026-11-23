@@ -51,23 +51,24 @@ fn main() -> ExitCode {
         ..Default::default()
     };
     cfg.base.verbose = env::var("SUPERKMEANS_VERBOSE").is_ok();
-    let mut kmeans = HierarchicalSuperKMeans::with_config(d, cfg);
+    let kmeans = HierarchicalSuperKMeans::with_config(d, cfg);
 
     println!("Running HierarchicalSuperKMeans...");
     let mut timer = TicToc::new();
     timer.tic();
-    let centroids = kmeans.train(&mut Matrix::new(&data, n, d));
+    let trained = kmeans.train(&mut Matrix::new(&data, n, d));
     timer.toc();
     println!("Index built in: {} ms", timer.milliseconds());
-    println!("Clusters: {}", kmeans.base.n_clusters);
+    let n_clusters = trained.n_clusters();
+    println!("Clusters: {n_clusters}");
 
     let assignments = kmeans.assign(
         Matrix::new(&data, n, d),
-        Matrix::new(&centroids, kmeans.base.n_clusters, d),
+        Matrix::new(&trained.centroids, n_clusters, d),
     );
     println!("Got {} assignments", assignments.len());
 
-    let stats = SuperKMeans::cluster_balance_stats(&assignments, n, kmeans.base.n_clusters);
+    let stats = SuperKMeans::cluster_balance_stats(&assignments, n, n_clusters);
     println!(
         "Cluster balance: mean={:.1} min={} max={} cv={:.3}",
         stats.mean, stats.min, stats.max, stats.cv
