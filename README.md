@@ -38,8 +38,10 @@ assert_eq!(trained.assignments.len(), n);
 ```
 
 Use [`SuperKMeansConfig`](https://docs.rs/superkmeans-rs/latest/superkmeans/struct.SuperKMeansConfig.html)
-to set iterations, seed, and pruning parameters. Set `RAYON_NUM_THREADS` to
-control parallelism, or run training in your own Rayon thread pool.
+to set iterations, seed, and pruning parameters. Each model owns a thread pool
+of `n_threads` threads and runs all of its work there. The default of `0` sizes
+the pool from `RAYON_NUM_THREADS`, or one thread per logical CPU. Free functions
+such as `assign` run on the caller's Rayon pool instead.
 
 `train` takes a [`Dataset`](https://docs.rs/superkmeans-rs/latest/superkmeans/trait.Dataset.html).
 A [`Matrix`](https://docs.rs/superkmeans-rs/latest/superkmeans/struct.Matrix.html) or

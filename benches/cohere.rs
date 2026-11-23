@@ -130,8 +130,8 @@ fn bench_assign(c: &mut Criterion) {
     group.bench_function(
         BenchmarkId::new("SuperKMeans", format!("n{N}_k{K}_d{D}")),
         |b| {
+            let kmeans = SuperKMeans::new(D);
             b.iter(|| {
-                let kmeans = SuperKMeans::new(D);
                 let assignments = kmeans.assign(
                     Matrix::new(black_box(data), N, D),
                     Matrix::new(black_box(&flat_centroids), K, D),
@@ -147,8 +147,8 @@ fn bench_assign(c: &mut Criterion) {
             format!("n{N}_leaf{HIER_TARGET_LEAF_SIZE}_d{D}"),
         ),
         |b| {
+            let kmeans = HierarchicalSuperKMeans::new(D);
             b.iter(|| {
-                let kmeans = HierarchicalSuperKMeans::new(D);
                 let assignments = kmeans.assign(
                     Matrix::new(black_box(data), N, D),
                     Matrix::new(black_box(&hier_centroids), hier_k, D),

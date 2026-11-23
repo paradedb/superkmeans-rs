@@ -2,6 +2,8 @@
 //! it through an iterator (or `Dataset`) of `Matrix` batches.
 
 use std::convert::Infallible;
+use std::marker::PhantomData;
+use std::thread::ThreadId;
 
 use superkmeans::{
     Dataset, FineClusters, HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, IterDataset,
@@ -251,6 +253,51 @@ fn a_sample_that_fits_one_leaf_needs_no_meso_pass() {
     let fine = kmeans.train_meso_cluster(&mut Matrix::new(&data, n, d));
     assert_eq!(fine.n_fine(), 1);
     assert_eq!(fine.members(0).len(), n);
+}
+
+/// A scan that cannot leave its thread, and records the thread of each pass.
+struct Pinned<'a> {
+    data: Matrix<'a>,
+    passes: Vec<ThreadId>,
+    not_send: PhantomData<*const ()>,
+}
+
+impl Dataset for Pinned<'_> {
+    type Error = Infallible;
+
+    fn for_each_batch(&mut self, f: &mut dyn FnMut(Matrix<'_>)) -> Result<(), Infallible> {
+        self.passes.push(std::thread::current().id());
+        for chunk in self.data.chunks(512) {
+            f(chunk);
+        }
+        Ok(())
+    }
+}
+
+/// Training computes on the model's pool, but the scan itself stays with
+/// the caller, so a dataset tied to its thread still trains.
+#[test]
+fn scans_run_on_the_calling_thread() {
+    let (n, d) = (4_000usize, 16usize);
+    let data = make_blobs(n, d, 10, true, 1.0, 10.0, 9);
+    let scan = || Pinned {
+        data: Matrix::new(&data, n, d),
+        passes: Vec::new(),
+        not_send: PhantomData,
+    };
+    let here = std::thread::current().id();
+
+    let mut flat = scan();
+    SuperKMeans::new(d).train(&mut flat, 10).unwrap();
+    assert!(!flat.passes.is_empty());
+    assert!(flat.passes.iter().all(|&thread| thread == here));
+
+    let mut meso = scan();
+    HierarchicalSuperKMeans::with_config(d, leaf_config(50))
+        .train_meso(&mut meso, n)
+        .unwrap();
+    assert!(!meso.passes.is_empty());
+    assert!(meso.passes.iter().all(|&thread| thread == here));
 }
 
 /// A scan that fails partway through its second pass.

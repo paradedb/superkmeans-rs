@@ -249,12 +249,12 @@ impl HierarchicalSuperKMeans {
         })
     }
 
-    /// Run `body` over the block's rows in the pruning domain, with their
-    /// norms and input positions.
-    fn with_rows<R>(
+    /// Run `body` on the model's thread pool, over the block's rows in the
+    /// pruning domain, with their norms and input positions.
+    fn with_rows<R: Send>(
         &self,
         block: Contiguous<'_>,
-        body: impl FnOnce(&mut Subset<'_>, &mut PartitionScratch) -> R,
+        body: impl FnOnce(&mut Subset<'_>, &mut PartitionScratch) -> R + Send,
     ) -> R {
         let d = self.skm.d();
         let n = block.as_matrix().n();
@@ -262,15 +262,17 @@ impl HierarchicalSuperKMeans {
         assert!(n > 0, "n must be positive");
         assert!(u32::try_from(n).is_ok(), "n must fit in u32");
 
-        self.skm.with_rotated(block, |data| {
-            let mut norms = squared_norms(data, n, d);
-            let mut ids: Vec<u32> = (0..n as u32).collect();
-            let mut rows = Subset {
-                data,
-                norms: &mut norms,
-                ids: &mut ids,
-            };
-            body(&mut rows, &mut PartitionScratch::new(n, d))
+        self.skm.install(|| {
+            self.skm.with_rotated(block, |data| {
+                let mut norms = squared_norms(data, n, d);
+                let mut ids: Vec<u32> = (0..n as u32).collect();
+                let mut rows = Subset {
+                    data,
+                    norms: &mut norms,
+                    ids: &mut ids,
+                };
+                body(&mut rows, &mut PartitionScratch::new(n, d))
+            })
         })
     }
 
@@ -789,6 +791,14 @@ mod tests {
     ) -> HierarchicalSuperKMeansResult {
         let data = make_blobs(n, d, 8, true, 1.0, 5.0, 42);
         HierarchicalSuperKMeans::with_config(d, cfg).train(&mut Matrix::new(&data, n, d))
+    }
+
+    #[test]
+    fn the_base_config_sizes_the_pool() {
+        let mut cfg = config(50);
+        cfg.base.n_threads = 3;
+        let kmeans = HierarchicalSuperKMeans::with_config(8, cfg);
+        assert_eq!(kmeans.skm.install(rayon::current_num_threads), 3);
     }
 
     #[test]

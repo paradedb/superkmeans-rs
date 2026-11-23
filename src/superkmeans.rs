@@ -25,6 +25,12 @@ use crate::utils::{
 #[derive(Clone, Debug)]
 pub struct SuperKMeansConfig {
     pub iters: u32,
+    /// Size of the thread pool each model owns. Every [`SuperKMeans`] and
+    /// [`HierarchicalSuperKMeans`](crate::HierarchicalSuperKMeans) method runs
+    /// its parallel work there, so a model never uses more threads than this.
+    ///
+    /// `0` takes Rayon's default: `RAYON_NUM_THREADS`, or one thread per
+    /// logical CPU.
     pub n_threads: u32,
     pub seed: u64,
     pub use_blas_only: bool,
@@ -138,9 +144,14 @@ pub struct ClusterBalanceStats {
 /// rotation, an O(d³) QR on first use, and the pruning layout. Training takes
 /// `&self` and returns a [`SuperKMeansResult`], so one model clusters any
 /// number of datasets and cluster counts, from several threads at once.
+///
+/// The model also owns a thread pool of [`SuperKMeansConfig::n_threads`]
+/// threads. Its methods run their parallel work there and nowhere else, so
+/// concurrent callers share that many threads between them.
 pub struct SuperKMeans {
     d: usize,
     config: SuperKMeansConfig,
+    pool: rayon::ThreadPool,
     pruner: ADSamplingPruner,
     vertical_d: usize,
     horizontal_d: usize,
@@ -373,7 +384,8 @@ impl SuperKMeans {
 
     /// # Panics
     ///
-    /// Panics if `dimensionality` or [`SuperKMeansConfig::iters`] is zero.
+    /// Panics if `dimensionality` or [`SuperKMeansConfig::iters`] is zero, or
+    /// the thread pool cannot start.
     pub fn with_config(dimensionality: usize, config: SuperKMeansConfig) -> Self {
         Self::with_pruning_threshold(dimensionality, config, PRUNER_INITIAL_THRESHOLD)
     }
@@ -391,8 +403,13 @@ impl SuperKMeans {
             config.unrotate_centroids = false;
         }
         let split = layout::get_dimension_split(dimensionality);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(config.n_threads as usize)
+            .build()
+            .expect("failed to start the SuperKMeans thread pool");
         Self {
             d: dimensionality,
+            pool,
             pruner: ADSamplingPruner::new(dimensionality, threshold, config.seed),
             config,
             vertical_d: split.vertical_d,
@@ -415,7 +432,8 @@ impl SuperKMeans {
     ///
     /// A [`Matrix`] or [`Vectors`](crate::Vectors) is trained in memory, and an
     /// owned [`Vectors`](crate::Vectors) is rotated in place. Any other
-    /// [`Dataset`] is streamed on the calling thread.
+    /// [`Dataset`] is scanned on the calling thread, and each batch it yields
+    /// is clustered on the model's pool.
     ///
     /// ```
     /// use superkmeans::{IterDataset, Matrix, SuperKMeans, make_blobs};
@@ -451,20 +469,31 @@ impl SuperKMeans {
     ) -> Result<SuperKMeansResult, D::Error> {
         assert!(n_clusters > 0, "n_clusters must be positive");
         let run = match data.contiguous() {
-            Some(block) => self.train_block(block, n_clusters),
+            Some(block) => self.install(|| self.train_block(block, n_clusters)),
             None => self.train_stream(data, n_clusters, self.config.iters, self.rotates())?,
         };
-        let rotated_centroids = self
-            .config
-            .unrotate_centroids
-            .then(|| run.horizontal_centroids.clone());
-        Ok(SuperKMeansResult {
-            centroids: self.output_centroids(run.horizontal_centroids),
-            assignments: run.assignments,
-            cluster_sizes: run.cluster_sizes,
-            iteration_stats: run.stats,
-            rotated_centroids,
-        })
+        Ok(self.install(|| {
+            let rotated_centroids = self
+                .config
+                .unrotate_centroids
+                .then(|| run.horizontal_centroids.clone());
+            SuperKMeansResult {
+                centroids: self.output_centroids(run.horizontal_centroids),
+                assignments: run.assignments,
+                cluster_sizes: run.cluster_sizes,
+                iteration_stats: run.stats,
+                rotated_centroids,
+            }
+        }))
+    }
+
+    /// Run `op` on the model's thread pool.
+    ///
+    /// The public methods wrap their work in this. The crate-private ones
+    /// expect their caller to, except [`Self::train_stream`]: a scan has to
+    /// stay on the caller's thread, so it moves only the work on each batch.
+    pub(crate) fn install<R: Send>(&self, op: impl FnOnce() -> R + Send) -> R {
+        self.pool.install(op)
     }
 
     /// Lloyd over one contiguous block, seeded with a Forgy sample of its rows.
@@ -516,7 +545,7 @@ impl SuperKMeans {
     ) -> Result<Run<'_>, D::Error> {
         let (n, sample) = self.reservoir_sample(data, k)?;
         expect_enough_rows(n, k);
-        let seeds = self.to_pruning_domain(&sample, k, rotate);
+        let seeds = self.install(|| self.to_pruning_domain(&sample, k, rotate));
         let mut run = Run::new(self, k, n, iters, seeds);
         run.fit_stream(data, rotate)?;
         Ok(run)
@@ -649,7 +678,7 @@ impl SuperKMeans {
             centroids.d(),
             self.d
         );
-        assign(vectors, centroids)
+        self.install(|| assign(vectors, centroids))
     }
 
     /// Brute-force assignment to the nearest centroid and a SOAR secondary, as
@@ -671,7 +700,7 @@ impl SuperKMeans {
             self.d,
             "centroids dimensionality does not match"
         );
-        assign_soar(vectors, centroids, lambda)
+        self.install(|| assign_soar(vectors, centroids, lambda))
     }
 
     /// Re-assign the training set to its nearest centroid using the pruning path.
@@ -706,49 +735,51 @@ impl SuperKMeans {
         );
         let n_centroids = trained.cluster_sizes.len();
 
-        if !self.can_prune(n_centroids) {
-            if !self.config.suppress_warnings {
-                eprintln!(
-                    "WARNING: AssignTrainingPoints cannot use pruning, falling back to brute force"
-                );
+        self.install(|| {
+            if !self.can_prune(n_centroids) {
+                if !self.config.suppress_warnings {
+                    eprintln!(
+                        "WARNING: AssignTrainingPoints cannot use pruning, falling back to brute force"
+                    );
+                }
+                return assign(vectors, Matrix::new(&trained.centroids, n_centroids, d));
             }
-            return assign(vectors, Matrix::new(&trained.centroids, n_centroids, d));
-        }
 
-        let partial_d = self.initial_partial_d() as usize;
-        let rotated;
-        let data = if self.rotates() {
-            rotated = self.to_pruning_domain(vectors.as_slice(), n_vectors, true);
-            &rotated
-        } else {
-            vectors.as_slice()
-        };
-        let centroids = trained.rotated_centroids();
-        let centroid_partial_norms = squared_norms_partial(centroids, n_centroids, d, partial_d);
-        let data_partial_norms = squared_norms_partial(data, n_vectors, d, partial_d);
+            let partial_d = self.initial_partial_d() as usize;
+            let rotated;
+            let data = if self.rotates() {
+                rotated = self.to_pruning_domain(vectors.as_slice(), n_vectors, true);
+                &rotated
+            } else {
+                vectors.as_slice()
+            };
+            let centroids = trained.rotated_centroids();
+            let centroid_partial_norms = squared_norms_partial(centroids, n_centroids, d, partial_d);
+            let data_partial_norms = squared_norms_partial(data, n_vectors, d, partial_d);
 
-        // Training row i is input row i, so the trained assignments seed directly.
-        let mut result_assignments = trained.assignments.clone();
-        let mut result_distances = vec![0.0_f32; n_vectors];
-        batch::find_nearest_neighbor_with_pruning(
-            data,
-            centroids,
-            n_vectors,
-            n_centroids,
-            d,
-            self.vertical_d,
-            self.horizontal_d,
-            &data_partial_norms,
-            &centroid_partial_norms,
-            &mut result_assignments,
-            &mut result_distances,
-            &self.pruner,
-            partial_d,
-            &mut vec![0_usize; n_vectors],
-            &mut Vec::new(),
-        );
+            // Training row i is input row i, so the trained assignments seed directly.
+            let mut result_assignments = trained.assignments.clone();
+            let mut result_distances = vec![0.0_f32; n_vectors];
+            batch::find_nearest_neighbor_with_pruning(
+                data,
+                centroids,
+                n_vectors,
+                n_centroids,
+                d,
+                self.vertical_d,
+                self.horizontal_d,
+                &data_partial_norms,
+                &centroid_partial_norms,
+                &mut result_assignments,
+                &mut result_distances,
+                &self.pruner,
+                partial_d,
+                &mut vec![0_usize; n_vectors],
+                &mut Vec::new(),
+            );
 
-        result_assignments
+            result_assignments
+        })
     }
 
     /// Cluster-balance summary stats over the assignments.
@@ -962,11 +993,13 @@ impl<'a> Run<'a> {
         }
         self.horizontal_centroids.fill(0.0);
         self.cluster_sizes.fill(0);
-        self.centroid_norms = if gemm_only {
-            squared_norms(&self.prev_centroids, n_clusters, d)
-        } else {
-            squared_norms_partial(&self.prev_centroids, n_clusters, d, partial_d)
-        };
+        self.centroid_norms = skm.install(|| {
+            if gemm_only {
+                squared_norms(&self.prev_centroids, n_clusters, d)
+            } else {
+                squared_norms_partial(&self.prev_centroids, n_clusters, d, partial_d)
+            }
+        });
 
         let mut offset = 0usize;
         let mut sse = 0.0_f64;
@@ -988,62 +1021,64 @@ impl<'a> Run<'a> {
             } = scratch;
 
             dataset::visit_work_batches(data, d, X_BATCH_SIZE, coalesce, |batch| {
-                let n = batch.n();
-                assert!(
-                    offset + n <= n_samples,
-                    "dataset yielded more rows than on its first pass ({n_samples})"
-                );
-                let x: &[f32] = if rotate {
-                    rotated.resize(n * d, 0.0);
-                    pruner.rotate(batch.as_slice(), rotated, n);
-                    &rotated[..]
-                } else {
-                    batch.as_slice()
-                };
-                let knn = &mut assignments[offset..offset + n];
-                distances.resize(n, 0.0);
-
-                if gemm_only {
-                    let norms = squared_norms(x, n, d);
-                    batch::find_nearest_neighbor(
-                        x,
-                        prev_centroids,
-                        n,
-                        n_clusters,
-                        d,
-                        &norms,
-                        centroid_norms,
-                        knn,
-                        distances,
-                        gemm_buf,
+                skm.install(|| {
+                    let n = batch.n();
+                    assert!(
+                        offset + n <= n_samples,
+                        "dataset yielded more rows than on its first pass ({n_samples})"
                     );
-                } else {
-                    let norms = squared_norms_partial(x, n, d, partial_d);
-                    not_pruned_counts.clear();
-                    not_pruned_counts.resize(n, 0);
-                    batch::find_nearest_neighbor_with_pruning(
-                        x,
-                        prev_centroids,
-                        n,
-                        n_clusters,
-                        d,
-                        vertical_d,
-                        horizontal_d,
-                        &norms,
-                        centroid_norms,
-                        knn,
-                        distances,
-                        pruner,
-                        partial_d,
-                        not_pruned_counts,
-                        gemm_buf,
-                    );
-                    not_pruned += not_pruned_counts.iter().map(|&v| v as f64).sum::<f64>();
-                }
+                    let x: &[f32] = if rotate {
+                        rotated.resize(n * d, 0.0);
+                        pruner.rotate(batch.as_slice(), rotated, n);
+                        &rotated[..]
+                    } else {
+                        batch.as_slice()
+                    };
+                    let knn = &mut assignments[offset..offset + n];
+                    distances.resize(n, 0.0);
 
-                sse += distances.iter().map(|&dist| dist as f64).sum::<f64>();
-                accumulate_rows_by_assignment(x, knn, sums, cluster_sizes, d);
-                offset += n;
+                    if gemm_only {
+                        let norms = squared_norms(x, n, d);
+                        batch::find_nearest_neighbor(
+                            x,
+                            prev_centroids,
+                            n,
+                            n_clusters,
+                            d,
+                            &norms,
+                            centroid_norms,
+                            knn,
+                            distances,
+                            gemm_buf,
+                        );
+                    } else {
+                        let norms = squared_norms_partial(x, n, d, partial_d);
+                        not_pruned_counts.clear();
+                        not_pruned_counts.resize(n, 0);
+                        batch::find_nearest_neighbor_with_pruning(
+                            x,
+                            prev_centroids,
+                            n,
+                            n_clusters,
+                            d,
+                            vertical_d,
+                            horizontal_d,
+                            &norms,
+                            centroid_norms,
+                            knn,
+                            distances,
+                            pruner,
+                            partial_d,
+                            not_pruned_counts,
+                            gemm_buf,
+                        );
+                        not_pruned += not_pruned_counts.iter().map(|&v| v as f64).sum::<f64>();
+                    }
+
+                    sse += distances.iter().map(|&dist| dist as f64).sum::<f64>();
+                    accumulate_rows_by_assignment(x, knn, sums, cluster_sizes, d);
+                    offset += n;
+                });
             })?;
         }
         assert_eq!(
@@ -1061,13 +1096,16 @@ impl<'a> Run<'a> {
             }
         });
 
-        let (empty_revived, small_revived) = self.consolidate_centroids();
-        let shift = centroid_shift(
-            &self.horizontal_centroids,
-            &self.prev_centroids,
-            n_clusters,
-            d,
-        );
+        let ((empty_revived, small_revived), shift) = skm.install(|| {
+            let revived = self.consolidate_centroids();
+            let shift = centroid_shift(
+                &self.horizontal_centroids,
+                &self.prev_centroids,
+                n_clusters,
+                d,
+            );
+            (revived, shift)
+        });
         self.push_iteration_stats(sse, shift, empty_revived, small_revived, pruning);
         Ok(())
     }
@@ -1343,6 +1381,23 @@ mod tests {
             small_revived,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn the_pool_has_n_threads_threads() {
+        let sized = |n_threads| {
+            SuperKMeans::with_config(
+                8,
+                SuperKMeansConfig {
+                    n_threads,
+                    ..Default::default()
+                },
+            )
+            .install(rayon::current_num_threads)
+        };
+        assert_eq!(sized(1), 1);
+        assert_eq!(sized(3), 3);
+        assert_eq!(sized(0), rayon::current_num_threads());
     }
 
     #[test]
