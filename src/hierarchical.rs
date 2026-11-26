@@ -26,7 +26,7 @@ use crate::common::{
 };
 use crate::dataset::{Contiguous, Dataset};
 use crate::matrix::Matrix;
-use crate::superkmeans::{SuperKMeans, SuperKMeansConfig, SuperKMeansIterationStats};
+use crate::superkmeans::{SuperKMeans, SuperKMeansConfig, SuperKMeansIterationStats, assign};
 use crate::utils::{normalize_rows_l2_sequential, squared_norms};
 
 /// Config for hierarchical training: [`SuperKMeansConfig`] plus the split knobs.
@@ -86,7 +86,8 @@ pub struct HierarchicalSuperKMeansIterationStats {
     pub bisected_nodes: usize,
 }
 
-/// Result of [`HierarchicalSuperKMeans::train_meso`]: the scanned rows grouped
+/// Result of [`HierarchicalSuperKMeans::train_meso`] and
+/// [`HierarchicalSuperKMeans::train_meso_resident`]: the scanned rows grouped
 /// by meso cluster.
 #[derive(Clone, Debug)]
 pub struct MesoPartition {
@@ -95,6 +96,11 @@ pub struct MesoPartition {
     pub offsets: Vec<usize>,
     /// 0-based scan positions grouped by meso cluster, ascending within each.
     pub rows: Vec<u32>,
+    /// Row-major meso centroids, `n_meso × d`, in the scanned rows'
+    /// coordinates: row `m` is the centroid of meso cluster `m`. Empty when
+    /// the meso step made no centroids: a sample that fits one leaf, or a
+    /// split that collapsed onto one cluster and was cut in half.
+    pub centroids: Vec<f32>,
     /// Per-iteration statistics of the streaming meso run.
     pub stats: Vec<SuperKMeansIterationStats>,
 }
@@ -367,38 +373,144 @@ impl HierarchicalSuperKMeans {
 
         let k_meso = self.meso_clusters(n);
         if k_meso < 2 {
-            return Ok(MesoPartition {
-                offsets: vec![0, n],
-                rows: (0..n as u32).collect(),
-                stats: Vec::new(),
-            });
+            return Ok(single_meso(n));
         }
 
-        let mut skm = self.new_superkmeans_from_config(
-            k_meso,
-            LocalSkmMode::Meso {
-                iters: self.config.iters_meso,
-                can_prune: self.meso_can_prune(k_meso),
-            },
-        );
+        let mut skm = self.new_meso_superkmeans(k_meso);
         skm.train_streaming(data)?;
         assert_eq!(
             skm.n_samples, n,
             "dataset yielded {} rows, expected {n}",
             skm.n_samples
         );
+        let centroids = skm.get_output_centroids(!skm.config.data_already_rotated);
+        Ok(meso_partition(
+            &skm.assignments,
+            k_meso,
+            &centroids,
+            self.base.d,
+            skm.iteration_stats,
+        ))
+    }
 
-        let (mut offsets, rows) = group_by_assignment(&skm.assignments, k_meso);
-        // The clustering collapsed onto one cluster; bisect so no meso
-        // cluster has to hold every row.
-        if offsets.len() < 3 {
-            offsets = vec![0, n / 2, n];
+    /// Meso step with every Lloyd pass over the rows already held in
+    /// `resident`, then one pass over `rest` that puts each remaining row in
+    /// its nearest meso centroid.
+    ///
+    /// The `n` rows of the scan are `resident`, at the ascending scan
+    /// positions `positions`, and the rows `rest` yields, which fill the other
+    /// positions in order. The meso clusters are as many as
+    /// [`Self::train_meso`] makes for `n` rows, seeded from `resident` as
+    /// [`Self::train_meso`] seeds from its scan, and iterated
+    /// ([`HierarchicalSuperKMeansConfig::iters_meso`]) the same way. `rest` is
+    /// read once; no row is read twice.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error [`Dataset::for_each_batch`] fails with.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n` is zero or exceeds `u32::MAX`; if `positions` is not
+    /// strictly ascending below `n` with one entry per `resident` row; if
+    /// `resident` holds fewer rows than the meso cluster count; or if `rest`
+    /// yields other than `n - positions.len()` rows.
+    pub fn train_meso_resident<D: Dataset + ?Sized>(
+        &self,
+        resident: Matrix<'_>,
+        positions: &[u32],
+        rest: &mut D,
+        n: usize,
+    ) -> Result<MesoPartition, D::Error> {
+        assert!(n > 0, "n must be positive");
+        assert!(u32::try_from(n).is_ok(), "n must fit in u32");
+        let d = self.base.d;
+        assert_eq!(
+            resident.d(),
+            d,
+            "resident rows must have dimensionality {d}"
+        );
+        assert_eq!(
+            positions.len(),
+            resident.n(),
+            "one position per resident row"
+        );
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1])
+                && positions.last().is_none_or(|&last| (last as usize) < n),
+            "resident positions must ascend strictly below {n}"
+        );
+
+        let k_meso = self.meso_clusters(n);
+        if k_meso < 2 {
+            return Ok(single_meso(n));
         }
-        Ok(MesoPartition {
-            offsets,
-            rows,
-            stats: skm.iteration_stats,
-        })
+        assert!(
+            resident.n() >= k_meso,
+            "{} resident rows cannot seed {k_meso} meso clusters",
+            resident.n()
+        );
+
+        let mut skm = self.new_meso_superkmeans(k_meso);
+        let mut lloyd = resident;
+        match skm.train_streaming(&mut lloyd) {
+            Ok(_) => {}
+            Err(never) => match never {},
+        }
+        let centroids = skm.get_output_centroids(!skm.config.data_already_rotated);
+        let meso = Matrix::new(&centroids, k_meso, d);
+
+        // Resident rows take their nearest meso centroid in place; the rows of
+        // `rest` fill the remaining positions in scan order.
+        let mut assignments = vec![0_u32; n];
+        for (&position, cluster) in positions.iter().zip(assign(resident, meso)) {
+            assignments[position as usize] = cluster;
+        }
+        let mut resident_positions = positions.iter().peekable();
+        let mut position = 0_usize;
+        let mut rest_rows = 0_usize;
+        rest.for_each_batch(&mut |batch| {
+            for cluster in assign(batch, meso) {
+                while resident_positions
+                    .next_if(|&&p| p as usize == position)
+                    .is_some()
+                {
+                    position += 1;
+                }
+                assert!(
+                    position < n,
+                    "rest yielded more than {} rows",
+                    n - positions.len()
+                );
+                assignments[position] = cluster;
+                position += 1;
+                rest_rows += 1;
+            }
+        })?;
+        assert_eq!(
+            rest_rows,
+            n - positions.len(),
+            "rest yielded {rest_rows} rows, expected {}",
+            n - positions.len()
+        );
+        Ok(meso_partition(
+            &assignments,
+            k_meso,
+            &centroids,
+            d,
+            skm.iteration_stats,
+        ))
+    }
+
+    /// A streaming meso run of `k_meso` clusters.
+    fn new_meso_superkmeans(&self, k_meso: usize) -> SuperKMeans {
+        self.new_superkmeans_from_config(
+            k_meso,
+            LocalSkmMode::Meso {
+                iters: self.config.iters_meso,
+                can_prune: self.meso_can_prune(k_meso),
+            },
+        )
     }
 
     /// Split one contiguous meso cluster into leaves of at most `target_leaf_size` rows.
@@ -673,7 +785,7 @@ impl HierarchicalSuperKMeans {
     ///
     /// `⌈√K⌉` with `K = ⌈n / target_leaf_size⌉`.
     /// Returns `0` when the sample already fits in one cluster.
-    fn meso_clusters(&self, n: usize) -> usize {
+    pub fn meso_clusters(&self, n: usize) -> usize {
         let target = n.div_ceil(self.config.target_leaf_size);
         if target < 2 {
             return 0;
@@ -800,6 +912,56 @@ fn mean_rows(data: &[f32], n: usize, d: usize) -> Vec<f32> {
         *v *= inv;
     }
     centroid
+}
+
+/// One meso cluster of every row and no centroids: a sample that fits one
+/// leaf.
+fn single_meso(n: usize) -> MesoPartition {
+    MesoPartition {
+        offsets: vec![0, n],
+        rows: (0..n as u32).collect(),
+        centroids: Vec::new(),
+        stats: Vec::new(),
+    }
+}
+
+/// The rows grouped by `assignments` into the non-empty of `k_meso` clusters,
+/// each with its row of `centroids`. A clustering that collapsed onto one
+/// cluster is cut in half instead, with no centroids, so no meso cluster has
+/// to hold every row.
+fn meso_partition(
+    assignments: &[u32],
+    k_meso: usize,
+    centroids: &[f32],
+    d: usize,
+    stats: Vec<SuperKMeansIterationStats>,
+) -> MesoPartition {
+    let n = assignments.len();
+    let (offsets, rows) = group_by_assignment(assignments, k_meso);
+    if offsets.len() < 3 {
+        return MesoPartition {
+            offsets: vec![0, n / 2, n],
+            rows,
+            centroids: Vec::new(),
+            stats,
+        };
+    }
+    let mut sizes = vec![0_usize; k_meso];
+    for &cluster in assignments {
+        sizes[cluster as usize] += 1;
+    }
+    let centroids = centroids
+        .chunks_exact(d)
+        .zip(&sizes)
+        .filter(|(_, size)| **size > 0)
+        .flat_map(|(centroid, _)| centroid.iter().copied())
+        .collect();
+    MesoPartition {
+        offsets,
+        rows,
+        centroids,
+        stats,
+    }
 }
 
 /// Stable counting sort of the positions `0..assignments.len()` by cluster.

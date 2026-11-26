@@ -5,7 +5,7 @@ use std::convert::Infallible;
 
 use superkmeans::{
     Dataset, FineClusters, HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, IterDataset,
-    Matrix, SuperKMeans, SuperKMeansConfig, make_blobs,
+    Matrix, SuperKMeans, SuperKMeansConfig, assign, make_blobs,
 };
 
 /// Mean squared distance from each row to the centroid it is assigned to.
@@ -225,10 +225,65 @@ fn meso_step_makes_one_pass_per_iteration_plus_one() {
     let meso = kmeans.train_meso(&mut scan, n).unwrap();
     assert_eq!(scan.passes, 1 + 4);
     assert_eq!(meso.stats.len(), 4);
+    assert_eq!(meso.centroids.len(), meso.n_meso() * d);
 
     let mut seen = vec![false; n];
     for &row in &meso.rows {
         assert!(!std::mem::replace(&mut seen[row as usize], true));
+    }
+    assert!(seen.iter().all(|&s| s), "partition dropped rows");
+}
+
+/// Trained on every fourth row held in memory, the meso step reads the other
+/// rows once, puts every row in exactly one meso cluster, the one whose
+/// centroid is nearest, and makes as many clusters as the streamed run.
+#[test]
+fn meso_step_on_resident_rows_reads_the_rest_once() {
+    let (n, d) = (8_000usize, 16usize);
+    let data = make_blobs(n, d, 10, true, 1.0, 10.0, 5);
+    let mut cfg = HierarchicalSuperKMeansConfig {
+        iters_meso: 4,
+        ..leaf_config(50)
+    };
+    cfg.base.early_termination = false;
+    let kmeans = HierarchicalSuperKMeans::with_config(d, cfg);
+
+    let positions: Vec<u32> = (0..n as u32).step_by(4).collect();
+    let pick = |keep: bool| -> Vec<f32> {
+        data.chunks_exact(d)
+            .enumerate()
+            .filter(|(row, _)| (row % 4 == 0) == keep)
+            .flat_map(|(_, row)| row.iter().copied())
+            .collect()
+    };
+    let (resident, rest) = (pick(true), pick(false));
+    let mut scan = Counting {
+        data: Matrix::new(&rest, n - positions.len(), d),
+        passes: 0,
+    };
+    let meso = kmeans
+        .train_meso_resident(
+            Matrix::new(&resident, positions.len(), d),
+            &positions,
+            &mut scan,
+            n,
+        )
+        .unwrap();
+    assert_eq!(scan.passes, 1);
+    assert_eq!(meso.stats.len(), 4);
+    assert!(meso.n_meso() >= 2 && meso.n_meso() <= kmeans.meso_clusters(n));
+    assert_eq!(meso.centroids.len(), meso.n_meso() * d);
+
+    let nearest = assign(
+        Matrix::new(&data, n, d),
+        Matrix::new(&meso.centroids, meso.n_meso(), d),
+    );
+    let mut seen = vec![false; n];
+    for m in 0..meso.n_meso() {
+        for &row in meso.meso_rows(m) {
+            assert!(!std::mem::replace(&mut seen[row as usize], true));
+            assert_eq!(nearest[row as usize] as usize, m, "row {row}");
+        }
     }
     assert!(seen.iter().all(|&s| s), "partition dropped rows");
 }
